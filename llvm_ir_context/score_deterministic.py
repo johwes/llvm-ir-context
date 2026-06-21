@@ -180,15 +180,16 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     has_free_sink = any(s.get("fn") == "free" for s in sinks
                         if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS)
 
-    trunc_drove_base = has_trunc and has_call_sink
+    trunc_drove_base      = has_trunc and has_call_sink
+    null_check_drove_base = (not has_trunc) and has_call_sink and guard_type == "null_check"
 
     mult = 1.0
     if is_ext:
         mult *= 1.10
-    if has_buffer_write and not trunc_drove_base:
-        # Skip when trunc drove the tier — the tier already captures the severity.
-        # Incidental narrowing ops (zlib bitstream arithmetic) must not compound with
-        # the ×1.50 boost and push every guarded memcpy function to 1.00.
+    if has_buffer_write and not trunc_drove_base and not null_check_drove_base:
+        # Skip when trunc or null_check drove the tier — those bases already encode the
+        # risk level. Stacking ×1.50 pushes well-known patterns (guarded memcpy, null-only
+        # inflateGetDictionary) to 1.00 and destroys differentiation at the top.
         mult *= 1.50   # raw copy with no built-in size limit — categorically most dangerous
     elif all_format_sinks and has_guard:
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
