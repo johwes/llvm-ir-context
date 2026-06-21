@@ -5,24 +5,27 @@ gen_harness.py — MVP: slice context → Qwen → harness C → IR validation.
 Usage:
     export QWEN_API_KEY=sk-...
 
-    # Auto-pick top public function from a directory (preferred)
-    python gen_harness.py --ir-dir <dir/> [--no-gep-only] [--header <header.h>]
+    # Auto-pick top public function
+    python gen_harness.py --ir-dir <dir/> [--no-gep-only] [--header <h>] [--output-dir <d>]
+
+    # Generate harnesses for top-K ranked functions
+    python gen_harness.py --ir-dir <dir/> --top-k 5 [--no-gep-only] [--header <h>]
 
     # Explicit target
-    python gen_harness.py --ll <target.ll> --function <fn> [--header <header.h>]
+    python gen_harness.py --ll <target.ll> --function <fn> [--header <h>]
 
 Examples:
     python gen_harness.py --ir-dir /tmp/zlib-ir/ --no-gep-only --header /usr/include/zlib.h
-    python gen_harness.py --ir-dir ~/scarnet-ir/ --header ~/scarnet/scarnet.h
+    python gen_harness.py --ir-dir ~/scarnet-ir/ --top-k 3 --header ~/scarnet/include/scarnet.h --output-dir ~/scarnet/
     python gen_harness.py --ll /tmp/zlib-ir/inflate.ll --function inflate
 
 Validation steps:
   1. Compile harness to IR  (catches syntax / API errors — retries with compiler error)
   2. ir-score on harness IR (catches self-harm: unguarded access in harness code)
      Score interpretation in harness context:
-       < 60%  — expected: unguarded malloc/GEP is normal in fuzzing harnesses
-       60-89% — review: check what the slicer flagged
-       ≥ 90%  — warning: likely a real bug in the harness itself
+       < 80%  — OK: expected harness boilerplate (malloc, GEP, null-terminated copies)
+       80-89% — REVIEW: check flagged sinks
+       >= 90% — WARNING: likely real bug in the harness itself
 """
 
 import argparse
@@ -34,11 +37,11 @@ from pathlib import Path
 
 import requests
 
-ENDPOINT    = "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions"
-MODEL       = "Qwen3.6-35B-A3B"
-MAX_RETRIES = 3
-SELF_HARM_WARN      = 0.90
-SELF_HARM_REVIEW    = 0.80   # below this is expected harness boilerplate
+ENDPOINT         = "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions"
+MODEL            = "Qwen3.6-35B-A3B"
+MAX_RETRIES      = 3
+SELF_HARM_WARN   = 0.90
+SELF_HARM_REVIEW = 0.80
 
 
 # ---------------------------------------------------------------------------
@@ -52,26 +55,23 @@ def get_context(ll_path: str, fn_name: str) -> str:
 
 
 def get_ir_signature(ll_path: str, fn_name: str) -> str:
-    """Extract the function signature line from the .ll file."""
     try:
         text = Path(ll_path).read_text(errors="replace")
     except OSError:
         return ""
-    # Match 'define ... @fn_name(...)'
     m = re.search(
         rf'^define\b[^@]*@{re.escape(fn_name)}\s*\([^)]*\)',
-        text, re.MULTILINE
+        text, re.MULTILINE,
     )
     return m.group(0) if m else ""
 
 
 def fn_in_header(fn_name: str, header_text: str) -> bool:
-    """True if fn_name appears as a declaration in the header text."""
     return bool(re.search(rf'\b{re.escape(fn_name)}\s*\(', header_text))
 
 
 def ranked_functions(ir_dir: str, no_gep_only: bool) -> list[tuple[str, str]]:
-    """Return list of (ll_path, fn_name) in score order from ir-score output."""
+    """Return [(ll_path, fn_name), ...] in score order."""
     cmd = ["ir-score", "--ir-dir", ir_dir]
     if no_gep_only:
         cmd.append("--no-gep-only")
@@ -89,21 +89,22 @@ def ranked_functions(ir_dir: str, no_gep_only: bool) -> list[tuple[str, str]]:
     return results
 
 
-def pick_top_function(ir_dir: str, no_gep_only: bool,
-                      header_text: str) -> tuple[str, str]:
-    """Pick the highest-ranked function that appears in the header (if provided).
+def pick_public_functions(ir_dir: str, no_gep_only: bool,
+                          header_text: str, k: int) -> list[tuple[str, str]]:
+    """Return up to k highest-ranked functions that appear in the header.
 
-    When a header is given, internal helpers (not declared in the public API)
-    are skipped — they can't be called directly from a harness and the LLM
-    has no signature to work from. Falls back to rank 1 if nothing matches.
+    When no header is provided, returns the top k ranked functions directly.
+    Falls back to rank 1 if nothing matches the header.
     """
     ranked = ranked_functions(ir_dir, no_gep_only)
-    if header_text:
-        for ll_path, fn_name in ranked:
-            if fn_in_header(fn_name, header_text):
-                return ll_path, fn_name
+    if not header_text:
+        return ranked[:k]
+
+    public = [(ll, fn) for ll, fn in ranked if fn_in_header(fn, header_text)]
+    if not public:
         print("  (no ranked function found in header — falling back to rank 1)")
-    return ranked[0]
+        return ranked[:1]
+    return public[:k]
 
 
 # ---------------------------------------------------------------------------
@@ -161,46 +162,25 @@ def parse_top_score(output: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Single harness generation
 # ---------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--ll",         metavar="FILE")
-    src.add_argument("--ir-dir",     metavar="DIR")
-    ap.add_argument("--function",    metavar="FN",
-                    help="Required with --ll")
-    ap.add_argument("--no-gep-only",  action="store_true")
-    ap.add_argument("--header",       metavar="FILE")
-    ap.add_argument("--output-dir",   metavar="DIR", default=".",
-                    help="Directory to write harness_<fn>.c (default: cwd)")
-    args = ap.parse_args()
+def generate_one(ll_path: str, fn_name: str, header: str,
+                 include_dirs: list[str], output_dir: Path) -> bool:
+    """Generate, compile, and validate one harness. Returns True on success."""
 
-    if args.ll and not args.function:
-        ap.error("--function is required with --ll")
+    print(f"\n{'='*60}")
+    print(f"Target: {fn_name}  ({ll_path})")
+    print('='*60)
 
-    header      = Path(args.header).read_text(errors="replace") if args.header else ""
-    include_dirs = [str(Path(args.header).parent)] if args.header else []
-
-    # ── 1. resolve target ─────────────────────────────────────────────────────
-    if args.ir_dir:
-        print(f"── auto-picking top public function from {args.ir_dir} ──")
-        ll_path, fn_name = pick_top_function(args.ir_dir, args.no_gep_only, header)
-        print(f"   → {fn_name}  ({ll_path})")
-    else:
-        ll_path, fn_name = args.ll, args.function
-
-    # ── 2. slice context + IR signature ──────────────────────────────────────
-    print(f"\n── slice context: {fn_name} ──────────────────────────")
-    ctx = get_context(ll_path, fn_name)
-    print(ctx)
-
+    # Slice context
+    ctx    = get_context(ll_path, fn_name)
     ir_sig = get_ir_signature(ll_path, fn_name)
+    print(ctx)
     if ir_sig:
         print(f"\nIR signature: {ir_sig}")
 
-    # ── 3. build prompt ───────────────────────────────────────────────────────
+    # Build prompt
     header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
@@ -224,10 +204,10 @@ Requirements:
 Output C code only, no explanation."""
 
     messages = [{"role": "user", "content": initial_prompt}]
-    out_c    = Path(args.output_dir) / f"harness_{fn_name}.c"
-    out_c.parent.mkdir(parents=True, exist_ok=True)
+    out_c    = output_dir / f"harness_{fn_name}.c"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 4. Qwen with compile-error retry ─────────────────────────────────────
+    # Qwen with compile-error retry
     harness_ll = None
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
@@ -245,7 +225,8 @@ Output C code only, no explanation."""
 
         print("COMPILE ERROR:\n" + stderr)
         if attempt == MAX_RETRIES:
-            sys.exit("VALIDATION: FAIL — compile errors after all retries")
+            print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} compile errors")
+            return False
 
         messages.append({"role": "assistant", "content": reply})
         messages.append({
@@ -257,7 +238,7 @@ Output C code only, no explanation."""
             ),
         })
 
-    # ── 5. self-harm check ───────────────────────────────────────────────────
+    # Self-harm check
     print("\n── ir-score on harness (self-harm check) ────────────")
     r = subprocess.run(["ir-score", "--ir-dir", str(harness_ll)],
                        capture_output=True, text=True)
@@ -267,10 +248,63 @@ Output C code only, no explanation."""
     if score is not None:
         print(f"Self-harm verdict: {self_harm_verdict(score)}")
 
-    print("\nDone. To fuzz:")
-    inc = f" -I {Path(args.header).parent}" if args.header else ""
+    inc = f" -I {include_dirs[0]}" if include_dirs else ""
+    print(f"\nTo fuzz:")
     print(f"  clang-20 -fsanitize=fuzzer,address{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
     print(f"  ./fuzzer_{fn_name}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ll",          metavar="FILE")
+    src.add_argument("--ir-dir",      metavar="DIR")
+    ap.add_argument("--function",     metavar="FN",
+                    help="Required with --ll")
+    ap.add_argument("--no-gep-only",  action="store_true")
+    ap.add_argument("--header",       metavar="FILE")
+    ap.add_argument("--top-k",        metavar="N", type=int, default=1,
+                    help="Generate harnesses for top-K ranked public functions (default: 1)")
+    ap.add_argument("--output-dir",   metavar="DIR", default=".",
+                    help="Directory to write harness_<fn>.c (default: cwd)")
+    args = ap.parse_args()
+
+    if args.ll and not args.function:
+        ap.error("--function is required with --ll")
+    if args.ll and args.top_k != 1:
+        ap.error("--top-k only applies to --ir-dir mode")
+
+    header       = Path(args.header).read_text(errors="replace") if args.header else ""
+    include_dirs = [str(Path(args.header).parent)] if args.header else []
+    output_dir   = Path(args.output_dir)
+
+    if args.ll:
+        generate_one(args.ll, args.function, header, include_dirs, output_dir)
+        return
+
+    # ir-dir mode
+    print(f"── ranking functions in {args.ir_dir} ──────────────")
+    targets = pick_public_functions(args.ir_dir, args.no_gep_only, header, args.top_k)
+    print(f"   Selected {len(targets)} target(s): {', '.join(fn for _, fn in targets)}")
+
+    results = {"ok": [], "fail": []}
+    for ll_path, fn_name in targets:
+        ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir)
+        (results["ok"] if ok else results["fail"]).append(fn_name)
+
+    # Summary when running multiple
+    if args.top_k > 1:
+        print(f"\n{'='*60}")
+        print(f"Summary: {len(results['ok'])} generated, {len(results['fail'])} failed")
+        if results["ok"]:
+            print(f"  OK:   {', '.join(results['ok'])}")
+        if results["fail"]:
+            print(f"  FAIL: {', '.join(results['fail'])}")
 
 
 if __name__ == "__main__":
