@@ -209,6 +209,7 @@ def _canonical_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _CONSTANT_IDS = frozenset({IDX_CONST_INT, IDX_CONST_FP, IDX_UNDEF, IDX_CONTEXT})
+_DIV_OPCODES  = frozenset({5, 6, 7, 8})    # udiv, sdiv, urem, srem
 
 
 def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
@@ -253,6 +254,27 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
             if int(x[d, 0]) in (29, 26) and int(x[s, 0]) not in _CONSTANT_IDS:
                 sink_ids.add(d)
 
+    # Sink type 3: div/rem instruction whose divisor (second operand, index 1) is non-constant.
+    # The first DFG edge into a div/rem node is the dividend (index 0), the second is the divisor.
+    # We flag div/rem only when the divisor is non-constant — a constant divisor can never be zero.
+    # Track per-node edge count to identify the divisor edge (second DFG predecessor).
+    div_dfg_preds: dict[int, list[int]] = {}   # node_id → [dfg_preds in order seen]
+    for i in range(E):
+        if int(edge_type[i]) == 1:
+            s, d = int(edge_index[0, i]), int(edge_index[1, i])
+            if int(x[d, 0]) in _DIV_OPCODES:
+                div_dfg_preds.setdefault(d, []).append(s)
+    for node_id, preds in div_dfg_preds.items():
+        # In LLVM IR, operand order is [dividend, divisor]; divisor is the second operand.
+        if len(preds) >= 2:
+            divisor_src = preds[1]
+            if int(x[divisor_src, 0]) not in _CONSTANT_IDS:
+                sink_ids.add(node_id)
+        elif preds:
+            # Only one predecessor visible — flag conservatively when non-constant.
+            if int(x[preds[0], 0]) not in _CONSTANT_IDS:
+                sink_ids.add(node_id)
+
     if not sink_ids:
         return None
 
@@ -288,6 +310,13 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
                     visited.add(term_id)
                     changed = True
 
+    # Record which old node IDs are div/rem sinks (for post-mapping below).
+    _OPCODE_TO_DIVNAME = {5: "udiv", 6: "sdiv", 7: "urem", 8: "srem"}
+    div_sink_old_ids: dict[int, str] = {
+        nid: _OPCODE_TO_DIVNAME[int(x[nid, 0])]
+        for nid in sink_ids & div_dfg_preds.keys()
+    }
+
     slice_nodes = sorted(visited)
     slice_size  = len(slice_nodes) + 1
     old_to_new  = {old: new + 1 for new, old in enumerate(slice_nodes)}
@@ -304,6 +333,11 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
     sink_fn_names = {old_to_new[old_id]: fn
                      for old_id, fn in sink_to_fn.items()
                      if old_id in old_to_new}
+
+    # Map div/rem sink opcodes to new node indices
+    div_sink_names = {old_to_new[old_id]: opname
+                      for old_id, opname in div_sink_old_ids.items()
+                      if old_id in old_to_new}
 
     new_src, new_dst, new_et = [], [], []
     for i in range(E):
@@ -334,6 +368,7 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
 
     return {"x": new_x, "edge_index": new_edge_index, "edge_type": new_edge_type,
             "sink_fn_names": sink_fn_names, "source_fn_names": source_fn_names,
+            "div_sink_names": div_sink_names,
             "_sliced": True, "_n_sinks": len(sink_ids)}
 
 
@@ -513,9 +548,146 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None):
                             instr_to_block, block_preds, block_last_instr)
     if g is None:
         g = {"x": x, "edge_index": edge_index, "edge_type": edge_type,
-             "sink_fn_names": {}, "source_fn_names": {}, "_sliced": False, "_n_sinks": 0}
+             "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
+             "_sliced": False, "_n_sinks": 0}
+
+    # Attach free-pairing analysis (intra-procedural; independent of slice).
+    free_info = _detect_double_free(target_fn)
+    g["double_free"]    = free_info["double_free"]
+    g["use_after_free"] = free_info["use_after_free"]
+    g["freed_ptrs"]     = free_info["freed_ptrs"]
+
+    # Shallow caller guard check: look for icmp in any direct caller in this module.
+    # Only meaningful when fn_name is given (multi-function module mode).
+    if target_fn is not None and fn_name is not None:
+        caller_info = _check_caller_guards(mod, target_fn.name)
+        g["caller_count"]     = caller_info["caller_count"]
+        g["caller_validated"] = caller_info["caller_validated"]
+        g["caller_names"]     = caller_info["caller_names"]
+    else:
+        g["caller_count"]     = 0
+        g["caller_validated"] = False
+        g["caller_names"]     = []
 
     return g
+
+
+# ---------------------------------------------------------------------------
+# Shallow caller guard check (1-level-up, intra-module)
+# ---------------------------------------------------------------------------
+
+def _check_caller_guards(mod, fn_name: str) -> dict:
+    """
+    Check whether any direct caller of fn_name in mod has an icmp guard on the
+    argument value it passes — a proxy for upstream validation.
+
+    Returns dict:
+      caller_count    int   — number of distinct callers found
+      caller_validated bool — at least one caller has an icmp before the call site
+      caller_names    list  — names of functions that call fn_name
+    """
+    callers_with_guard: list[str] = []
+    all_callers:        list[str] = []
+
+    for fn in mod.functions:
+        if fn.is_declaration or fn.name == fn_name:
+            continue
+
+        fn_calls_target  = False
+        caller_has_icmp  = False
+
+        for block in fn.blocks:
+            for instr in block.instructions:
+                if instr.opcode == "call":
+                    for op in instr.operands:
+                        if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR) and op.name == fn_name:
+                            fn_calls_target = True
+                elif instr.opcode == "icmp":
+                    caller_has_icmp = True
+
+        if fn_calls_target:
+            all_callers.append(fn.name)
+            if caller_has_icmp:
+                callers_with_guard.append(fn.name)
+
+    return {
+        "caller_count":     len(all_callers),
+        "caller_validated": bool(callers_with_guard),
+        "caller_names":     all_callers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Double-free / use-after-free detector (intra-procedural, SSA names)
+# ---------------------------------------------------------------------------
+
+_FREE_RE    = re.compile(r'\bcall\b.*?\bfree\s*\(\s*(.*?)\s*\)')
+_USE_SSA_RE = re.compile(r'(%[\w.]+)')
+
+
+def _detect_double_free(fn) -> dict:
+    """
+    Scan a function for double-free and use-after-free patterns using raw IR text.
+
+    Strategy: iterate instructions as text, track SSA pointer operands passed to
+    free(). If the same SSA name hits free() again → double-free. If any load or
+    non-free call uses the SSA name after a free() → use-after-free.
+
+    Returns dict with keys:
+      double_free   bool  — same ptr freed twice
+      use_after_free bool — ptr used after first free
+      freed_ptrs    list  — SSA names that were freed
+    """
+    freed: dict[str, int] = {}   # ssa_name → instruction index of first free
+    double_free   = False
+    use_after_free = False
+    freed_ptrs: list[str] = []
+
+    instr_idx = 0
+    for block in fn.blocks:
+        for instr in block.instructions:
+            text = str(instr)
+            opc  = instr.opcode
+
+            if opc == "call":
+                # Check if this is a call to free / xfree / cfree / etc.
+                callee = ""
+                for op in instr.operands:
+                    if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
+                        callee = op.name
+                        break
+                norm = _normalize_sink_name(callee.lstrip("@"))
+                if norm == "free" or (norm.endswith("free") and _is_dangerous(callee)):
+                    # Extract the first pointer argument SSA name from IR text
+                    m = _FREE_RE.search(text)
+                    if m:
+                        ptr = m.group(1).strip()
+                        # Normalise: keep only the SSA name prefix (strip type cast noise)
+                        ssa_matches = _USE_SSA_RE.findall(ptr)
+                        if ssa_matches:
+                            ptr = ssa_matches[-1]   # last SSA reference = the actual pointer
+                        if ptr in freed:
+                            double_free = True
+                        else:
+                            freed[ptr] = instr_idx
+                            freed_ptrs.append(ptr)
+                else:
+                    # Any other call — check if a freed ptr appears as argument
+                    for ptr, free_idx in freed.items():
+                        if instr_idx > free_idx and ptr in text:
+                            use_after_free = True
+            elif opc == "load":
+                for ptr, free_idx in freed.items():
+                    if instr_idx > free_idx and ptr in text:
+                        use_after_free = True
+
+            instr_idx += 1
+
+    return {
+        "double_free":    double_free,
+        "use_after_free": use_after_free,
+        "freed_ptrs":     freed_ptrs,
+    }
 
 
 # ---------------------------------------------------------------------------

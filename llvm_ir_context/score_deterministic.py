@@ -54,9 +54,10 @@ _SCARNET_REPO = "https://github.com/johwes/scarnet.git"
 # GEP / alloca unguarded in an internal helper often means the guard was
 # done by the caller (intra-procedural blind spot) — score them lower.
 _GEP_SINKS = frozenset({"getelementptr", "alloca"})
+_DIV_SINKS = frozenset({"sdiv", "udiv", "srem", "urem"})
 
 
-def philosophy2_score(summary: dict) -> float:
+def philosophy2_score(summary: dict) -> float:  # noqa: C901
     """Pure structural Philosophy 2 score from a slice_context summary.
 
     Tier system (descending priority):
@@ -77,8 +78,26 @@ def philosophy2_score(summary: dict) -> float:
     sinks      = summary.get("sinks", [])
     channels   = summary.get("input_channels", [])
 
-    has_call_sink = any(s.get("fn") not in _GEP_SINKS for s in sinks)
-    has_arg_input = "function_argument" in channels
+    has_call_sink    = any(s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS
+                          for s in sinks)
+    has_div_sink     = any(s.get("fn") in _DIV_SINKS for s in sinks)
+    has_arg_input    = "function_argument" in channels
+    caller_validated = summary.get("caller_validated", False)
+
+    # For div/rem sinks a null_check (icmp ne ... 0) IS the correct guard.
+    # Separate early: unguarded div is dangerous, guarded div is fine.
+    if has_div_sink and not has_call_sink:
+        # Only div sinks — guard adequacy differs from buffer sinks.
+        if n_sinks == 0:
+            return 0.05
+        if not has_guard:
+            # Unguarded divisor — divide-by-zero likely.
+            base = 0.85 if has_arg_input else 0.70
+        else:
+            # Any icmp (including ne) is sufficient for div guard.
+            base = 0.15
+        mult = 1.10 if is_ext else 1.0
+        return min(base * mult, 1.0)
 
     if n_sinks == 0:
         base = 0.05
@@ -121,8 +140,22 @@ def philosophy2_score(summary: dict) -> float:
     if is_ext:
         mult *= 1.10
     # trunc already baked into tier — no extra multiplier when it drove the base score
+    # Caller has icmp guard → reduce confidence; this function may be a guarded helper.
+    # Don't apply when trunc drove the base (trunc+call_sink is still suspicious even if
+    # a caller validates — the truncation itself may be the bug).
+    if caller_validated and not (has_trunc and has_call_sink):
+        mult *= 0.65
 
-    return min(base * mult, 1.0)
+    score = min(base * mult, 1.0)
+
+    # Double-free / use-after-free override: these are detected intra-procedurally
+    # independent of the slice — if present, escalate to at least 0.88.
+    if summary.get("double_free"):
+        score = max(score, 0.92)
+    elif summary.get("use_after_free"):
+        score = max(score, 0.88)
+
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +337,13 @@ def main() -> None:
             gt    = summary.get("guard_type", "none")
             ext   = "ext" if summary.get("is_external_input") else ""
             trunc = "+trunc" if summary.get("has_trunc") else ""
+            df    = "+df"      if summary.get("double_free")    else ""
+            uaf   = "+uaf"     if summary.get("use_after_free") else ""
+            cv    = "+caller?" if summary.get("caller_validated") else ""
             sinks = ",".join(sorted({s.get("fn","?") for s in summary["sinks"]}))
             details[fn_name] = (
                 f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
-                f"{ext}{trunc} [{sinks}] ({fn_file.name})"
+                f"{ext}{trunc}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
             )
             if args.verbose:
                 print(f"  {fn_name}: {summary['natural_language']}")

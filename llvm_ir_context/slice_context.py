@@ -132,6 +132,14 @@ _SINK_INFO: dict[str, tuple[str, str]] = {
                       "index at, near, and beyond array bounds; negative index; index=SIZE_MAX"),
     "alloca":        ("stack allocation with non-constant size (VLA) — stack overflow if unchecked",
                       "size=0; size=SIZE_MAX; negative size (signed wrap); size from user input"),
+    "sdiv":   ("signed division with non-constant divisor — divide-by-zero if divisor not checked",
+               "divisor=0; divisor=-1 with dividend=INT_MIN (signed overflow)"),
+    "udiv":   ("unsigned division with non-constant divisor — divide-by-zero if divisor not checked",
+               "divisor=0"),
+    "srem":   ("signed remainder with non-constant divisor — divide-by-zero if divisor not checked",
+               "divisor=0; divisor=-1 with dividend=INT_MIN"),
+    "urem":   ("unsigned remainder with non-constant divisor — divide-by-zero if divisor not checked",
+               "divisor=0"),
 }
 
 
@@ -165,6 +173,13 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
 
     sink_fn_names:   dict[int, str] = g.get("sink_fn_names", {})
     source_fn_names: dict[int, str] = g.get("source_fn_names", {})
+    div_sink_names:  dict[int, str] = g.get("div_sink_names", {})
+    double_free:      bool  = g.get("double_free", False)
+    use_after_free:   bool  = g.get("use_after_free", False)
+    freed_ptrs:       list  = g.get("freed_ptrs", [])
+    caller_validated: bool  = g.get("caller_validated", False)
+    caller_count:     int   = g.get("caller_count", 0)
+    caller_names:     list  = g.get("caller_names", [])
     sink_mask = g.get("sink_mask", None)
 
     # ---- build DFG adjacency (used for distance + guard path analysis) -----
@@ -211,6 +226,26 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
                     fn = "getelementptr" if opc == 29 else "alloca"
                     kind = "unguarded_gep" if opc == 29 else "vla_alloca"
                     sinks.append({"node": i, "type": kind, "fn": fn})
+
+    # ---- div/rem sinks (non-constant divisor) --------------------------
+    # Guard for these is icmp ne ... 0 (null_check), which IS sufficient —
+    # unlike buffer writes where null_check is inadequate.
+    _DIV_OPCODES_MAP = {5: "udiv", 6: "sdiv", 7: "urem", 8: "srem"}
+    for i, opname in div_sink_names.items():
+        sinks.append({"node": i, "type": "div_by_zero", "fn": opname})
+
+    # Fallback: also scan opcodes directly if div_sink_names absent/empty
+    if not div_sink_names:
+        for i in range(N):
+            opc = opcodes[i]
+            if opc in _DIV_OPCODES_MAP:
+                preds = [int(edge_index[0, e]) for e in range(E)
+                         if int(edge_type[e]) == 1 and int(edge_index[1, e]) == i]
+                const_ids = {IDX_CONST_INT, IDX_CONST_FP, IDX_UNDEF, IDX_CONTEXT}
+                divisor = preds[1] if len(preds) >= 2 else (preds[0] if preds else None)
+                if divisor is not None and opcodes[divisor] not in const_ids:
+                    sinks.append({"node": i, "type": "div_by_zero",
+                                  "fn": _DIV_OPCODES_MAP[opc]})
 
     # ---- input channels ------------------------------------------------
     input_channels = []
@@ -377,6 +412,15 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
             f"fuzz integer truncation: supply values > INT_MAX / > UINT32_MAX as size"
         )
 
+    if double_free:
+        hint_parts.append(
+            "fuzz double-free: call twice with same pointer; trigger via two code paths"
+        )
+    if use_after_free and not double_free:
+        hint_parts.append(
+            "fuzz use-after-free: free pointer then access via alias or stale reference"
+        )
+
     harness_hint = " | ".join(hint_parts)
 
     return {
@@ -400,6 +444,12 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         "min_distance":       min_distance,
         "trunc_count":        trunc_count,
         "has_trunc":          has_trunc,
+        "double_free":        double_free,
+        "use_after_free":     use_after_free,
+        "freed_ptrs":         freed_ptrs,
+        "caller_validated":   caller_validated,
+        "caller_count":       caller_count,
+        "caller_names":       caller_names,
         "natural_language":   natural_language,
         "harness_hint":       harness_hint,
     }
@@ -484,6 +534,18 @@ def format_for_llm(summary: dict, score: float | None = None,
 
     if summary.get("has_trunc"):
         lines.append(f"Trunc warning   : {summary['trunc_count']} integer narrowing(s) — check size args for truncation")
+    if summary.get("double_free"):
+        ptrs = summary.get("freed_ptrs", [])
+        ptr_str = ", ".join(ptrs[:3]) + (" ..." if len(ptrs) > 3 else "")
+        lines.append(f"Double-free risk: YES  ptr(s): {ptr_str}")
+    elif summary.get("use_after_free"):
+        ptrs = summary.get("freed_ptrs", [])
+        ptr_str = ", ".join(ptrs[:3]) + (" ..." if len(ptrs) > 3 else "")
+        lines.append(f"Use-after-free  : YES  freed ptr(s): {ptr_str}")
+    if summary.get("caller_validated"):
+        callers = summary.get("caller_names", [])
+        caller_str = ", ".join(callers[:3]) + (" ..." if len(callers) > 3 else "")
+        lines.append(f"Caller guard    : icmp found in caller(s): {caller_str}  — may be validated upstream")
     lines.append("Harness target  : " + summary["harness_hint"])
     lines.append(f"Slice           : {summary['slice_size']} nodes, "
                  f"{summary['n_sinks']} sink(s)")
