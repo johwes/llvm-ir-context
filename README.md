@@ -72,19 +72,23 @@ context = format_for_llm(summary, score=score)
 | Score | Meaning |
 |---|---|
 | 1.00 | `trunc` + call sink + no guard — integer narrowing into unguarded call |
-| 0.88 | `trunc` + call sink + guards (guards may not protect the truncated size) |
+| 0.92+ | double-free detected (score floor) |
+| 0.88+ | use-after-free detected (score floor); or `trunc` + call sink + guards |
 | 0.90 | call sink + no guard + direct function argument |
 | 0.75 | call sink + null-check only (doesn't protect buffer writes) |
-| 0.70 | call sink + no guard, struct/return source |
+| 0.70 | call sink + no guard, struct/return source; or unguarded divide/remainder |
+| 0.62 | GEP-only + bounds check, sparse (≥5 sinks per guard) |
 | 0.55 | GEP-only + no guard |
 | 0.40 | call sink + bounds check, well-covered |
 | 0.05 | no sink found |
 
+Multipliers applied on top of base scores: buffer-write sinks (strcpy/memcpy/gets/…) ×1.50; external input ×1.10; free() sink ×1.05; format-only sinks (snprintf/printf/…) with guard ×0.70; allocation-only sinks (malloc/calloc) ×0.70; double-free floor 0.92; UAF floor 0.88.
+
 ## What it detects / doesn't
 
-**Detectable:** unguarded memcpy/strcpy/malloc/sprintf, integer truncation before size arg, null-check-only on buffer write, network-input-to-sink chains.
+**Detectable:** unguarded memcpy/strcpy/malloc/sprintf, integer truncation before size arg, null-check-only on buffer write, network-input-to-sink chains, divide-by-zero (sdiv/udiv/srem/urem with non-constant divisor), double-free and use-after-free (intra-procedural typestate analysis).
 
-**Not detectable:** double-free, divide-by-zero, null dereference, unaligned cast, off-by-one in a constant. See [context-enrichment-design.md](context-enrichment-design.md) for the full breakdown.
+**Not detectable:** null dereference, unaligned cast, off-by-one in a constant, wrong comparison operator. See [context-enrichment-design.md](context-enrichment-design.md) for the full breakdown.
 
 ## Design
 

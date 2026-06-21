@@ -90,14 +90,19 @@ python score_deterministic.py --scarnet --answer-key scarnet-answer-key.txt
 
 | Score | Meaning |
 |---|---|
-| 1.00 | Unguarded sink — no `icmp` anywhere in the backward slice |
-| 0.75–0.82 | Null-check only — pointer deref protected but buffer write is not |
-| 0.55–0.77 | Sparse guards — some bounds checks but sink-to-guard ratio is high |
-| 0.40–0.44 | Guarded — bounds checks present, ratio is reasonable |
-| 0.05 | No sink found / no slice (safe or structurally undetectable) |
+| 1.00 | `trunc` + call sink + no guard — integer narrowing into unguarded call |
+| 0.92+ | double-free detected (score floor) |
+| 0.88+ | use-after-free detected (score floor); or `trunc` + call sink + guards |
+| 0.90 | call sink + no guard + direct function argument |
+| 0.75 | call sink + null-check only — pointer deref protected, buffer write is not |
+| 0.70 | call sink + no guard + struct/return source; or unguarded divide/remainder |
+| 0.62 | GEP-only + bounds check, sparse coverage |
+| 0.55 | Sparse guards — some bounds checks but sink-to-guard ratio is high |
+| 0.40 | Guarded — bounds checks present, ratio is reasonable |
+| 0.05 | No sink found / no slice |
 
-Multipliers applied on top: `is_external_input` × 1.10 (network/user data
-reaches the sink), `has_trunc` × 1.05 (integer narrowing before size argument).
+Multipliers: buffer-write sinks ×1.50; external input ×1.10; free() ×1.05;
+format-only with guard ×0.70; allocation-only ×0.70.
 
 ### `--no-gep-only`
 
@@ -147,8 +152,8 @@ python slice_context.py /tmp/parse.ll --json
 ### Get a summary dict
 
 ```python
-from preprocess_slice_pdg import ir_to_graph_slice_pdg
-from slice_context import summarize_slice, format_for_llm
+from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
+from llvm_ir_context.slice_context import summarize_slice, format_for_llm
 
 ir_text = open("function.ll").read()
 g       = ir_to_graph_slice_pdg(ir_text, fn_name="process_packet")
@@ -163,6 +168,9 @@ else:
     print(summary["guard_type"])       # "none" | "null_check" | "bounds_check" | "mixed"
     print(summary["is_external_input"])# bool — network/user data reaches sink
     print(summary["has_trunc"])        # bool — integer narrowing before size arg
+    print(summary["double_free"])      # bool — same ptr freed twice (intra-procedural)
+    print(summary["use_after_free"])   # bool — ptr used after free (intra-procedural)
+    print(summary["caller_validated"]) # bool — a caller in the codebase has icmp guards
     print(summary["natural_language"]) # one-sentence description
     print(summary["harness_hint"])     # what to fuzz
 ```
@@ -170,8 +178,8 @@ else:
 ### Format for LLM injection
 
 ```python
-from slice_context import format_for_llm
-from score_deterministic import philosophy2_score
+from llvm_ir_context.slice_context import format_for_llm
+from llvm_ir_context.score_deterministic import philosophy2_score
 
 score   = philosophy2_score(summary)   # 0.0–1.0
 context = format_for_llm(summary, score=score)
@@ -190,38 +198,28 @@ score = philosophy2_score(summary)
 ### Full pipeline example
 
 ```python
-import re
+import llvmlite.binding as llvm
 from pathlib import Path
-from preprocess_slice_pdg import ir_to_graph_slice_pdg
-from slice_context import summarize_slice, format_for_llm
-from score_deterministic import philosophy2_score
+from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
+from llvm_ir_context.slice_context import summarize_slice, format_for_llm
+from llvm_ir_context.score_deterministic import philosophy2_score
 
 def score_file(ll_path: Path, threshold: float = 0.5):
     ir_text = ll_path.read_text(errors="replace")
-
-    # Split into per-function segments
-    segs = re.split(r'(?=^define\b)', ir_text, flags=re.MULTILINE)
-    header = "\n".join(l for l in ir_text.splitlines()
-                       if not l.startswith("define"))
+    # Pass full module IR so declare stubs remain visible for cross-function calls
+    mod = llvm.parse_assembly(ir_text)
 
     results = []
-    for seg in segs:
-        seg = seg.strip()
-        if not seg.startswith("define"):
+    for fn in mod.functions:
+        if fn.is_declaration:
             continue
-        m = re.match(r'define\s+.*?@([\w.]+)\s*\(', seg)
-        if not m:
-            continue
-        fn_name = m.group(1)
-        fn_ir   = header + "\n\n" + seg
-
-        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name)
+        g = ir_to_graph_slice_pdg(ir_text, fn_name=fn.name)
         if g is None:
             continue
-        summary = summarize_slice(g, fn_name=fn_name)
+        summary = summarize_slice(g, fn_name=fn.name)
         score   = philosophy2_score(summary)
         if score >= threshold:
-            results.append((fn_name, score, format_for_llm(summary, score)))
+            results.append((fn.name, score, format_for_llm(summary, score)))
 
     return sorted(results, key=lambda r: r[1], reverse=True)
 
@@ -240,17 +238,16 @@ for fn, score, ctx in score_file(Path("/tmp/parse.ll")):
 - Integer truncation before a size argument (`trunc i64 → i32` feeding `memcpy`)
 - Network-input-to-sink chains (when `recv`/`read`/`fgets` mock node is in slice)
 - Out-of-bounds array access via GEP with non-constant, unguarded index
+- Divide-by-zero via `sdiv`/`udiv`/`srem`/`urem` with non-constant, unguarded divisor
+- Double-free — same pointer freed twice in the same function (typestate)
+- Use-after-free — pointer used after free in the same function (typestate)
 
 **Not detectable** — semantic / value-level bugs:
 
-- Double-free (no memory write sink)
-- Divide-by-zero (no recognized sink, control flow not data flow to a call)
-- Null dereference before write (control flow bug, not data flow)
+- Null dereference before write (control flow bug, not data flow to a sink)
 - Unaligned pointer cast (type system, not address computation)
 - Off-by-one in a constant, wrong comparison operator
-
-The 4 scarnet functions that no approach detects (handle_stats, handle_del,
-handle_set, session_consume_frag) all fall into the second category.
+- Cross-function UAF/double-free (typestate is intra-procedural only)
 
 ## Sink types recognized
 
@@ -270,7 +267,8 @@ The slicer recognises these call names as dangerous sinks (plus their
 **Allocation:** `malloc`, `calloc`, `realloc`, `free`, `xmalloc`, `xrealloc`
 
 **IR instructions:** `getelementptr` (non-constant index), `alloca`
-(variable-length stack allocation)
+(variable-length stack allocation), `sdiv`/`udiv`/`srem`/`urem`
+(non-constant divisor — divide-by-zero risk)
 
 ## Integration with SCAR
 

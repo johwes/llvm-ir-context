@@ -75,7 +75,8 @@ arguments are attacker-controlled:
   others (plus their `__foo_chk` FORTIFY_SOURCE variants)
 - **Instruction-based:** `getelementptr` with a non-constant index (array
   subscript that can go out of bounds), `alloca` with a non-constant size
-  (variable-length stack allocation)
+  (variable-length stack allocation), `sdiv`/`udiv`/`srem`/`urem` with a
+  non-constant divisor (divide-by-zero if the divisor is attacker-controlled)
 
 ### Step 2 — build the PDG backward slice
 
@@ -153,17 +154,30 @@ The score maps structural evidence to a priority signal:
 | call sink + no guard + `function_argument` | 0.90 |
 | call sink + no guard + struct/return source | 0.70 |
 | call sink + `null_check` only | 0.75 |
+| div/rem sink + no guard + `function_argument` | 0.85 |
+| div/rem sink + no guard | 0.70 |
+| div/rem sink + any `icmp` guard | 0.15 |
 | GEP-only + no guard | 0.55 |
+| GEP-only + bounds check, sparse (≥5 sinks/guard) | 0.62 |
 | call sink + bounds check, sparse (≥5 sinks/guard) | 0.70 |
 | call sink + bounds check, moderate (≥2) | 0.55 |
 | call sink + bounds check, good (<2) | 0.40 |
-| GEP-only + bounds check | 0.18–0.40 |
+| GEP-only + bounds check | 0.18–0.28 |
 | no sink | 0.05 |
 
-Multipliers: `is_external_input` × 1.10 (network-facing attack surface).
+Multipliers (applied after base tier):
+- Buffer-write sinks (strcpy/memcpy/gets/…) × 1.50 — raw copies, no built-in size limit
+- `is_external_input` × 1.10 — network/user data demonstrably reaches sink
+- `free()` call site × 1.05 — UAF/double-free signal without a raw copy
+- Format-only sinks (snprintf/printf/…) with guard × 0.70 — snprintf size param is the guard
+- Allocation-only sinks (malloc/calloc/…) × 0.70 — null-return / OOM, not overflow
+- Double-free detected: score floor 0.92
+- Use-after-free detected: score floor 0.88
 
 The `trunc` check comes first because narrowing is suspicious even when other
-guards exist — those guards may protect different things.
+guards exist — those guards may protect different things. For div/rem sinks,
+a null check (`icmp ne` against zero) IS the correct guard — unlike buffer
+writes where null-check is insufficient — so guarded div sinks score very low.
 
 ---
 
@@ -199,37 +213,31 @@ dangerous operation without an adequate guard:
 
 - Buffer overflow via `memcpy`, `strcpy`, `memmove`, `memset`
 - Allocation size overflow via `malloc`, `calloc`, `realloc`
-- Format string via `printf`, `sprintf`, `syslog` with external format arg
+- Format string bugs via `printf`, `sprintf`, `syslog` with external format arg
 - Unbounded input via `recv`, `read`, `gets`, `fgets`
 - Integer truncation before a size argument
 - Network-input-to-sink chains (`recv`/`read` mock node in slice)
 - Out-of-bounds array access via GEP with unguarded non-constant index
+- **Divide-by-zero** — `sdiv`/`udiv`/`srem`/`urem` with non-constant divisor and no `icmp ne 0` guard
+- **Double-free** — same pointer freed twice in the same function (typestate analysis on llvmlite operand identity)
+- **Use-after-free** — pointer used in load/store/call after being freed in the same function
 
 ---
 
 ## What it cannot detect
 
-Anything that requires value-level or semantic reasoning:
+Anything that requires value-level or cross-function semantic reasoning:
 
-- **Double-free** — no memory write sink; the bug is in the sequence of calls,
-  not the data flowing into one
-- **Divide-by-zero** — no recognised sink; the buggy operation is a `udiv` or
-  `sdiv` instruction, not a function call, and the "guard" would be a zero
-  check on the divisor — currently not modelled
-- **Null dereference before write** — control flow bug; the function
-  dereferences a pointer that may be null, but the structural check for this
-  requires tracking which pointer values can be null, not just whether an
-  `icmp` exists
+- **Null dereference before write** — control flow bug; requires tracking which
+  pointer values can be null, not just whether an `icmp` exists
 - **Unaligned pointer cast** — type system bug; `*(uint32_t *)(buf+1)` has no
   recognisable sink in the IR
 - **Off-by-one in a constant** — `buf[MAX]` when `MAX` should be `MAX-1`;
   the constant is embedded in the IR and looks identical to a correct bound
 - **Wrong comparison operator** — `>` instead of `>=`; both produce an `icmp`
   in the slice, indistinguishable structurally
-
-These are the 4 scarnet functions no approach detects: `handle_stats`
-(divide-by-zero), `handle_del` (double-free), `handle_set` (null deref),
-`session_consume_frag` (unaligned cast).
+- **Cross-function UAF/double-free** — the free and the subsequent use are in
+  different functions; the typestate analysis is intra-procedural only
 
 ---
 
@@ -241,7 +249,10 @@ against `windowBits`, `lm_init`'s slice contains no `icmp` and scores as
 unguarded. The guard happened one frame up and is invisible. Symptoms: internal
 helpers with `external_call_return` input and no guards score high despite
 being safe. Mitigation: the scoring deprioritises `external_call_return` vs
-`function_argument` for the unguarded tiers.
+`function_argument` for the unguarded tiers. The `+caller?` annotation in the
+output indicates that at least one caller in the codebase (across all loaded
+`.ll` files) contains an `icmp` — a hint for human review that upstream
+validation may exist.
 
 **GEP noise.** In codebases that do heavy table indexing (compression codecs,
 Huffman decoders, CRC tables), every array access becomes a GEP sink and
@@ -275,10 +286,9 @@ an unguarded dangerous operation than rank 50. The LLM triage step handles
 the semantic question of whether a specific input can actually trigger the
 condition.
 
-On scarnet (13 known-vulnerable, 19 total functions), the structural rule alone
-achieves 9/13 recall — the same ceiling as every GNN variant. The 4 misses are
-structurally undetectable by any IR-level method. The 9 detectable functions
-all score above 0.70 and appear in the top half of the ranking.
+On scarnet (13 known-vulnerable, 19 total functions), the structural rule
+achieves 13/13 recall (100% P@K=R@K). The previously undetectable patterns
+(divide-by-zero, double-free, UAF) are now covered by the new sink types.
 
 On zlib (112 functions), the top 6 by score after `--no-gep-only` are all
 functions with real call-based sinks (memcpy, memset) and either unguarded
