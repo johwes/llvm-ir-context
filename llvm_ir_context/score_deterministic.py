@@ -56,6 +56,24 @@ _SCARNET_REPO = "https://github.com/johwes/scarnet.git"
 _GEP_SINKS = frozenset({"getelementptr", "alloca"})
 _DIV_SINKS = frozenset({"sdiv", "udiv", "srem", "urem"})
 
+# Raw buffer-copy sinks: no built-in size limit, or size is not enforced by the function name.
+# Presence → ×1.20 boost (more dangerous than allocation or format sinks).
+_BUFFER_WRITE_SINKS = frozenset({
+    "strcpy", "strncpy", "strcat", "strncat",
+    "memcpy", "memmove", "bcopy",
+    "gets", "fgets",
+    "sprintf", "vsprintf",   # unbounded format writes
+})
+
+# Format/logging sinks: output-only, or have an explicit size parameter (snprintf).
+# When ALL call sinks are in this set AND a guard is present → ×0.70 penalty.
+# Rationale: snprintf(buf, size, ...) with a null_check guard is far less likely to
+# overflow than memcpy(buf, src, n) with the same guard.
+_FORMAT_ONLY_SINKS = frozenset({
+    "printf", "fprintf", "snprintf", "vsnprintf",
+    "syslog", "err", "warn",
+})
+
 
 def philosophy2_score(summary: dict) -> float:  # noqa: C901
     """Pure structural Philosophy 2 score from a slice_context summary.
@@ -136,9 +154,20 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
             elif gd >= 2: base = 0.28
             else:         base = 0.18
 
+    # Identify call sink types for multiplier logic
+    call_sink_fns = {s.get("fn") for s in sinks
+                     if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS}
+    has_buffer_write  = bool(call_sink_fns & _BUFFER_WRITE_SINKS)
+    all_format_sinks  = bool(call_sink_fns) and call_sink_fns <= _FORMAT_ONLY_SINKS
+
     mult = 1.0
     if is_ext:
         mult *= 1.10
+    if has_buffer_write:
+        mult *= 1.20   # raw copy with no built-in size limit
+    elif all_format_sinks and has_guard:
+        mult *= 0.70   # snprintf/printf with guard — size param is the guard
+
     # trunc already baked into tier — no extra multiplier when it drove the base score
     # Caller has icmp guard → reduce confidence only for small, no-arg internal helpers
     # (≤5 sinks, no direct function arguments, e.g. lm_init called by deflateInit2_).
