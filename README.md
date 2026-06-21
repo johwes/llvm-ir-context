@@ -82,7 +82,7 @@ context = format_for_llm(summary, score=score)
 | 0.40 | call sink + bounds check, well-covered |
 | 0.05 | no sink found |
 
-Multipliers applied on top of base scores (only when the base tier didn't already encode the risk): buffer-write sinks (strcpy/memcpy/gets/…) ×1.50 — skipped when trunc or null_check drove the base tier; external input ×1.10; free() sink ×1.05; format-only sinks (snprintf/printf/…) with guard ×0.70; allocation-only sinks (malloc/calloc) ×0.70; double-free floor 0.92; UAF floor 0.88. Guard density for functions with mixed GEP+call sinks is computed over call sinks only (excluding free()), so GEP count does not inflate sparseness.
+Multipliers applied on top of base scores (only when the base tier didn't already encode the risk): buffer-write sinks (strcpy/memcpy/gets/…) ×1.50 — skipped when trunc or null_check drove the base tier; external input ×1.10; free() sink ×1.05 — skipped when free() is the only call sink (bare deallocation wrappers are not a buffer overflow signal; UAF/double-free risk is handled via typestate score floors instead); format-only sinks (snprintf/printf/…) with guard ×0.70; allocation-only sinks (malloc/calloc) ×0.70; double-free floor 0.92; UAF floor 0.88. Guard density for functions with mixed GEP+call sinks is computed over non-free call sinks only, so GEP count does not inflate sparseness.
 
 ## What it detects / doesn't
 

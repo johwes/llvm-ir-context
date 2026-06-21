@@ -103,7 +103,9 @@ python score_deterministic.py --scarnet --answer-key scarnet-answer-key.txt
 
 Multipliers (only when the base tier didn't already encode the risk):
 buffer-write sinks ×1.50 — skipped when `trunc` or `null_check` drove the base;
-external input ×1.10; free() ×1.05; format-only with guard ×0.70; allocation-only ×0.70.
+external input ×1.10; free() ×1.05 — skipped when free() is the only call sink
+(bare wrappers aren't a buffer overflow signal; UAF/double-free is handled via
+typestate floors instead); format-only with guard ×0.70; allocation-only ×0.70.
 Guard density uses call-sink count (excluding free()) when call sinks are present,
 so GEP noise doesn't make guarded memcpy functions look sparse.
 

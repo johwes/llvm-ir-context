@@ -173,7 +173,7 @@ The score maps structural evidence to a priority signal:
 Multipliers (applied after base tier, but only when the base tier didn't already encode the risk):
 - Buffer-write sinks (strcpy/memcpy/gets/…) × 1.50 — **skipped** when `trunc` or `null_check` drove the base tier; those bases already encode the severity and stacking would push well-characterised patterns to 1.00
 - `is_external_input` × 1.10 — network/user data demonstrably reaches sink
-- `free()` call site × 1.05 — UAF/double-free signal without a raw copy
+- `free()` call site × 1.05 — UAF/double-free signal; **skipped** when `free()` is the only non-GEP call sink (bare deallocation wrappers are not a buffer overflow signal; `free(NULL)` is valid C)
 - Format-only sinks (snprintf/printf/…) with guard × 0.70 — snprintf size param is the guard
 - Allocation-only sinks (malloc/calloc/…) × 0.70 — null-return / OOM, not overflow
 - Double-free detected: score floor 0.92

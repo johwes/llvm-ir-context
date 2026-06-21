@@ -6,18 +6,34 @@ Scores each function using only the structural facts computed by
 preprocess_slice_pdg.py + slice_context.py — no trained model, no weights.
 
 Philosophy 2 rule:
-  "Does a parameter reach a dangerous sink without a guard?"
+  "Does a parameter reach a dangerous sink without a bounds-checking guard?"
 
-Score formula:
-  base: n_sinks > 0 AND no guard            → 1.00  (unguarded sink)
-        n_sinks > 0 AND null_check only      → 0.75  (weak guard)
-        n_sinks > 0 AND bounds_check present → 0.40  (guarded)
-        no slice / no sinks                  → 0.05
+Base tier (descending priority):
+  1.00  trunc + call sink + no guard       — integer narrowing into unguarded call
+  0.88  trunc + call sink + guards         — truncation still suspicious despite guards
+  0.90  call sink + no guard + fn_arg      — direct argument to unguarded call
+  0.70  call sink + no guard, other source — upstream validation possible
+  0.75  call sink + null_check only        — null guard doesn't protect buffer writes
+  0.55  GEP-only or free-only unguarded    — not a buffer overflow signal
+  0.40–0.70  call sink + bounds_check      — guard density logic (sinks/guard ratio)
+  0.18–0.62  GEP-only + guarded           — well-covered array access
+  0.05  no sink
 
-Multipliers:
-  is_external_input   × 1.10
-  has_trunc           × 1.05
-Score capped at 1.0.
+  free() is excluded from "substantive call sink" for base-tier selection.
+  free(NULL) is valid C — bare deallocation wrappers are not a buffer overflow
+  signal. UAF/double-free risk is detected by typestate and handled via floors.
+
+Multipliers (applied after base, only when base didn't already encode the risk):
+  buffer-write sinks × 1.50 — skipped when trunc or null_check drove the base
+  is_external_input  × 1.10
+  free() call site   × 1.05 — UAF signal; skipped when free is the only call sink
+  format-only + guard × 0.70
+  allocation-only     × 0.70
+  double-free floor   → 0.92
+  UAF floor           → 0.88
+
+Guard density for the bounds_check/mixed tier uses non-free call-sink count so
+GEP noise doesn't make guarded memcpy functions appear sparse.
 
 MAX ensemble (--gnn-checkpoint):
   Loads a trained GNN checkpoint and scores each function with it too.
