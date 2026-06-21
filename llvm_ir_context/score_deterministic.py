@@ -160,13 +160,18 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     has_buffer_write  = bool(call_sink_fns & _BUFFER_WRITE_SINKS)
     all_format_sinks  = bool(call_sink_fns) and call_sink_fns <= _FORMAT_ONLY_SINKS
 
+    has_free_sink = any(s.get("fn") == "free" for s in sinks
+                        if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS)
+
     mult = 1.0
     if is_ext:
         mult *= 1.10
     if has_buffer_write:
-        mult *= 1.20   # raw copy with no built-in size limit
+        mult *= 1.50   # raw copy with no built-in size limit — categorically most dangerous
     elif all_format_sinks and has_guard:
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
+    if has_free_sink and not has_buffer_write:
+        mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
     # trunc already baked into tier — no extra multiplier when it drove the base score
     # Caller has icmp guard → reduce confidence only for small, no-arg internal helpers
@@ -402,7 +407,9 @@ def main() -> None:
                 details[fn_name]    += "  [gep-only suppressed]"
 
     # --- build ranked list and print ---
-    rule_ranked = sorted(rule_scores.items(), key=lambda x: x[1], reverse=True)
+    rule_ranked = sorted(rule_scores.items(),
+                         key=lambda x: (x[1], summaries.get(x[0], {}).get("n_sinks", 0)),
+                         reverse=True)
     _print_table("Philosophy 2 rule", rule_ranked, answer_key, top_k, details)
 
     # --- summary ---
