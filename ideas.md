@@ -213,6 +213,66 @@ logic is a handful of conditionals.
 
 ---
 
+## Harness quality: strcmp guards block fuzzer coverage
+
+### The problem
+
+When a target function has a hardcoded credential check early (e.g.,
+`strcmp(pass, "scarnet123") == 0`), libFuzzer's random mutations never flip
+that branch. Coverage freezes, and the real bug downstream (e.g., a
+null-terminator-less `memcpy` into a fixed-size buffer) is never reached.
+
+`session_login` in scarnet demonstrates this exactly: the fuzzer ran 10,000
+rounds at `cov: 9 ft: 10` — flat from start to finish — because the strcmp
+exit path never opened up.
+
+### Two complementary improvements
+
+**1. String literal extraction for fuzzer dictionaries**
+
+LLVM IR contains all hardcoded string constants as global `@.str` symbols:
+
+```llvm
+@.str.1 = private unnamed_addr constant [11 x i8] c"scarnet123\00"
+```
+
+The slicer already reads IR text. A post-pass that extracts string constants
+reachable in the backward slice and emits a `.dict` file would give libFuzzer
+the tokens it needs to flip strcmp branches. Implementation: walk `@.str*`
+globals referenced in the slice function body, decode the byte array, write
+to `<fn_name>.dict`. Low effort, high payoff for credential-checking targets.
+
+**2. Strcmp guard hint in slice_context.py**
+
+Higher value than a dictionary: when the slicer detects an `icmp` guard fed
+by a `call @strcmp` (or `@strncmp`, `@memcmp`) with a known global string
+argument, emit a harness hint: "argument `X` is gated by a strcmp against the
+literal `"scarnet123"` — hardcode that value and fuzz only the other
+arguments." This is the same mechanism as the `trunc` hint already in
+`slice_context.py`: a structural IR observation → concrete harness guidance.
+
+A harness that hardcodes `pass = "scarnet123"` and fuzzes only `user` would
+have found the `memcpy` null-terminator bug in scarnet in milliseconds.
+
+### Detection sketch
+
+In the backward slice, look for an `icmp` node whose operands include:
+1. A `call` to `strcmp`/`strncmp`/`memcmp`
+2. One argument of that call is a `getelementptr` into a `@.str` global
+
+When both conditions hold, record the literal value and which argument index
+holds the constant — that's the argument to hardcode in the harness; the other
+argument is the one to fuzz.
+
+### Caveats
+
+- Only detects direct strcmp against a string constant. Indirect comparisons
+  (hash check, custom equality function) are not visible in the IR slice.
+- The extracted literal is the expected value in the one function; other
+  callers may use different credentials — the hint is function-scoped.
+
+---
+
 ## Harness generation — zlib trunc targets
 
 A concrete experiment enabled by the current pipeline: generate a fuzzing
