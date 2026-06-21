@@ -165,14 +165,21 @@ The score maps structural evidence to a priority signal:
 | GEP-only + bounds check | 0.18–0.28 |
 | no sink | 0.05 |
 
-Multipliers (applied after base tier):
-- Buffer-write sinks (strcpy/memcpy/gets/…) × 1.50 — raw copies, no built-in size limit
+Multipliers (applied after base tier, but only when the base tier didn't already encode the risk):
+- Buffer-write sinks (strcpy/memcpy/gets/…) × 1.50 — **skipped** when `trunc` or `null_check` drove the base tier; those bases already encode the severity and stacking would push well-characterised patterns to 1.00
 - `is_external_input` × 1.10 — network/user data demonstrably reaches sink
 - `free()` call site × 1.05 — UAF/double-free signal without a raw copy
 - Format-only sinks (snprintf/printf/…) with guard × 0.70 — snprintf size param is the guard
 - Allocation-only sinks (malloc/calloc/…) × 0.70 — null-return / OOM, not overflow
 - Double-free detected: score floor 0.92
 - Use-after-free detected: score floor 0.88
+
+Guard density for the `bounds_check`/`mixed` tier uses call-sink count (excluding
+`free()`) when non-free call sinks are present. This prevents functions with many
+GEP sinks and a handful of memcpy calls (e.g. state-copy helpers) from appearing
+sparse when the guards actually cover the memcpy paths. When `free()` is the only
+non-GEP call sink, density falls back to total count — a null-check before
+`free(ptr)` prevents null-deref but not UAF, so the overall ratio remains informative.
 
 The `trunc` check comes first because narrowing is suspicious even when other
 guards exist — those guards may protect different things. For div/rem sinks,

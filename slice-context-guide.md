@@ -101,8 +101,11 @@ python score_deterministic.py --scarnet --answer-key scarnet-answer-key.txt
 | 0.40 | Guarded — bounds checks present, ratio is reasonable |
 | 0.05 | No sink found / no slice |
 
-Multipliers: buffer-write sinks ×1.50; external input ×1.10; free() ×1.05;
-format-only with guard ×0.70; allocation-only ×0.70.
+Multipliers (only when the base tier didn't already encode the risk):
+buffer-write sinks ×1.50 — skipped when `trunc` or `null_check` drove the base;
+external input ×1.10; free() ×1.05; format-only with guard ×0.70; allocation-only ×0.70.
+Guard density uses call-sink count (excluding free()) when call sinks are present,
+so GEP noise doesn't make guarded memcpy functions look sparse.
 
 ### `--no-gep-only`
 
