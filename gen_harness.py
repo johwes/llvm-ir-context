@@ -10,7 +10,7 @@ Example:
     python gen_harness.py /tmp/zlib-ir/inflate.ll inflate /usr/include/zlib.h
 
 Validation steps:
-  1. Compile harness to IR  (catches syntax / API errors)
+  1. Compile harness to IR  (catches syntax / API errors — retries with error)
   2. ir-score on harness IR (catches self-harm: unguarded access in test code)
 """
 
@@ -22,8 +22,9 @@ from pathlib import Path
 
 import requests
 
-ENDPOINT = "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions"
-MODEL    = "Qwen3.6-35B-A3B"
+ENDPOINT   = "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions"
+MODEL      = "Qwen3.6-35B-A3B"
+MAX_RETRIES = 3
 
 
 def get_context(ll_path: str, fn_name: str) -> str:
@@ -32,14 +33,14 @@ def get_context(ll_path: str, fn_name: str) -> str:
     return r.stdout.strip()
 
 
-def ask_qwen(prompt: str) -> str:
+def ask_qwen(messages: list[dict]) -> str:
     key = os.environ.get("QWEN_API_KEY", "")
     if not key:
         sys.exit("Set QWEN_API_KEY env var first.")
     r = requests.post(
         ENDPOINT,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": MODEL, "messages": [{"role": "user", "content": prompt}]},
+        json={"model": MODEL, "messages": messages},
         timeout=120,
     )
     r.raise_for_status()
@@ -51,16 +52,16 @@ def extract_c(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def compile_to_ir(src: Path) -> Path | None:
+def compile_to_ir(src: Path) -> tuple[Path | None, str]:
+    """Returns (ir_path, stderr). ir_path is None on failure."""
     out = src.with_suffix(".ll")
     r = subprocess.run(
         ["clang-20", "-O0", "-fno-inline", "-S", "-emit-llvm", "-w", str(src), "-o", str(out)],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
-        print("COMPILE ERROR:\n" + r.stderr)
-        return None
-    return out
+        return None, r.stderr
+    return out, ""
 
 
 def main():
@@ -76,9 +77,9 @@ def main():
     ctx = get_context(ll_path, fn_name)
     print(ctx)
 
-    # ── 2. build prompt ───────────────────────────────────────────────────────
+    # ── 2. build initial prompt ───────────────────────────────────────────────
     header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
-    prompt = f"""Write a libFuzzer harness in C for security testing.
+    initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
 ## Static analysis (IR slicer output)
 {ctx}
@@ -93,23 +94,43 @@ Requirements:
 
 Output C code only, no explanation."""
 
-    # ── 3. call Qwen ─────────────────────────────────────────────────────────
-    print(f"\n── calling {MODEL} ──────────────────────────────────")
-    code = extract_c(ask_qwen(prompt))
+    messages = [{"role": "user", "content": initial_prompt}]
 
     out_c = Path(f"harness_{fn_name}.c")
-    out_c.write_text(code)
-    print(code)
-    print(f"\n→ saved: {out_c}")
 
-    # ── 4. compile to IR ─────────────────────────────────────────────────────
-    print("\n── compiling harness to IR ──────────────────────────")
-    harness_ll = compile_to_ir(out_c)
-    if harness_ll is None:
-        sys.exit("VALIDATION: FAIL (compile error — see above)")
-    print(f"OK → {harness_ll}")
+    # ── 3. call Qwen with compile-error retry loop ────────────────────────────
+    harness_ll = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ─────────")
+        reply = ask_qwen(messages)
+        code  = extract_c(reply)
+        out_c.write_text(code)
+        print(code)
+        print(f"\n→ saved: {out_c}")
 
-    # ── 5. self-harm check ───────────────────────────────────────────────────
+        print("\n── compiling harness to IR ──────────────────────────")
+        harness_ll, stderr = compile_to_ir(out_c)
+        if harness_ll:
+            print(f"OK → {harness_ll}")
+            break
+
+        print("COMPILE ERROR:\n" + stderr)
+        if attempt == MAX_RETRIES:
+            sys.exit("VALIDATION: FAIL — compile errors after all retries")
+
+        # Feed the compiler error back as a follow-up message so Qwen has
+        # both the original context and the specific failure.
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"The harness failed to compile. Fix the C code and output "
+                f"corrected C only (no explanation).\n\n"
+                f"Compiler error:\n```\n{stderr.strip()}\n```"
+            ),
+        })
+
+    # ── 4. self-harm check ───────────────────────────────────────────────────
     print("\n── ir-score on harness (self-harm check) ────────────")
     r = subprocess.run(
         ["ir-score", "--ir-dir", str(harness_ll)],
