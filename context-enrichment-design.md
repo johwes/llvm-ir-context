@@ -84,7 +84,12 @@ From each sink node, the slicer walks backwards through two edge types:
 
 - **DFG edges** (data flow): the value used by the sink was produced by some
   earlier instruction — follow its definition chain back to the function
-  boundary
+  boundary. At `-O0`, clang emits `alloca`/`store`/`load` for every local
+  variable instead of SSA register form. A synthetic bridge pass records
+  `store` instructions (alloca_ptr → stored_val) before the main DFG loop and
+  injects direct edges from stored values to their corresponding `load` nodes,
+  so arguments passed through local variables still reach sinks in the backward
+  BFS.
 - **Control dependence edges**: the basic block containing the sink only
   executes if some earlier branch condition is true — include that condition
   and its operands
