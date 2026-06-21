@@ -272,6 +272,8 @@ def main():
                     help="Generate harnesses for top-K ranked public functions (default: 1)")
     ap.add_argument("--output-dir",   metavar="DIR", default=".",
                     help="Directory to write harness_<fn>.c (default: cwd)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Skip functions that already have a harness_<fn>.c calling the target")
     args = ap.parse_args()
 
     if args.ll and not args.function:
@@ -292,19 +294,28 @@ def main():
     targets = pick_public_functions(args.ir_dir, args.no_gep_only, header, args.top_k)
     print(f"   Selected {len(targets)} target(s): {', '.join(fn for _, fn in targets)}")
 
-    results = {"ok": [], "fail": []}
+    results = {"ok": [], "fail": [], "skipped": []}
     for ll_path, fn_name in targets:
+        if args.skip_existing:
+            existing = output_dir / f"harness_{fn_name}.c"
+            if existing.exists() and fn_name in existing.read_text(errors="replace"):
+                print(f"\n── skipping {fn_name} — harness already exists ({existing})")
+                results["skipped"].append(fn_name)
+                continue
         ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
     if args.top_k > 1:
         print(f"\n{'='*60}")
-        print(f"Summary: {len(results['ok'])} generated, {len(results['fail'])} failed")
+        print(f"Summary: {len(results['ok'])} generated, "
+              f"{len(results['skipped'])} skipped, {len(results['fail'])} failed")
         if results["ok"]:
-            print(f"  OK:   {', '.join(results['ok'])}")
+            print(f"  OK:      {', '.join(results['ok'])}")
+        if results["skipped"]:
+            print(f"  SKIPPED: {', '.join(results['skipped'])}")
         if results["fail"]:
-            print(f"  FAIL: {', '.join(results['fail'])}")
+            print(f"  FAIL:    {', '.join(results['fail'])}")
 
 
 if __name__ == "__main__":
