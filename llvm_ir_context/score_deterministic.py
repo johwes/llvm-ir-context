@@ -149,8 +149,8 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
             elif gd >= 2: base = 0.55
             else:         base = 0.40
         else:
-            # GEP with bounds check — well-covered array indexing
-            if gd >= 5:   base = 0.40
+            # GEP with bounds check — higher gd means many accesses per guard (off-by-one risk)
+            if gd >= 5:   base = 0.62   # sparse: 1 guard for 5+ GEP sinks — guard may miss some
             elif gd >= 2: base = 0.28
             else:         base = 0.18
 
