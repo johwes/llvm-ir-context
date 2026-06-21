@@ -130,6 +130,57 @@ scan in `score_deterministic.py`.
 
 ---
 
+## Patch re-validation via slicer
+
+### The problem
+
+LLMs asked to fix a vulnerability sometimes produce patches that are
+structurally wrong in non-obvious ways: replacing `memcpy` with a hardcoded
+safe response, deleting the check rather than adding it, or adding a guard
+that compares the wrong variable. Standard test suites don't catch this —
+the code compiles, functional tests pass, and the patch looks plausible in a
+diff. The only way to know the vulnerability is actually gone is to re-analyse
+the patched code structurally.
+
+### The idea
+
+After an LLM produces a patch, compile the patched function to IR and re-run
+the slicer on it. Compare the new summary against the original:
+
+- If the original had `guard_type="none"` and the patch still has
+  `guard_type="none"` for the same sink — the patch didn't add a guard.
+  Reject and tell the LLM which sink is still unguarded.
+- If the original had a `trunc` warning and the patch still does — the
+  narrowing wasn't addressed.
+- If the sink count dropped to zero — the LLM may have deleted the
+  functionality rather than fixing it. Flag for human review.
+- If `guard_type` changed to `bounds_check` and guard density is reasonable —
+  the patch structurally addressed the issue.
+
+The feedback to the LLM is concrete and tool-derived, not a vague "try again":
+`"Patch rejected: memcpy in do_inflate still has no icmp guard in its slice.
+The size argument still originates from function_argument with no bounds check."`
+
+### Why this is tractable
+
+We already have all the machinery. The only new piece is a diff between two
+`summarize_slice` outputs on the same function name — before and after the
+patch. No new analysis, no new sinks, no new pass manager. The comparison
+logic is a handful of conditionals.
+
+### Caveats
+
+- Same intra-procedural blind spot as the main slicer. A patch that moves the
+  guard into a wrapper function will look unguarded here even if it's correct.
+- Deletion of the sink (function removed or renamed) is ambiguous — it could
+  be a correct refactor or a cop-out. Human review is the right gate for that
+  case, not automated rejection.
+- This validates structural pattern, not semantic correctness. A guard that
+  compares the wrong variable (`if (src_len < limit)` when `dst_len` is what
+  matters) looks identical to a correct guard in the IR slice.
+
+---
+
 ## Harness generation — zlib trunc targets
 
 A concrete experiment enabled by the current pipeline: generate a fuzzing
