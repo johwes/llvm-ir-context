@@ -476,9 +476,49 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
     mock_cache     = {}
     mock_names     = {}
 
+    # Pre-pass: record store mappings so load instructions can trace values back
+    # through alloca/store/load chains. At -O0, clang emits alloca+store+load for
+    # every local variable instead of SSA form, breaking the backward BFS: the
+    # DFG edge from load → alloca stops at the alloca, which has no incoming edge
+    # from the stored argument. Collect alloca_ptr_id → [stored_val_node_id] here;
+    # inject synthetic DFG edges (stored_val → load) below.
+    alloca_stored_vals: dict[int, list[int]] = defaultdict(list)
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode != "store":
+                continue
+            ops = list(instr.operands)
+            if len(ops) < 2:
+                continue
+            val_op, ptr_op = ops[0], ops[1]
+            # Only bridge when the write target is a local alloca (VK_INSTRUCTION)
+            if ptr_op.value_kind != VK_INSTRUCTION:
+                continue
+            ptr_pid = _ptr_id(ptr_op)
+            if ptr_pid not in ptr_to_id:
+                continue
+            if val_op.value_kind in (VK_INSTRUCTION, VK_ARGUMENT):
+                val_pid = _ptr_id(val_op)
+                if val_pid in ptr_to_id:
+                    alloca_stored_vals[ptr_pid].append(ptr_to_id[val_pid])
+
     for block in target_fn.blocks:
         for instr in block.instructions:
             dst_id = ptr_to_id[_ptr_id(instr)]
+
+            # Synthetic store→load bridge: when a load reads from an alloca that
+            # has stored values (args or computed values), add a direct DFG edge
+            # from those values to this load node so the backward BFS can reach
+            # function arguments through -O0 alloca/store/load sequences.
+            if instr.opcode == "load":
+                load_ops = list(instr.operands)
+                if load_ops and load_ops[0].value_kind == VK_INSTRUCTION:
+                    ptr_pid = _ptr_id(load_ops[0])
+                    for stored_src_id in alloca_stored_vals.get(ptr_pid, ()):
+                        edges_src.append(stored_src_id)
+                        edges_dst.append(dst_id)
+                        edges_type.append(1)
+
             for op in instr.operands:
                 vk = op.value_kind
 
