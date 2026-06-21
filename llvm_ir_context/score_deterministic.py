@@ -184,13 +184,10 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
     # trunc already baked into tier — no extra multiplier when it drove the base score
-    # Caller has icmp guard → reduce confidence only for small, no-arg internal helpers
-    # (≤5 sinks, no direct function arguments, e.g. lm_init called by deflateInit2_).
-    # Handler functions with many sinks are NOT discounted — their callers' icmp guards
-    # are routing logic, not data validation for what the handler operates on.
-    # Also skip when trunc drove the base score.
-    if caller_validated and not has_arg_input and n_sinks <= 5 and not (has_trunc and has_call_sink):
-        mult *= 0.65
+    # caller_validated is surfaced as +caller? in the details column for human review.
+    # We do NOT apply an automatic score reduction: "caller has icmp" is too broad a
+    # signal — routing guards, null pointer checks, and loop bounds all satisfy it
+    # independently of whether they protect the data flow into this function's sinks.
 
     score = min(base * mult, 1.0)
 
