@@ -74,6 +74,13 @@ _FORMAT_ONLY_SINKS = frozenset({
     "syslog", "err", "warn",
 })
 
+# Pure allocation sinks: the bug is "null return not checked" (OOM / null-deref),
+# not buffer overflow. When ALL call sinks are allocators, apply ×0.70 penalty —
+# these matter but rank below overflow/UAF vulnerabilities.
+_ALLOC_ONLY_SINKS = frozenset({
+    "malloc", "calloc", "realloc", "xmalloc", "xrealloc",
+})
+
 
 def philosophy2_score(summary: dict) -> float:  # noqa: C901
     """Pure structural Philosophy 2 score from a slice_context summary.
@@ -159,6 +166,7 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
                      if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS}
     has_buffer_write  = bool(call_sink_fns & _BUFFER_WRITE_SINKS)
     all_format_sinks  = bool(call_sink_fns) and call_sink_fns <= _FORMAT_ONLY_SINKS
+    all_alloc_sinks   = bool(call_sink_fns) and call_sink_fns <= _ALLOC_ONLY_SINKS
 
     has_free_sink = any(s.get("fn") == "free" for s in sinks
                         if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS)
@@ -170,6 +178,8 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         mult *= 1.50   # raw copy with no built-in size limit — categorically most dangerous
     elif all_format_sinks and has_guard:
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
+    elif all_alloc_sinks:
+        mult *= 0.70   # null-return / OOM bug, not overflow — lower severity
     if has_free_sink and not has_buffer_write:
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
