@@ -407,9 +407,41 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         f"Slice: {N} nodes, {n_sinks} sink(s) ({len(unique_sinks)} unique type(s))."
     )
 
+    # Buffer-write sink set — used for guard-type-aware hints below.
+    _BUFFER_WRITE_FNS = frozenset({
+        "strcpy", "strncpy", "strcat", "strncat",
+        "memcpy", "memmove", "memset", "bcopy",
+        "gets", "fgets", "sprintf", "vsprintf",
+    })
+    has_buffer_write_sink = any(s.get("fn") in _BUFFER_WRITE_FNS for s in sinks)
+
     if has_trunc:
+        # Identify the size-taking sink the truncation feeds so the hint is specific.
+        trunc_sinks = [s.get("fn") for s in sinks if s.get("fn") in _SIZE_SINKS]
+        trunc_target = trunc_sinks[0] if trunc_sinks else "the size argument"
         hint_parts.append(
-            f"fuzz integer truncation: supply values > INT_MAX / > UINT32_MAX as size"
+            f"fuzz integer truncation: a wide integer (e.g. i64) is narrowed to a "
+            f"narrower type (e.g. i32) before reaching {trunc_target} — "
+            f"derive the length from all input bytes without capping it; "
+            f"do not artificially bound the output buffer; "
+            f"try sizes near UINT32_MAX (0xFFFFFFFF) and values that differ only in "
+            f"high bits (e.g. 0x100000001) to trigger the truncation wrap"
+        )
+
+    if guard_type == "null_check" and has_buffer_write_sink:
+        # null_check (icmp eq/ne) protects pointer validity, not the size argument.
+        # Without this note the LLM often assumes the guard is sufficient.
+        hint_parts.append(
+            "note: the guard is a null-pointer check (icmp eq/ne) — it does NOT bound "
+            "the size argument; the buffer write is unprotected; fuzz the size without restriction"
+        )
+
+    if "function_argument" not in input_channels and "external_call_return" in input_channels:
+        # Input arrives via struct field or callee return value, not a direct parameter.
+        # Harnesses that just pass raw bytes will miss the actual data path.
+        hint_parts.append(
+            "input enters via struct field or callee return value — "
+            "populate the input structure before the call rather than passing raw bytes directly"
         )
 
     if double_free:
@@ -533,7 +565,8 @@ def format_for_llm(summary: dict, score: float | None = None,
         lines.append(f"Distance        : {min_dist} hop(s) source→sink")
 
     if summary.get("has_trunc"):
-        lines.append(f"Trunc warning   : {summary['trunc_count']} integer narrowing(s) — check size args for truncation")
+        lines.append(f"Trunc warning   : {summary['trunc_count']} integer narrowing(s) — "
+                     f"wide integer narrowed before size arg; values near UINT32_MAX trigger wrap")
     if summary.get("double_free"):
         ptrs = summary.get("freed_ptrs", [])
         ptr_str = ", ".join(ptrs[:3]) + (" ..." if len(ptrs) > 3 else "")
