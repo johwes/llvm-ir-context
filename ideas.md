@@ -273,6 +273,74 @@ argument is the one to fuzz.
 
 ---
 
+## Harness quality: split-input pattern for alloc+copy functions
+
+### The problem
+
+`scar_alloc_copy(const char *s, size_t len)` has an unguarded `memcpy(buf, s, len)`
+that the slicer correctly flags. But the harness Qwen generates is:
+
+```c
+scar_alloc_copy((const char *)Data, Size);
+```
+
+libFuzzer guarantees `Data` is exactly `Size` bytes, so `memcpy` always reads
+within bounds. Coverage hits 5 counters — every reachable branch — and stays
+flat for 10,000 runs. The slicer was right about the risk; the harness is
+wrong about how to exercise it.
+
+The vulnerability is a **caller-side API misuse bug**: `len` exceeds the actual
+allocation of `s`. This class of bug cannot be triggered by calling the function
+with a matching `(data, size)` pair. It requires the harness to deliberately
+create a mismatch.
+
+### The split-input pattern
+
+For alloc+copy functions where the dangerous call is `memcpy(buf, s, len)`:
+
+```c
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    if (Size < 2) return 0;
+    // First byte controls source buffer size; remaining bytes are copy length
+    size_t s_len    = (Data[0] % 64) + 1;
+    size_t copy_len = Size - 1;
+    char *s = malloc(s_len + 1);
+    if (!s) return 0;
+    memcpy(s, Data + 1, s_len < Size - 1 ? s_len : Size - 1);
+    s[s_len] = '\0';
+    scar_alloc_copy(s, copy_len);   // copy_len >> s_len → heap OOB read
+    free(s);
+    return 0;
+}
+```
+
+`copy_len` grows with `Size`; `s_len` is bounded to 64. libFuzzer quickly
+finds inputs where `copy_len > s_len`, which are the inputs that trigger the
+heap read overflow ASAN would catch.
+
+### How to detect this case in the slicer
+
+The split-input pattern is appropriate when:
+1. The function takes two parameters — a buffer pointer and a length
+2. The dangerous sink (`memcpy`, `strcpy`) uses the length parameter
+3. The length parameter is the `function_argument` source (not derived from
+   the buffer itself via `strlen` or similar)
+4. There is no guard comparing the length against an allocation or buffer size
+
+When all four hold, the slice context hint should say: "split input — derive
+`len` from one region and `s` from another so they can diverge; use a small
+fixed-size `s` (e.g., 64 bytes) and let `len` be fuzzed freely."
+
+### Three coverage-flatness root causes now documented
+
+| Root cause | Example | Fix |
+|---|---|---|
+| Credential strcmp gate | `session_login` (strcmp vs "scarnet123") | Literal extraction → dict or hardcode-arg hint |
+| API misuse only triggerable by caller | `scar_alloc_copy` (len vs s allocation) | Split-input harness pattern hint |
+| Internal helper (no public entry) | `lm_init` | Header-aware auto-pick (already implemented) |
+
+---
+
 ## Harness generation — zlib trunc targets
 
 A concrete experiment enabled by the current pipeline: generate a fuzzing
