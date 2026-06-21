@@ -47,9 +47,6 @@ import llvmlite.binding as llvm
 HERE = Path(__file__).parent
 DATA = HERE / "data"
 
-sys.path.insert(0, str(HERE))
-from preprocess import compile_to_ir, download_devign
-
 # ---------------------------------------------------------------------------
 # Opcode vocabulary (identical to preprocess_instr.py — 110 entries)
 # ---------------------------------------------------------------------------
@@ -768,6 +765,10 @@ def process_split_slice_pdg(jsonl_path, subset, workers, seed=42):
 # ---------------------------------------------------------------------------
 
 def main():
+    import sys as _sys
+    _sys.path.insert(0, str(HERE))
+    from preprocess import compile_to_ir, download_devign  # noqa: F401 — Devign batch only
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--subset",        type=int,  default=None)
     ap.add_argument("--workers",       type=int,  default=4)
