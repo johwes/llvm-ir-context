@@ -56,17 +56,47 @@ identified by the trunc/truncation warnings in the slice context.
 
 ### Implementation sketch
 
-A ~50-line addition to `score_deterministic.py` (or a new `ir-validate-harness`
-CLI entry point) that:
+**Preferred approach: linked IR.**
 
-1. Accepts the harness `.ll` file and the target function name as arguments
-2. Runs the existing `ir_to_graph_slice_pdg` with the target call treated as
-   the sink (may require a small extension to accept a custom sink name)
-3. Checks `input_channels` for `function_argument`
-4. Runs `philosophy2_score` on the harness IR itself and warns if anything
-   scores above a threshold (self-harm check)
-5. Returns pass/fail + structured reason so the orchestration layer can loop
-   back to the LLM with specific feedback
+Compile the harness and the target library together into a single `.ll` file
+rather than keeping them separate:
+
+```bash
+# Compile both to IR, then link into one module
+clang-20 -O0 -fno-inline -S -emit-llvm harness.c -o harness.ll
+llvm-link harness.ll target.ll -o combined.ll -S
+```
+
+Then run the slicer on the combined module with the harness entry point as the
+function under analysis:
+
+```python
+g = ir_to_graph_slice_pdg(combined_ir_text, fn_name="LLVMFuzzerTestOneInput")
+summary = summarize_slice(g, fn_name="LLVMFuzzerTestOneInput")
+```
+
+Because the target function body is present in the combined IR (not a `declare`
+stub), the slicer's backward BFS follows DFG edges all the way from the
+dangerous sink inside the target, through the call site in the harness, back to
+the `data` and `size` arguments of `LLVMFuzzerTestOneInput`. No custom sink
+extension needed — the existing dangerous sink list already covers `memcpy`,
+`strcpy`, etc. in the target function.
+
+Checks on the resulting summary:
+
+1. `"function_argument" in summary["input_channels"]` — blank-shooter check.
+   If false, `data`/`size` never reach the sink; reject and tell the LLM which
+   call argument is disconnected.
+2. `philosophy2_score(summary)` above a threshold on the harness IR itself —
+   self-harm check. An unguarded array access in the harness body scores high
+   and is a bug in the test code.
+3. Sink types in `summary["sinks"]` match what the original target analysis
+   flagged — confirms the harness is targeting the right code path.
+
+The alternative (compile harness alone, treat target call as a custom sink)
+also works but sees only a `declare` stub for the target — enough for the
+blank-shooter check but not for tracing through the target's internal data
+flow.
 
 ### Pipeline position
 
@@ -89,12 +119,14 @@ CPU cost of a blank-shooter harness.
   the call" does not guarantee it flows to the *right* argument in the *right*
   way. Value-level correctness (e.g., is SIZE_MAX actually reachable?) is not
   checkable without symbolic execution.
-- The harness likely calls into a compiled library rather than containing the
-  target function definition. The slicer will see a `declare` stub for the
-  target. That is enough to detect whether arguments flow into the call site —
-  the actual body is not needed for the blank-shooter check.
+- The linked IR approach requires the target source or IR to be available at
+  validation time. When analysing a pre-compiled binary (no source), fall back
+  to the stub approach — enough for the blank-shooter check, not for tracing
+  through the target's internals.
 - Guard presence in the harness is not the same as guard correctness (same
-  caveat as the main slicer).
+  caveat as the main slicer). A harness with `if (Size < 4) return 0` is
+  correct and necessary — don't penalise guards in the harness body, only flag
+  unguarded *accesses* in the harness itself.
 
 ---
 
