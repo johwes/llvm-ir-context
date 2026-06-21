@@ -213,6 +213,7 @@ Requirements:
 - Use the exact function signature from the IR / API reference above
 - Check the API reference for required initialization and teardown functions and call them
 - Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size
+- If `Data` is used as a string (passed to a function expecting `const char *`), null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set the last byte to `\\0`
 - Initialize any required state before the call; clean it up after
 - Return 0
 
