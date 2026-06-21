@@ -373,7 +373,8 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
 # Graph builder — 5-pass algorithm + PDG slice extraction
 # ---------------------------------------------------------------------------
 
-def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None):
+def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
+                          extra_modules=None):
     """
     Build instruction-level graph then extract PDG backward slice.
 
@@ -554,10 +555,11 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None):
     g["use_after_free"] = free_info["use_after_free"]
     g["freed_ptrs"]     = free_info["freed_ptrs"]
 
-    # Shallow caller guard check: look for icmp in any direct caller in this module.
-    # Only meaningful when fn_name is given (multi-function module mode).
+    # Shallow caller guard check: look for icmp in any direct caller.
+    # extra_modules lets score_deterministic pass all loaded modules for cross-file coverage.
     if target_fn is not None and fn_name is not None:
-        caller_info = _check_caller_guards(mod, target_fn.name)
+        all_mods = [mod] + (list(extra_modules) if extra_modules else [])
+        caller_info = _check_caller_guards(all_mods, target_fn.name)
         g["caller_count"]     = caller_info["caller_count"]
         g["caller_validated"] = caller_info["caller_validated"]
         g["caller_names"]     = caller_info["caller_names"]
@@ -573,39 +575,46 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None):
 # Shallow caller guard check (1-level-up, intra-module)
 # ---------------------------------------------------------------------------
 
-def _check_caller_guards(mod, fn_name: str) -> dict:
+def _check_caller_guards(modules, fn_name: str) -> dict:
     """
-    Check whether any direct caller of fn_name in mod has an icmp guard on the
-    argument value it passes — a proxy for upstream validation.
+    Check whether any direct caller of fn_name has an icmp guard — searched
+    across all provided modules (cross-file aware).
+
+    modules: single llvmlite module OR list of modules. Passing all loaded
+             modules catches callers defined in different compilation units.
 
     Returns dict:
-      caller_count    int   — number of distinct callers found
-      caller_validated bool — at least one caller has an icmp before the call site
-      caller_names    list  — names of functions that call fn_name
+      caller_count     int  — number of distinct callers found
+      caller_validated bool — at least one caller has an icmp
+      caller_names     list — names of functions that call fn_name
     """
+    if not isinstance(modules, (list, tuple)):
+        modules = [modules]
+
     callers_with_guard: list[str] = []
     all_callers:        list[str] = []
 
-    for fn in mod.functions:
-        if fn.is_declaration or fn.name == fn_name:
-            continue
+    for mod in modules:
+        for fn in mod.functions:
+            if fn.is_declaration or fn.name == fn_name:
+                continue
 
-        fn_calls_target  = False
-        caller_has_icmp  = False
+            fn_calls_target = False
+            caller_has_icmp = False
 
-        for block in fn.blocks:
-            for instr in block.instructions:
-                if instr.opcode == "call":
-                    for op in instr.operands:
-                        if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR) and op.name == fn_name:
-                            fn_calls_target = True
-                elif instr.opcode == "icmp":
-                    caller_has_icmp = True
+            for block in fn.blocks:
+                for instr in block.instructions:
+                    if instr.opcode == "call":
+                        for op in instr.operands:
+                            if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR) and op.name == fn_name:
+                                fn_calls_target = True
+                    elif instr.opcode == "icmp":
+                        caller_has_icmp = True
 
-        if fn_calls_target:
-            all_callers.append(fn.name)
-            if caller_has_icmp:
-                callers_with_guard.append(fn.name)
+            if fn_calls_target:
+                all_callers.append(fn.name)
+                if caller_has_icmp:
+                    callers_with_guard.append(fn.name)
 
     return {
         "caller_count":     len(all_callers),
@@ -618,72 +627,110 @@ def _check_caller_guards(mod, fn_name: str) -> dict:
 # Double-free / use-after-free detector (intra-procedural, SSA names)
 # ---------------------------------------------------------------------------
 
-_FREE_RE    = re.compile(r'\bcall\b.*?\bfree\s*\(\s*(.*?)\s*\)')
-_USE_SSA_RE = re.compile(r'(%[\w.]+)')
-
-
 def _detect_double_free(fn) -> dict:
     """
-    Scan a function for double-free and use-after-free patterns using raw IR text.
+    Detect double-free and use-after-free using llvmlite operand identity.
 
-    Strategy: iterate instructions as text, track SSA pointer operands passed to
-    free(). If the same SSA name hits free() again → double-free. If any load or
-    non-free call uses the SSA name after a free() → use-after-free.
+    Tracks freed pointers by their llvmlite value identity (_ptr_id), not by
+    SSA name text — so bitcast wrappers and type-cast aliases are handled
+    transparently. Also walks through bitcast/inttoptr chains to normalise the
+    canonical pointer identity before comparing.
 
-    Returns dict with keys:
-      double_free   bool  — same ptr freed twice
+    State machine per pointer:
+      LIVE  → free(p) → FREED
+      FREED → free(p) again         → double_free
+      FREED → load/store/call(p)    → use_after_free
+
+    Returns dict:
+      double_free    bool — same canonical ptr freed twice
       use_after_free bool — ptr used after first free
-      freed_ptrs    list  — SSA names that were freed
+      freed_ptrs     list — SSA display names of freed pointers
     """
-    freed: dict[str, int] = {}   # ssa_name → instruction index of first free
-    double_free   = False
+    # freed_ids: canonical ptr_id → SSA display name (from str(op))
+    freed_ids:  dict[int, str] = {}
+    double_free    = False
     use_after_free = False
-    freed_ptrs: list[str] = []
 
-    instr_idx = 0
+    def _canonical_ptr_id(op):
+        """Follow bitcast / inttoptr / addrspacecast chains to the base value."""
+        seen = set()
+        while True:
+            pid = _ptr_id(op)
+            if pid in seen:
+                break
+            seen.add(pid)
+            if op.value_kind != VK_INSTRUCTION:
+                break
+            # Peek at opcode via string representation — llvmlite exposes no opcode
+            # on Value objects directly, only on Instruction objects.
+            # We use the ptr_to_id map built during graph construction, but here we
+            # don't have it, so fall back to checking operand count.
+            try:
+                ops = list(op.operands)
+            except Exception:
+                break
+            if len(ops) == 1 and ops[0].value_kind in (VK_INSTRUCTION, VK_ARGUMENT):
+                op = ops[0]   # peel one layer of single-operand cast
+            else:
+                break
+        return _ptr_id(op)
+
     for block in fn.blocks:
         for instr in block.instructions:
-            text = str(instr)
-            opc  = instr.opcode
+            opc = instr.opcode
 
             if opc == "call":
-                # Check if this is a call to free / xfree / cfree / etc.
-                callee = ""
-                for op in instr.operands:
+                ops = list(instr.operands)
+                # Last operand of a call is the callee function reference
+                callee_name = ""
+                for op in ops:
                     if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
-                        callee = op.name
+                        callee_name = op.name
                         break
-                norm = _normalize_sink_name(callee.lstrip("@"))
-                if norm == "free" or (norm.endswith("free") and _is_dangerous(callee)):
-                    # Extract the first pointer argument SSA name from IR text
-                    m = _FREE_RE.search(text)
-                    if m:
-                        ptr = m.group(1).strip()
-                        # Normalise: keep only the SSA name prefix (strip type cast noise)
-                        ssa_matches = _USE_SSA_RE.findall(ptr)
-                        if ssa_matches:
-                            ptr = ssa_matches[-1]   # last SSA reference = the actual pointer
-                        if ptr in freed:
+
+                norm = _normalize_sink_name(callee_name.lstrip("@"))
+                is_free_call = (norm == "free" or
+                                (norm.endswith("free") and _is_dangerous(callee_name)))
+
+                if is_free_call:
+                    # First non-callee operand is the pointer argument
+                    ptr_op = None
+                    for op in ops:
+                        if op.value_kind not in (VK_FUNCTION, VK_GLOBAL_VAR):
+                            ptr_op = op
+                            break
+                    if ptr_op is not None:
+                        cid = _canonical_ptr_id(ptr_op)
+                        if cid in freed_ids:
                             double_free = True
                         else:
-                            freed[ptr] = instr_idx
-                            freed_ptrs.append(ptr)
+                            freed_ids[cid] = str(ptr_op).split()[-1]  # SSA name for display
                 else:
-                    # Any other call — check if a freed ptr appears as argument
-                    for ptr, free_idx in freed.items():
-                        if instr_idx > free_idx and ptr in text:
-                            use_after_free = True
-            elif opc == "load":
-                for ptr, free_idx in freed.items():
-                    if instr_idx > free_idx and ptr in text:
-                        use_after_free = True
+                    # Non-free call: check if any argument is a freed pointer
+                    if not use_after_free and freed_ids:
+                        for op in ops:
+                            if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
+                                continue
+                            if _canonical_ptr_id(op) in freed_ids:
+                                use_after_free = True
+                                break
 
-            instr_idx += 1
+            elif opc == "load" and freed_ids:
+                # load's first operand is the pointer being read
+                ops = list(instr.operands)
+                if ops and _canonical_ptr_id(ops[0]) in freed_ids:
+                    use_after_free = True
+
+            elif opc == "store" and freed_ids:
+                # store val, ptr — second operand is the pointer
+                ops = list(instr.operands)
+                if len(ops) >= 2 and _canonical_ptr_id(ops[1]) in freed_ids:
+                    use_after_free = True
 
     return {
         "double_free":    double_free,
         "use_after_free": use_after_free,
-        "freed_ptrs":     freed_ptrs,
+        "freed_ptrs":     list(freed_ids.values()),
     }
 
 

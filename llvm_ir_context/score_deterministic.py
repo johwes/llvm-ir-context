@@ -360,6 +360,19 @@ def main() -> None:
     else:
         print(f"No answer key — showing all {len(functions)} functions ranked")
 
+    # --- parse all modules once for cross-file caller scanning ---
+    import llvmlite.binding as _llvm
+    all_modules = []
+    seen_ir: set[int] = set()
+    for _, fn_ir, _ in functions:
+        ir_id = id(fn_ir)
+        if ir_id not in seen_ir:
+            seen_ir.add(ir_id)
+            try:
+                all_modules.append(_llvm.parse_assembly(fn_ir))
+            except Exception:
+                pass
+
     # --- score each function ---
     rule_scores: dict[str, float] = {}
     details:     dict[str, str]   = {}
@@ -369,7 +382,7 @@ def main() -> None:
 
     for fn_name, fn_ir, fn_file in functions:
         fn_files[fn_name] = fn_file
-        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name)
+        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name, extra_modules=all_modules)
         if g is None or g.get("x") is None:
             rule_scores[fn_name] = 0.05
             details[fn_name]     = f"no slice ({fn_file.name})"
