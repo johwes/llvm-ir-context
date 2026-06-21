@@ -140,10 +140,12 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     if is_ext:
         mult *= 1.10
     # trunc already baked into tier — no extra multiplier when it drove the base score
-    # Caller has icmp guard → reduce confidence; this function may be a guarded helper.
-    # Don't apply when trunc drove the base (trunc+call_sink is still suspicious even if
-    # a caller validates — the truncation itself may be the bug).
-    if caller_validated and not (has_trunc and has_call_sink):
+    # Caller has icmp guard → reduce confidence only when this function takes NO direct
+    # function arguments (pure internal helper pattern, e.g. lm_init called by deflateInit2_).
+    # Handler functions that receive client data via arguments are NOT discounted — their
+    # caller's icmp guards routing logic, not the data they operate on.
+    # Also skip when trunc drove the base score.
+    if caller_validated and not has_arg_input and not (has_trunc and has_call_sink):
         mult *= 0.65
 
     score = min(base * mult, 1.0)
