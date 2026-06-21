@@ -171,10 +171,15 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     has_free_sink = any(s.get("fn") == "free" for s in sinks
                         if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS)
 
+    trunc_drove_base = has_trunc and has_call_sink
+
     mult = 1.0
     if is_ext:
         mult *= 1.10
-    if has_buffer_write:
+    if has_buffer_write and not trunc_drove_base:
+        # Skip when trunc drove the tier — the tier already captures the severity.
+        # Incidental narrowing ops (zlib bitstream arithmetic) must not compound with
+        # the ×1.50 boost and push every guarded memcpy function to 1.00.
         mult *= 1.50   # raw copy with no built-in size limit — categorically most dangerous
     elif all_format_sinks and has_guard:
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
@@ -183,7 +188,7 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     if has_free_sink and not has_buffer_write:
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
-    # trunc already baked into tier — no extra multiplier when it drove the base score
+    # caller_validated is surfaced as +caller? in the details column for human review.
     # caller_validated is surfaced as +caller? in the details column for human review.
     # We do NOT apply an automatic score reduction: "caller has icmp" is too broad a
     # signal — routing guards, null pointer checks, and loop bounds all satisfy it
