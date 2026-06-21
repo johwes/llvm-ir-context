@@ -37,7 +37,8 @@ import requests
 ENDPOINT    = "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions"
 MODEL       = "Qwen3.6-35B-A3B"
 MAX_RETRIES = 3
-SELF_HARM_WARN = 0.90
+SELF_HARM_WARN      = 0.90
+SELF_HARM_REVIEW    = 0.80   # below this is expected harness boilerplate
 
 
 # ---------------------------------------------------------------------------
@@ -132,20 +133,20 @@ def extract_c(text: str) -> str:
 # Compilation + validation
 # ---------------------------------------------------------------------------
 
-def compile_to_ir(src: Path) -> tuple[Path | None, str]:
+def compile_to_ir(src: Path, include_dirs: list[str] | None = None) -> tuple[Path | None, str]:
     out = src.with_suffix(".ll")
-    r = subprocess.run(
-        ["clang-20", "-O0", "-fno-inline", "-S", "-emit-llvm", "-w",
-         str(src), "-o", str(out)],
-        capture_output=True, text=True,
-    )
+    cmd = ["clang-20", "-O0", "-fno-inline", "-S", "-emit-llvm", "-w"]
+    for d in (include_dirs or []):
+        cmd += ["-I", d]
+    cmd += [str(src), "-o", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     return (out, "") if r.returncode == 0 else (None, r.stderr)
 
 
 def self_harm_verdict(score: float) -> str:
     if score >= SELF_HARM_WARN:
         return f"WARNING ({score:.0%}) — likely real bug in harness; review before fuzzing"
-    if score >= 0.60:
+    if score >= SELF_HARM_REVIEW:
         return f"REVIEW ({score:.0%}) — elevated; check flagged sinks"
     return f"OK ({score:.0%}) — expected harness noise"
 
@@ -177,7 +178,8 @@ def main():
     if args.ll and not args.function:
         ap.error("--function is required with --ll")
 
-    header = Path(args.header).read_text(errors="replace") if args.header else ""
+    header      = Path(args.header).read_text(errors="replace") if args.header else ""
+    include_dirs = [str(Path(args.header).parent)] if args.header else []
 
     # ── 1. resolve target ─────────────────────────────────────────────────────
     if args.ir_dir:
@@ -233,7 +235,7 @@ Output C code only, no explanation."""
         print(f"\n→ saved: {out_c}")
 
         print("\n── compiling harness to IR ──────────────────────────")
-        harness_ll, stderr = compile_to_ir(out_c)
+        harness_ll, stderr = compile_to_ir(out_c, include_dirs)
         if harness_ll:
             print(f"OK → {harness_ll}")
             break
