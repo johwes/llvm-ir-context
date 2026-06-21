@@ -211,6 +211,7 @@ Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` targeting `
 
 Requirements:
 - Use the exact function signature from the IR / API reference above
+- Check the API reference for required initialization and teardown functions and call them
 - Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size
 - Initialize any required state before the call; clean it up after
 - Return 0
