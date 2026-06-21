@@ -156,14 +156,18 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
             # look sparse even when the guards actually cover the memcpy/memset paths.
             # Example: deflateCopy has 67 GEP + 8 call sinks / 9 guards → total gd=8.3,
             # but call gd=0.89 (well-covered). We want 0.40, not 0.70.
+            # Exclude free() from the count: a null-check before free(ptr) only prevents
+            # null-deref, not UAF/double-free. If the only call sinks are free, fall back
+            # to total density so the overall sink-to-guard ratio still informs the base.
             gc = summary.get("guard_count", 1) or 1
-            n_call_sinks = sum(1 for s in sinks
-                               if s.get("fn") not in _GEP_SINKS
-                               and s.get("fn") not in _DIV_SINKS)
-            call_gd = n_call_sinks / gc
-            if call_gd >= 5:   base = 0.70
-            elif call_gd >= 2: base = 0.55
-            else:              base = 0.40
+            n_call_sinks_nonfree = sum(1 for s in sinks
+                                       if s.get("fn") not in _GEP_SINKS
+                                       and s.get("fn") not in _DIV_SINKS
+                                       and s.get("fn") != "free")
+            effective_gd = (n_call_sinks_nonfree / gc) if n_call_sinks_nonfree > 0 else gd
+            if effective_gd >= 5:   base = 0.70
+            elif effective_gd >= 2: base = 0.55
+            else:                   base = 0.40
         else:
             # GEP with bounds check — higher gd means many accesses per guard (off-by-one risk)
             if gd >= 5:   base = 0.62   # sparse: 1 guard for 5+ GEP sinks — guard may miss some
