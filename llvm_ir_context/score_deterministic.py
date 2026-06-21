@@ -140,12 +140,12 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     if is_ext:
         mult *= 1.10
     # trunc already baked into tier — no extra multiplier when it drove the base score
-    # Caller has icmp guard → reduce confidence only when this function takes NO direct
-    # function arguments (pure internal helper pattern, e.g. lm_init called by deflateInit2_).
-    # Handler functions that receive client data via arguments are NOT discounted — their
-    # caller's icmp guards routing logic, not the data they operate on.
+    # Caller has icmp guard → reduce confidence only for small, no-arg internal helpers
+    # (≤5 sinks, no direct function arguments, e.g. lm_init called by deflateInit2_).
+    # Handler functions with many sinks are NOT discounted — their callers' icmp guards
+    # are routing logic, not data validation for what the handler operates on.
     # Also skip when trunc drove the base score.
-    if caller_validated and not has_arg_input and not (has_trunc and has_call_sink):
+    if caller_validated and not has_arg_input and n_sinks <= 5 and not (has_trunc and has_call_sink):
         mult *= 0.65
 
     score = min(base * mult, 1.0)
@@ -358,7 +358,12 @@ def main() -> None:
         gep_only_fns = set()
         for fn_name, summary in summaries.items():
             sink_types = {s.get("fn") for s in summary["sinks"]}
-            if sink_types and sink_types <= {"getelementptr"}:
+            # Only suppress when GEP is the only sink type AND there are no bounds checks.
+            # GEP-only + bounds_check means real array indexing with guard logic (parsing,
+            # protocol code) — suppressing that would hide genuine vulnerabilities.
+            # GEP-only + no guard / null_check = table lookup pattern → safe to suppress.
+            has_bounds = summary.get("bounds_check_count", 0) > 0
+            if sink_types and sink_types <= {"getelementptr"} and not has_bounds:
                 gep_only_fns.add(fn_name)
         if gep_only_fns:
             print(f"--no-gep-only: suppressing {len(gep_only_fns)} GEP-only function(s): "
