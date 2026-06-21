@@ -105,6 +105,17 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
 
     has_call_sink    = any(s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS
                           for s in sinks)
+    # Substantive call sink: excludes free() for base-tier purposes.
+    # free(ptr) with a function arg and no null check isn't a ranking signal —
+    # free(NULL) is valid C, and the real free() risks (UAF, double-free) are
+    # caught by typestate analysis. Counting free as a "call sink" pushes bare
+    # deallocation wrappers (zcfree, xfree) to the top of the ranking incorrectly.
+    has_substantive_call_sink = any(
+        s.get("fn") not in _GEP_SINKS
+        and s.get("fn") not in _DIV_SINKS
+        and s.get("fn") != "free"
+        for s in sinks
+    )
     has_div_sink     = any(s.get("fn") in _DIV_SINKS for s in sinks)
     has_arg_input    = "function_argument" in channels
     caller_validated = summary.get("caller_validated", False)
@@ -133,18 +144,18 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         base = 1.00 if not has_guard else 0.88
 
     elif not has_guard:
-        if has_call_sink and has_arg_input:
+        if has_substantive_call_sink and has_arg_input:
             base = 0.90   # direct function argument to unguarded call sink
-        elif has_call_sink:
+        elif has_substantive_call_sink:
             base = 0.70   # unguarded call sink, struct/return source — upstream validation possible
         else:
-            base = 0.55   # GEP-only unguarded — likely struct field access pattern
+            base = 0.55   # GEP-only or free-only unguarded — not a buffer overflow signal
 
     elif guard_type == "null_check":
-        if has_call_sink:
+        if has_substantive_call_sink:
             base = 0.75   # null check doesn't protect buffer writes
         else:
-            base = 0.30   # null-check + GEP — standard pointer guard, not a buffer sink
+            base = 0.30   # null-check + GEP/free — standard pointer guard, not a buffer sink
 
     else:
         # bounds_check or mixed
