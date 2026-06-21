@@ -171,8 +171,10 @@ def main():
     src.add_argument("--ir-dir",     metavar="DIR")
     ap.add_argument("--function",    metavar="FN",
                     help="Required with --ll")
-    ap.add_argument("--no-gep-only", action="store_true")
-    ap.add_argument("--header",      metavar="FILE")
+    ap.add_argument("--no-gep-only",  action="store_true")
+    ap.add_argument("--header",       metavar="FILE")
+    ap.add_argument("--output-dir",   metavar="DIR", default=".",
+                    help="Directory to write harness_<fn>.c (default: cwd)")
     args = ap.parse_args()
 
     if args.ll and not args.function:
@@ -222,7 +224,8 @@ Requirements:
 Output C code only, no explanation."""
 
     messages = [{"role": "user", "content": initial_prompt}]
-    out_c    = Path(f"harness_{fn_name}.c")
+    out_c    = Path(args.output_dir) / f"harness_{fn_name}.c"
+    out_c.parent.mkdir(parents=True, exist_ok=True)
 
     # ── 4. Qwen with compile-error retry ─────────────────────────────────────
     harness_ll = None
@@ -265,7 +268,8 @@ Output C code only, no explanation."""
         print(f"Self-harm verdict: {self_harm_verdict(score)}")
 
     print("\nDone. To fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address {out_c} <target_lib> -o fuzzer_{fn_name}")
+    inc = f" -I {Path(args.header).parent}" if args.header else ""
+    print(f"  clang-20 -fsanitize=fuzzer,address{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
     print(f"  ./fuzzer_{fn_name}")
 
 
