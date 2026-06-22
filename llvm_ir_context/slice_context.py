@@ -327,6 +327,28 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         s.get("fn") in _SIZE_SINKS for s in sinks
     )
 
+    # ---- zext-before-alloc-size: 64-bit false positive suppressor -----------
+    # zext i32 to i64 (opcode 49) feeding an alloc-size sink means the multiply
+    # is widened to 64-bit before it executes.  count*sizeof() with a uint32_t
+    # count becomes a 64-bit multiply: UINT32_MAX*324 ~= 87 GB, malloc returns
+    # NULL, and the null check exits cleanly.  No overflow reachable on this
+    # target.  Flag it so the scorer can apply a discount.
+    _ALLOC_FNS = frozenset({
+        "malloc", "calloc", "realloc", "xmalloc", "xrealloc",
+    })
+    _BUFFER_WRITE_FNS_EARLY = frozenset({
+        "strcpy", "strncpy", "strcat", "strncat",
+        "memcpy", "memmove", "memset", "bcopy",
+        "gets", "fgets", "sprintf", "vsprintf",
+    })
+    zext_count = sum(1 for opc in opcodes if opc == 49)
+    has_safe_mul_via_zext = (
+        zext_count > 0
+        and not has_trunc          # trunc overrides — narrowing is still risky
+        and any(s.get("fn") in _ALLOC_FNS for s in sinks)
+        and not any(s.get("fn") in _BUFFER_WRITE_FNS_EARLY for s in sinks)
+    )
+
     # ---- deduplicate sinks by function name (preserve first-seen order) ----
     from collections import Counter, OrderedDict
     sink_counts: dict[str, int] = Counter(s.get("fn") or "unknown" for s in sinks)
@@ -560,6 +582,7 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         "min_distance":       min_distance,
         "trunc_count":        trunc_count,
         "has_trunc":          has_trunc,
+        "has_safe_mul_via_zext": has_safe_mul_via_zext,
         "double_free":        double_free,
         "use_after_free":     use_after_free,
         "freed_ptrs":         freed_ptrs,

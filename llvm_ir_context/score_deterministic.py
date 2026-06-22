@@ -213,6 +213,7 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
 
     trunc_drove_base      = has_trunc and has_call_sink
     null_check_drove_base = (not has_trunc) and has_call_sink and guard_type == "null_check"
+    safe_mul_via_zext     = summary.get("has_safe_mul_via_zext", False)
 
     mult = 1.0
     if is_ext:
@@ -226,6 +227,8 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
     elif all_alloc_sinks:
         mult *= 0.70   # null-return / OOM bug, not overflow — lower severity
+        if safe_mul_via_zext:
+            mult *= 0.70   # zext i32→i64 before multiply: overflow unreachable on 64-bit
     if has_free_sink and not has_buffer_write:
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
@@ -439,13 +442,14 @@ def main() -> None:
             gt    = summary.get("guard_type", "none")
             ext   = "ext" if summary.get("is_external_input") else ""
             trunc = "+trunc" if summary.get("has_trunc") else ""
+            szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
             df    = "+df"      if summary.get("double_free")    else ""
             uaf   = "+uaf"     if summary.get("use_after_free") else ""
             cv    = "+caller?" if summary.get("caller_validated") else ""
             sinks = ",".join(sorted({s.get("fn","?") for s in summary["sinks"]}))
             details[fn_name] = (
                 f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
-                f"{ext}{trunc}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
+                f"{ext}{trunc}{szext}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
             )
             if args.verbose:
                 print(f"  {fn_name}: {summary['natural_language']}")

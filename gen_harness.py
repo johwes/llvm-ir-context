@@ -71,6 +71,9 @@ parameters.
 - If an "API reference" header is provided, always `#include` it — never redefine \
 structs, typedefs, or enums that are declared in it. Redefining types that don't \
 match the compiled target causes silent layout mismatches and missed bugs.
+- If the target function returns a pointer, always `free()` it after the call \
+(unless the API documents that ownership is not transferred). Leaked allocations \
+hide crashes and produce misleading ASAN output.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
@@ -519,6 +522,22 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
 
+    # Suppress the generic "pass Data and Size" instruction when the slicer
+    # emitted a split-input hint — the two instructions contradict each other
+    # and the model tends to follow the Task bullet over the Harness target hint.
+    summary_json  = get_context_json(ll_path, fn_name)
+    has_split_input = "split-input" in summary_json.get("harness_hint", "")
+    if has_split_input:
+        data_size_rule = (
+            "- Follow the split-input hint in the Static analysis block exactly — "
+            "derive the source buffer and the length from different regions of Data "
+            "so they can diverge; do not call the function with matching (Data, Size)"
+        )
+    else:
+        data_size_rule = (
+            f"- Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size"
+        )
+
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
 ## Static analysis (IR slicer output)
@@ -534,7 +553,7 @@ Requirements:
 - Read the target function source carefully — understand what state must be \
 initialized before calling it and what the function does with its arguments
 - Check the API reference for required initialization and teardown functions and call them
-- Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size
+{data_size_rule}
 - If `Data` is used as a string (passed to a function expecting `const char *`), null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set the last byte to `\\0`
 - Initialize any required state before the call; clean it up after
 - Return 0
