@@ -345,11 +345,26 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
     keep: list[str] = []
     in_block = False
     brace_depth = 0
+    in_comment = False
 
     for line in lines:
         # Always keep integer/hex constant macros — LLM needs Z_OK, Z_NO_FLUSH, etc.
         if re.match(r'\s*#define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?', line):
             keep.append(line)
+            continue
+
+        # Drop standalone multi-line comment blocks outside struct/typedef bodies.
+        # Inside a struct body comments describe fields and should be kept.
+        if in_comment:
+            if in_block:
+                keep.append(line)
+            if '*/' in line:
+                in_comment = False
+            continue
+        if line.strip().startswith('/*') and '*/' not in line:
+            in_comment = True
+            if in_block:
+                keep.append(line)
             continue
 
         if re.match(r'\s*(typedef|struct|#define|#ifndef|#endif)', line):
