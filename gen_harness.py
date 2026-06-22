@@ -230,6 +230,52 @@ def fn_in_header(fn_name: str, header_text: str) -> bool:
     return bool(re.search(rf'\b{re.escape(fn_name)}\s*\(', header_text))
 
 
+def _trim_header(header_text: str, fn_name: str, char_limit: int = 6000) -> str:
+    """Return a trimmed view of the header focused on fn_name.
+
+    Large headers (e.g. zlib.h at ~16K tokens) overflow small-context models.
+    Strategy: keep lines that mention fn_name or its close relatives, plus
+    typedef/struct blocks, up to char_limit characters. Falls back to a hard
+    character truncation if the focused extract is still too large.
+    """
+    if len(header_text) <= char_limit:
+        return header_text
+
+    lines = header_text.splitlines(keepends=True)
+    # Collect line indices that are relevant to fn_name
+    base = fn_name.rstrip("0123456789")  # deflate → deflate, deflateInit → deflate
+    keep: list[str] = []
+    in_block = False
+    brace_depth = 0
+
+    for line in lines:
+        # Always keep typedef/struct/define blocks (they carry type definitions)
+        if re.match(r'\s*(typedef|struct|#define|#ifndef|#endif)', line):
+            keep.append(line)
+            if '{' in line:
+                in_block = True
+                brace_depth += line.count('{') - line.count('}')
+            continue
+
+        if in_block:
+            keep.append(line)
+            brace_depth += line.count('{') - line.count('}')
+            if brace_depth <= 0:
+                in_block = False
+            continue
+
+        # Keep lines that mention the function family
+        if base in line or fn_name in line:
+            keep.append(line)
+
+    trimmed = "".join(keep)
+    if len(trimmed) <= char_limit:
+        return trimmed
+
+    # Hard truncation with a note so the model knows it's partial
+    return trimmed[:char_limit] + "\n/* ... header truncated ... */\n"
+
+
 def ranked_functions(ir_dir: str, no_gep_only: bool) -> list[tuple[str, str]]:
     """Return [(ll_path, fn_name), ...] in score order."""
     cmd = ["ir-score", "--ir-dir", ir_dir]
@@ -542,7 +588,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
     caller_src  = _source_block(caller_ll, caller_fn, src_dir,
                                 label=f"Harness entry point: {caller_fn}")
 
-    header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
+    header_trimmed = _trim_header(header, vuln_fn) if header else ""
+    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     vuln_sig_block   = (f"\n## Vulnerable function signature (from IR)\n```\n{vuln_sig}\n```"
                         if vuln_sig else "")
     caller_sig_block = (f"\n## Entry point signature (from IR)\n```\n{caller_sig}\n```"
@@ -684,7 +731,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print(f"\nIR signature: {ir_sig}")
 
     src_block    = _source_block(ll_path, fn_name, src_dir)
-    header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
+    header_trimmed = _trim_header(header, fn_name) if header else ""
+    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
 
