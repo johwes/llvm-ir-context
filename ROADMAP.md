@@ -241,6 +241,7 @@ goal is pipeline validation.
 | System prompt: `#include` header rule (no struct redefinition) | `gen_harness.py` |
 | System prompt: `free()` pointer return values rule | `gen_harness.py` |
 | `--save-prompt` flag: writes full LLM prompt to `harness_<fn>_prompt.md` | `gen_harness.py` |
+| `_extract_header_for_fn`: transitive typedef expansion (captures struct body), integer/hex `#define` constants (Z_OK, Z_NO_FLUSH), empty-output fallback — validated on zlib-ng `inflate`/`deflate` | `gen_harness.py` |
 | Prompt module system (`build_task_block`): M-01–M-07 modules selected by slicer signals | `gen_harness.py` |
 | M-02 routing gate module: multi-call sequence, `Data[i]` verb selection per call | `gen_harness.py` |
 | M-05 double-free precondition module: two-phase SETUP+TRIGGER harness structure | `gen_harness.py` |
