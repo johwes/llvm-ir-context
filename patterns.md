@@ -309,6 +309,74 @@ dispatch with DEL on the same key to trigger the double-free.
 
 ---
 
+## P-08 · Structured-input / format-validated sink
+
+**What it is:** A function whose input channel passes through a format-validation
+check before any dangerous sink is reachable. Random bytes fail the header check
+and the function returns an error code immediately. Coverage stays flat regardless
+of how many runs the fuzzer does.
+
+**Concrete example (zlib):**
+- `inflate` validates the zlib magic bytes and checksum in the first two bytes.
+  Random input → `Z_DATA_ERROR` in ~5 instructions. No decompression logic reached.
+  Coverage: cov:5 after 50k runs with and without seed corpus.
+- `inflate` also uses a streaming call model: it returns `Z_BUF_ERROR` when
+  `avail_out` exhausts. A single-call harness that doesn't refill `next_out`
+  never advances past the first output page even with valid input.
+
+**IR shape (detection signals):**
+- Input flows through an `icmp` against a small set of constants (magic byte check)
+  near the function entry — before any memcpy/GEP sink
+- The check is on a field offset 0–2 of the input buffer (header bytes)
+- `external_call_return` feeds a struct pointer that is then passed to the sink
+  (the state object initialized by `inflateInit`)
+
+**Two sub-patterns:**
+
+### P-08a · Magic-byte / header validation gate
+The function rejects input that doesn't match a format header.
+libFuzzer discovers valid headers quickly with a seed corpus, but without one
+the fuzzer is blind.
+
+**What the pipeline must do:**
+- Detect: `icmp` near entry against small integer constants, operand is a load
+  from input-buffer offset 0 or 1
+- Hint: "provide a seed corpus containing at least one valid `<format>` stream;
+  without a seed the fuzzer cannot reach any decompression logic"
+- Optionally: emit a `.dict` file containing the magic bytes
+
+**Status:** NOT implemented. Seed corpus generation is out of scope for the
+current pipeline (no output file path knowledge). The hint is implementable
+— detecting a header-byte icmp near entry is a 1-hop check.
+
+### P-08b · Streaming / incremental-call pattern
+The function is designed to be called in a loop: it processes as much input as
+`avail_in` / `avail_out` allows and returns a status code indicating more work
+is needed. A single-call harness never processes a complete stream and therefore
+never reaches deep decompression state.
+
+**What the pipeline must do:**
+- Detect: function returns a status integer; the sink is inside a loop controlled
+  by that return value; the function takes `(state_ptr, flush_flag)` shape
+- Hint: "this function is streaming — call it in a loop until return value
+  indicates completion or error; refill `next_out` / `avail_out` each iteration"
+
+**Status:** NOT implemented. Detecting the streaming pattern requires recognising
+the return-value-as-loop-condition shape — feasible but not yet implemented.
+
+**Short-term workaround:** For known streaming functions (inflate, deflate),
+the C source injection (`--src-dir`) gives the model enough context to
+write a loop if it reads the source carefully. The inflate harness above did NOT
+do this — it called inflate once and exited. Providing source for streaming
+functions should be mandatory for this pattern.
+
+**Correct harness:**
+- Provides seed corpus entry with valid format header
+- Calls the function in a loop, refilling output buffer each iteration
+- Terminates on `Z_STREAM_END` or error return
+
+---
+
 ## Evaluation rubric
 
 Given a generated harness, mark it:

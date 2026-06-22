@@ -113,7 +113,39 @@ is a constant (`sizeof`), the overflow is not reachable on this target — reduc
 
 ---
 
-### 6. Patch re-validation via slicer
+### 6. Structured-input / streaming pattern (P-08) — zlib inflate validated
+
+**Observed (zlib validation run):** `inflate` harness compiled clean, called
+`inflateInit` correctly without any hint (model read the header — generality
+confirmed). Coverage stayed flat at cov:5 for 50k runs with and without seed
+corpus. Two root causes:
+
+**P-08a — magic-byte gate:** `inflate` validates the zlib header (2-byte magic +
+CMF/FLG fields) at entry. Random bytes fail immediately. Without a seed containing
+a valid zlib stream, the fuzzer can't reach any decompression logic.
+
+**P-08b — streaming pattern:** `inflate` is designed for a call loop — it returns
+`Z_BUF_ERROR` when `avail_out` exhausts. The single-call harness exited after the
+first call without refilling, so even with valid input no deep state was reached.
+
+**Fix path:**
+- P-08a: detect `icmp` against small integer constant within 1–2 hops of input
+  buffer offset 0/1 near function entry → emit hint "provide seed corpus with a
+  valid `<format>` stream; fuzzer cannot reach sink without it"
+- P-08b: detect return-value-as-loop-condition shape (function returns status int,
+  caller loops while status == CONTINUE) → emit hint "call in a loop; refill
+  output buffer each iteration"
+- Short-term: `--src-dir` source injection should surface the streaming pattern
+  without a hint — model didn't loop even with source available; may need an
+  explicit system prompt rule for functions returning status codes
+
+**File:** `llvm_ir_context/slice_context.py` (hints), `gen_harness.py` (system prompt)
+
+See `patterns.md § P-08` for full spec.
+
+---
+
+### 7. Patch re-validation via slicer
 After an LLM generates a fix, compile the patched function to IR and diff the
 `summarize_slice` output against the original. Reject if `guard_type` is still
 `none` for the same sink; flag for human review if sink count dropped to zero
