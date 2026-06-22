@@ -54,7 +54,7 @@ _SUMMARY_RE = re.compile(r"SUMMARY:\s+(.+)")
 
 def _asan_rule_id(bug_type: str) -> str:
     t = bug_type.lower()
-    if "divide-by-zero" in t or "division by zero" in t:
+    if "divide-by-zero" in t or "division by zero" in t or "fpe" in t or "sigfpe" in t:
         return "DIV_BY_ZERO"
     if "double-free" in t:
         return "DOUBLE_FREE"
@@ -301,21 +301,33 @@ def main() -> None:
     if args.file and args.line:
         # Explicit override — skip log parsing entirely
         bug_type = ""
-        if "log_text" in dir():
+        if log_text:
             m = _BUG_TYPE_RE.search(log_text)
             if m:
                 bug_type = m.group(1).strip()
+            elif _SUMMARY_RE.search(log_text):
+                # SIGFPE / signal crashes lack an ERROR: line but have SUMMARY
+                ms = _SUMMARY_RE.search(log_text)
+                bug_type = ms.group(1).strip()
+        rule_id = _asan_rule_id(bug_type) if bug_type else "MEMORY_SAFETY"
+        # Make the message specific enough for SCAR's context_gen to pick the right sink
+        if rule_id == "DIV_BY_ZERO":
+            crash_desc = "divide-by-zero (SIGFPE)"
+        elif bug_type:
+            crash_desc = bug_type
+        else:
+            crash_desc = "unknown crash"
         parsed = {
-            "rule_id":   _asan_rule_id(bug_type) if bug_type else "MEMORY_SAFETY",
+            "rule_id":   rule_id,
             "file_path": args.file,
             "line":      args.line,
             "bug_type":  bug_type,
             "message":   (
-                f"libFuzzer/ASAN crash: {bug_type or 'unknown'} "
+                f"libFuzzer/ASAN crash: {crash_desc} "
                 f"in {args.function or '?'} at line {args.line}."
             ),
         }
-        print(f"  Using explicit location override")
+        print(f"  Using explicit location override ({rule_id})")
     else:
         parsed = parse_asan_log(log_text, fn_name=args.function)
         if parsed is None:
