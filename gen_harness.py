@@ -710,7 +710,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 def _find_ll_for_function(ir_dir: str, fn_name: str) -> str | None:
     """Return the .ll file path that defines fn_name, or None."""
     import glob as _glob
-    pattern = re.compile(rf"^define\b.*\b@{re.escape(fn_name)}\b", re.MULTILINE)
+    pattern = re.compile(rf"^define\b.*@{re.escape(fn_name)}\s*\(", re.MULTILINE)
     for ll_path in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
         try:
             if pattern.search(Path(ll_path).read_text(errors="replace")):
