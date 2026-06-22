@@ -74,6 +74,9 @@ match the compiled target causes silent layout mismatches and missed bugs.
 - If the target function returns a pointer, always `free()` it after the call \
 (unless the API documents that ownership is not transferred). Leaked allocations \
 hide crashes and produce misleading ASAN output.
+- When reading multi-byte integers from fuzz input (e.g. `*(int*)(Data + N)`), \
+guard with `Size >= N + sizeof(type)` — not `Size >= N + 1`. Reading 4 bytes at \
+offset 4 requires `Size >= 8`, not `Size >= 5`.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
