@@ -136,3 +136,8 @@ goal is pipeline validation.
 | Trunc hint sharpened (no output cap, concrete trigger values) | `slice_context.py` |
 | 13/13 scarnet answer key | validated |
 | `scar_log` format string crash confirmed (`%+`, `%0`) | validated |
+| **P0.1** strcmp gate detection → `fuzz_fn_arg_idx` hint in context | `slice_context.py`, `preprocess_slice_pdg.py` |
+| **P0.2** Split-input hint for (ptr, len) functions | `slice_context.py` |
+| System prompt (security researcher framing, no safety caps) | `gen_harness.py` |
+| `session_login` coverage: strcmp gate opened (cov 9→10); bug is latent (null-terminator only surfaces via caller) | validated |
+| `dispatch()` multi-step harness: targets double-free (handle_del) and divide-by-zero (handle_stats) | `harness_dispatch.c` in scarnet repo |
