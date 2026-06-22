@@ -455,6 +455,33 @@ def main() -> None:
             if args.verbose:
                 print(f"  {fn_name}: {summary['natural_language']}")
 
+    # --- P-05 interprocedural score propagation ---
+    # When a high-scoring function is not directly fuzzable (non-public internal
+    # helper), its danger should surface via its public caller. Propagate a
+    # discounted fraction of the callee score to each caller so the caller rises
+    # in the ranking and gets picked by --top-k / gen_harness.py.
+    #
+    # Weight: 0.60 — caller inherits danger but is one step removed; guards and
+    # routing logic in the caller's own body are not reflected by the callee score.
+    # Only propagate from callees scoring >= 0.75 (real vulnerability signal).
+    _PROPAGATION_WEIGHT = 0.60
+    _PROPAGATION_THRESHOLD = 0.75
+    propagated_into: dict[str, list[tuple[str, float]]] = {}  # caller → [(callee, boost)]
+    for fn_name, summary in summaries.items():
+        callee_score = rule_scores.get(fn_name, 0.0)
+        if callee_score < _PROPAGATION_THRESHOLD:
+            continue
+        for caller in summary.get("caller_names", []):
+            if caller not in rule_scores:
+                continue
+            boost = callee_score * _PROPAGATION_WEIGHT
+            if boost > rule_scores[caller]:
+                rule_scores[caller] = boost
+                propagated_into.setdefault(caller, []).append((fn_name, boost))
+    for caller, sources in propagated_into.items():
+        src_str = "+".join(f"{fn}×{_PROPAGATION_WEIGHT}" for fn, _ in sources)
+        details[caller] = details.get(caller, "") + f"  [+prop:{src_str}]"
+
     # --- --no-gep-only filter ---
     # Drop functions whose only sinks are GEP (array index) instructions.
     # These are false positives in codebases with heavily-indexed data structures
