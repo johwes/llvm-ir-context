@@ -77,6 +77,10 @@ hide crashes and produce misleading ASAN output.
 - When reading multi-byte integers from fuzz input (e.g. `*(int*)(Data + N)`), \
 guard with `Size >= N + sizeof(type)` — not `Size >= N + 1`. Reading 4 bytes at \
 offset 4 requires `Size >= 8`, not `Size >= 5`.
+- When seeding state variables (counts, indices, sizes) from fuzz input, clamp \
+them to their valid range. If the real API enforces a maximum (e.g. nstore <= \
+MAX_STORE), clamp to that maximum in the harness. Unclamped values cause OOB \
+accesses that cannot occur in real usage and mask real bugs.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
