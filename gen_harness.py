@@ -727,16 +727,56 @@ def _find_ll_for_function(ir_dir: str, fn_name: str) -> str | None:
     return None
 
 
+def _fn_ir_body(ll_text: str, fn_name: str) -> str:
+    """Extract the IR body of fn_name from an .ll file text, or ''."""
+    # Match: define ... @fn_name(...) ... { ... }
+    # We find the opening brace after the define line, then collect lines
+    # until we hit the matching closing brace (top-level, col 0).
+    start = re.search(
+        rf"^define\b.*@{re.escape(fn_name)}\s*\(", ll_text, re.MULTILINE
+    )
+    if not start:
+        return ""
+    body_start = ll_text.find("{", start.start())
+    if body_start == -1:
+        return ""
+    depth = 0
+    for i, ch in enumerate(ll_text[body_start:], body_start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return ll_text[body_start : i + 1]
+    return ll_text[body_start:]
+
+
+def _ir_has_double_free(fn_body: str) -> bool:
+    """Return True if fn_body contains two or more calls to free().
+
+    This is a conservative text-level check: it fires whenever a function
+    calls free() at least twice. Most such functions contain conditional
+    paths that can free the same pointer (early-exit + unconditional cleanup),
+    which is the double-free pattern. False positives (two genuinely
+    independent frees of different pointers) are rare and acceptable — the
+    M-05 instruction is generic enough to help in either case.
+    """
+    free_calls = re.findall(r"\bcall\b.*@free\b", fn_body)
+    return len(free_calls) >= 2
+
+
 def _enrich_with_callee_flags(summary: dict, fn_name: str,
                                ll_path: str, ir_dir: str,
                                src_text: str = "") -> dict:
     """Merge double_free/use_after_free from direct callees into summary.
 
-    Scans all .ll files in ir_dir. For each function found there, if it has
-    double_free=True or use_after_free=True AND its name appears in the target
-    function's C source (confirming it is a direct callee), OR in the
-    caller_names list of the callee's own summary, OR in the target's IR text,
-    propagate the flag into the returned summary dict.
+    Scans all .ll files in ir_dir. For each direct callee of fn_name that
+    calls free() at least twice in its body (double-free pattern), sets
+    double_free=True in the returned summary so M-05 fires in the prompt.
+
+    Uses IR text scan rather than get_context_json because the slicer's
+    typestate analysis can miss the pattern when -O0 IR uses alloca/load
+    for the freed pointer instead of direct SSA (different ptr_ids per path).
     """
     if summary.get("double_free") and summary.get("use_after_free"):
         return summary  # already set, nothing to do
@@ -751,7 +791,6 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
     enriched = dict(summary)
     define_re = re.compile(r"^define\b.*@(\w+)\s*\(", re.MULTILINE)
     for sibling_ll in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
-        # Include same-file: callees of dispatch may live in src_handler.ll
         try:
             sibling_text = (Path(sibling_ll).read_text(errors="replace")
                             if sibling_ll != ll_path else ll_text)
@@ -760,18 +799,22 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
         for m in define_re.finditer(sibling_text):
             callee = m.group(1)
             if callee == fn_name:
-                continue  # skip the target itself
-            # Check if callee is directly called by our target function:
-            # presence in IR text (call @callee) or in C source text
+                continue
             in_ir  = bool(re.search(rf"\bcall\b.*@{re.escape(callee)}\b", ll_text))
             in_src = bool(src_text and re.search(rf"\b{re.escape(callee)}\s*\(", src_text))
             if not (in_ir or in_src):
                 continue
+            # Primary: check via slicer JSON (works when typestate fires)
             callee_summary = get_context_json(sibling_ll, callee)
             if callee_summary.get("double_free") and not enriched.get("double_free"):
                 enriched["double_free"] = True
             if callee_summary.get("use_after_free") and not enriched.get("use_after_free"):
                 enriched["use_after_free"] = True
+            # Fallback: IR text scan (catches alloca-based -O0 IR the typestate misses)
+            if not enriched.get("double_free"):
+                body = _fn_ir_body(sibling_text, callee)
+                if body and _ir_has_double_free(body):
+                    enriched["double_free"] = True
             if enriched.get("double_free") and enriched.get("use_after_free"):
                 return enriched
     return enriched

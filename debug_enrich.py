@@ -4,7 +4,8 @@ import sys, re, glob
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from gen_harness import get_context_json, _enrich_with_callee_flags, _source_block
+from gen_harness import (get_context_json, _enrich_with_callee_flags,
+                         _source_block, _fn_ir_body, _ir_has_double_free)
 
 IR_DIR  = Path.home() / "scarnet-ir-clean"
 LL_PATH = str(IR_DIR / "src_handler.ll")
@@ -33,8 +34,10 @@ for ll in sorted(glob.glob(str(IR_DIR / "*.ll"))):
         cs = get_context_json(ll, callee)
         df = cs.get("double_free")
         uaf = cs.get("use_after_free")
+        body = _fn_ir_body(txt, callee)
+        ir_df = _ir_has_double_free(body) if body else False
         print(f"  {callee:30s} in_ir={in_ir} in_src={in_src} "
-              f"double_free={df} use_after_free={uaf}")
+              f"double_free={df} use_after_free={uaf} ir_scan_df={ir_df}")
 
 result = _enrich_with_callee_flags(summary, FN_NAME, LL_PATH, str(IR_DIR), src_text=src_block)
 print(f"\nEnriched: double_free={result.get('double_free')}, "
