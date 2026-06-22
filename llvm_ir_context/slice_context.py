@@ -25,7 +25,6 @@ import json
 import sys
 from pathlib import Path
 
-from llvm_ir_context.preprocess_slice_pdg import apply_mem2reg
 
 # ---------------------------------------------------------------------------
 # Opcode constants (must match OPCODE_VOCAB in preprocess_slice_pdg.py)
@@ -737,7 +736,7 @@ def _demo_cli():
     from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
 
     import re
-    ir_text = apply_mem2reg(Path(args.ir_file).read_text(errors="replace"))
+    ir_text = Path(args.ir_file).read_text(errors="replace")
 
     import llvmlite.binding as _llvm
     try:
