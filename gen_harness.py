@@ -18,6 +18,7 @@ Examples:
     python gen_harness.py --ir-dir /tmp/zlib-ir/ --no-gep-only --header /usr/include/zlib.h
     python gen_harness.py --ir-dir ~/scarnet-ir/ --top-k 3 --header ~/scarnet/include/scarnet.h --output-dir ~/scarnet/
     python gen_harness.py --ll /tmp/zlib-ir/inflate.ll --function inflate
+    python gen_harness.py --ll target.ll --function foo --save-prompt  # inspect what the LLM sees
 
 Validation steps:
   1. Compile harness to IR  (catches syntax / API errors — retries with compiler error)
@@ -67,6 +68,9 @@ buffer", do not add any size cap or MAX_SIZE guard.
 point is to reach the dangerous sizes the slicer identified.
 - Use the exact function signature from the IR or API reference. Do not invent \
 parameters.
+- If an "API reference" header is provided, always `#include` it — never redefine \
+structs, typedefs, or enums that are declared in it. Redefining types that don't \
+match the compiled target causes silent layout mismatches and missed bugs.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
@@ -305,6 +309,20 @@ def parse_top_score(output: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt saving
+# ---------------------------------------------------------------------------
+
+def save_prompt_file(path: Path, messages: list[dict]) -> None:
+    """Write the full message sequence to a markdown file for inspection."""
+    lines = [f"# Prompt: {path.stem}\n"]
+    for msg in messages:
+        role = msg["role"].upper()
+        lines.append(f"## {role}\n\n{msg['content']}\n")
+    path.write_text("\n---\n\n".join(lines))
+    print(f"  Prompt saved: {path}")
+
+
+# ---------------------------------------------------------------------------
 # Source extraction helper (shared by 1:1 and interprocedural paths)
 # ---------------------------------------------------------------------------
 
@@ -337,7 +355,8 @@ def _source_block(ll_path: str, fn_name: str, src_dir: str,
 def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                caller_ll: str, caller_fn: str,
                                header: str, include_dirs: list[str],
-                               output_dir: Path, src_dir: str) -> bool:
+                               output_dir: Path, src_dir: str,
+                               save_prompt: bool = False) -> bool:
     """Build a two-section prompt: vulnerable callee context + caller entry point.
 
     The model sees where the bug is (vuln_fn) and where the harness must
@@ -406,6 +425,9 @@ Output C code only, no explanation."""
     out_c = output_dir / f"harness_{vuln_fn}_via_{caller_fn}.c"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if save_prompt:
+        save_prompt_file(output_dir / f"harness_{vuln_fn}_via_{caller_fn}_prompt.md", messages)
+
     harness_ll = None
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
@@ -460,7 +482,8 @@ Output C code only, no explanation."""
 
 def generate_one(ll_path: str, fn_name: str, header: str,
                  include_dirs: list[str], output_dir: Path,
-                 src_dir: str = "", ir_dir: str = "") -> bool:
+                 src_dir: str = "", ir_dir: str = "",
+                 save_prompt: bool = False) -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
@@ -481,6 +504,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 caller_ll=caller_ll, caller_fn=caller_fn,
                 header=header, include_dirs=include_dirs,
                 output_dir=output_dir, src_dir=src_dir,
+                save_prompt=save_prompt,
             )
 
     # Standard 1:1 path
@@ -523,6 +547,9 @@ Output C code only, no explanation."""
     ]
     out_c    = output_dir / f"harness_{fn_name}.c"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if save_prompt:
+        save_prompt_file(output_dir / f"harness_{fn_name}_prompt.md", messages)
 
     # Qwen with compile-error retry
     harness_ll = None
@@ -595,6 +622,9 @@ def main():
                     help="Directory containing C source files; the target function body "
                          "is extracted and included in the prompt so the model can reason "
                          "about required state and call sequences")
+    ap.add_argument("--save-prompt",  action="store_true",
+                    help="Write harness_<fn>_prompt.md alongside each harness showing "
+                         "the full message sequence sent to the model (system + user turns)")
     args = ap.parse_args()
 
     if args.ll and not args.function:
@@ -610,7 +640,8 @@ def main():
     if args.ll:
         generate_one(args.ll, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir,
-                     ir_dir=str(Path(args.ll).parent))
+                     ir_dir=str(Path(args.ll).parent),
+                     save_prompt=args.save_prompt)
         return
 
     # ir-dir mode
@@ -627,7 +658,8 @@ def main():
                 results["skipped"].append(fn_name)
                 continue
         ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir,
-                          src_dir=src_dir, ir_dir=args.ir_dir)
+                          src_dir=src_dir, ir_dir=args.ir_dir,
+                          save_prompt=args.save_prompt)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
