@@ -25,6 +25,7 @@ Appends to existing findings in that file (deduplicates by file+line).
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -72,12 +73,49 @@ def _asan_rule_id(bug_type: str) -> str:
     return "MEMORY_SAFETY"
 
 
+def _symbolize_address(binary: str, addr: str) -> "tuple[str,str,int] | None":
+    """Try to resolve a raw address to (func, file, line) using llvm-symbolizer.
+
+    Returns None if no symbolizer is available or address cannot be resolved.
+    """
+    for sym in ("llvm-symbolizer-20", "llvm-symbolizer"):
+        if not shutil.which(sym):
+            continue
+        try:
+            r = subprocess.run(
+                [sym, "--exe", binary, addr],
+                capture_output=True, text=True, timeout=10,
+            )
+            lines = r.stdout.strip().splitlines()
+            if len(lines) >= 2:
+                func = lines[0].strip()
+                loc  = lines[1].strip()   # file:line:col
+                parts = loc.rsplit(":", 2)
+                if len(parts) >= 2 and parts[-2].isdigit():
+                    return func, parts[0], int(parts[-2])
+                elif len(parts) >= 1:
+                    m = re.search(r":(\d+)", loc)
+                    if m:
+                        return func, parts[0], int(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+# Matches raw-address frames when symbolizer wasn't available:
+#   #0 0x0000005249b7  (/path/to/binary+0x5249b7)
+_RAW_FRAME_RE = re.compile(
+    r"#(\d+)\s+0x[0-9a-f]+\s+\((.+?)\+0x([0-9a-f]+)\)"
+)
+
+
 def parse_asan_log(log_text: str, fn_name: str | None = None) -> dict | None:
     """Extract (rule_id, file_path, line, message) from ASAN output.
 
     Prefers a stack frame that matches fn_name if provided.
     Falls back to the first user-code frame (skips libFuzzer internals).
-    Returns None if the log cannot be parsed.
+    When debug symbols are absent, attempts to symbolize raw addresses via
+    llvm-symbolizer. Returns None if the log cannot be parsed.
     """
     bug_type = ""
     m = _BUG_TYPE_RE.search(log_text)
@@ -88,11 +126,8 @@ def parse_asan_log(log_text: str, fn_name: str | None = None) -> dict | None:
         if m:
             bug_type = m.group(1).strip()
 
+    # Try symbolic frames first (binary compiled with -g and symbolizer ran)
     frames = _FRAME_RE.findall(log_text)  # list of (func, file, line)
-    if not frames:
-        return None
-
-    # Pick best frame: prefer the target function, then first non-fuzzer frame.
     best_func, best_file, best_line = None, None, None
     for func, fpath, lineno in frames:
         if fn_name and func == fn_name:
@@ -100,6 +135,21 @@ def parse_asan_log(log_text: str, fn_name: str | None = None) -> dict | None:
             break
         if best_func is None and "LLVMFuzzer" not in func and "sanitizer" not in func.lower():
             best_func, best_file, best_line = func, fpath, int(lineno)
+
+    # If no symbolic frames, try to symbolize raw addresses
+    if best_file is None:
+        raw_frames = _RAW_FRAME_RE.findall(log_text)  # (frame_no, binary, offset)
+        for _fno, binary, offset in raw_frames:
+            if "libc" in binary or "libfuzzer" in binary.lower():
+                continue
+            result = _symbolize_address(binary, f"0x{offset}")
+            if result:
+                func, fpath, lineno = result
+                if fn_name and func == fn_name:
+                    best_func, best_file, best_line = func, fpath, lineno
+                    break
+                if best_func is None and "LLVMFuzzer" not in func:
+                    best_func, best_file, best_line = func, fpath, lineno
 
     if best_file is None:
         return None
@@ -217,9 +267,15 @@ def main() -> None:
     ap.add_argument("--severity", default="error",
                     choices=["error", "warning", "note"],
                     help="SCAR severity level (default: error)")
+    ap.add_argument("--file",     metavar="FILE",
+                    help="Override: source file path of the bug (skips ASAN log parsing)")
+    ap.add_argument("--line",     metavar="N", type=int,
+                    help="Override: line number of the bug (skips ASAN log parsing)")
     args = ap.parse_args()
 
     # --- Get ASAN output ---
+    # Not required when --file + --line are provided as explicit overrides.
+    log_text = ""
     if args.asan_log:
         log_text = Path(args.asan_log).read_text(errors="replace")
     elif args.fuzzer and args.crash:
@@ -233,25 +289,47 @@ def main() -> None:
             sys.exit("ERROR: fuzzer produced no ASAN output. "
                      "Was it built with -fsanitize=address?")
     elif args.crash:
-        # Try reading the crash file as a plain text ASAN log (some pipelines do this)
         log_text = Path(args.crash).read_text(errors="replace")
         if "AddressSanitizer" not in log_text and "SUMMARY" not in log_text:
             sys.exit("ERROR: --crash file does not look like an ASAN log. "
                      "Provide --asan-log or --fuzzer to capture ASAN output.")
-    else:
-        sys.exit("ERROR: provide --asan-log <file> or --fuzzer <binary> + --crash <artifact>")
+    elif not (args.file and args.line):
+        sys.exit("ERROR: provide --asan-log <file>, or --fuzzer + --crash, "
+                 "or --file + --line to specify the bug location directly.")
 
-    # --- Parse ASAN log ---
-    parsed = parse_asan_log(log_text, fn_name=args.function)
-    if parsed is None:
-        sys.exit(
-            "ERROR: could not extract file/line from ASAN output.\n"
-            "The stack trace must include function names and file paths.\n"
-            "Rebuild the fuzzer with debug info:\n"
-            "  clang-20 -fsanitize=fuzzer,address -g -I include \\\n"
-            "      harness_<fn>.c src/*.c -o fuzzer_<fn>\n"
-            "Then re-run to capture a new asan.log."
-        )
+    # --- Parse ASAN log or use explicit override ---
+    if args.file and args.line:
+        # Explicit override — skip log parsing entirely
+        bug_type = ""
+        if "log_text" in dir():
+            m = _BUG_TYPE_RE.search(log_text)
+            if m:
+                bug_type = m.group(1).strip()
+        parsed = {
+            "rule_id":   _asan_rule_id(bug_type) if bug_type else "MEMORY_SAFETY",
+            "file_path": args.file,
+            "line":      args.line,
+            "bug_type":  bug_type,
+            "message":   (
+                f"libFuzzer/ASAN crash: {bug_type or 'unknown'} "
+                f"in {args.function or '?'} at line {args.line}."
+            ),
+        }
+        print(f"  Using explicit location override")
+    else:
+        parsed = parse_asan_log(log_text, fn_name=args.function)
+        if parsed is None:
+            sys.exit(
+                "ERROR: could not extract file/line from ASAN output.\n"
+                "The stack trace must include function names and file paths.\n"
+                "Options:\n"
+                "  1. Rebuild with debug info and ensure llvm-symbolizer is in PATH:\n"
+                "       clang-20 -fsanitize=fuzzer,address -g -I include \\\n"
+                "           harness_<fn>.c src/*.c -o fuzzer_<fn>\n"
+                "       export PATH=/usr/lib/llvm-20/bin:$PATH\n"
+                "  2. Skip ASAN parsing and provide location directly:\n"
+                "       --file src/handler.c --line 87\n"
+            )
 
     print(f"  Bug type  : {parsed['bug_type'] or '(unknown)'}")
     print(f"  Rule ID   : {parsed['rule_id']}")
