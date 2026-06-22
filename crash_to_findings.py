@@ -24,11 +24,35 @@ Appends to existing findings in that file (deduplicates by file+line).
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Symbolizer discovery
+# ---------------------------------------------------------------------------
+
+def _find_symbolizer() -> str | None:
+    """Return the path to llvm-symbolizer, trying versioned names first."""
+    for name in ("llvm-symbolizer-20", "llvm-symbolizer-19", "llvm-symbolizer-18",
+                 "llvm-symbolizer"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _asan_env() -> dict:
+    """Return env vars that make ASAN use the best available symbolizer."""
+    env = dict(os.environ)
+    sym = _find_symbolizer()
+    if sym and "ASAN_SYMBOLIZER_PATH" not in env:
+        env["ASAN_SYMBOLIZER_PATH"] = sym
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -78,27 +102,27 @@ def _symbolize_address(binary: str, addr: str) -> "tuple[str,str,int] | None":
 
     Returns None if no symbolizer is available or address cannot be resolved.
     """
-    for sym in ("llvm-symbolizer-20", "llvm-symbolizer"):
-        if not shutil.which(sym):
-            continue
-        try:
-            r = subprocess.run(
-                [sym, "--exe", binary, addr],
-                capture_output=True, text=True, timeout=10,
-            )
-            lines = r.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                func = lines[0].strip()
-                loc  = lines[1].strip()   # file:line:col
-                parts = loc.rsplit(":", 2)
-                if len(parts) >= 2 and parts[-2].isdigit():
-                    return func, parts[0], int(parts[-2])
-                elif len(parts) >= 1:
-                    m = re.search(r":(\d+)", loc)
-                    if m:
-                        return func, parts[0], int(m.group(1))
-        except Exception:
-            pass
+    sym = _find_symbolizer()
+    if not sym:
+        return None
+    try:
+        r = subprocess.run(
+            [sym, "--exe", binary, addr],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = r.stdout.strip().splitlines()
+        if len(lines) >= 2:
+            func = lines[0].strip()
+            loc  = lines[1].strip()   # file:line:col
+            parts = loc.rsplit(":", 2)
+            if len(parts) >= 2 and parts[-2].isdigit():
+                return func, parts[0], int(parts[-2])
+            elif len(parts) >= 1:
+                m = re.search(r":(\d+)", loc)
+                if m:
+                    return func, parts[0], int(m.group(1))
+    except Exception:
+        pass
     return None
 
 
@@ -286,6 +310,7 @@ def main() -> None:
         r = subprocess.run(
             [args.fuzzer, args.crash],
             capture_output=True, text=True, timeout=30,
+            env=_asan_env(),
         )
         log_text = r.stderr  # ASAN writes to stderr
         if not log_text.strip():
