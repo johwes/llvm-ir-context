@@ -737,11 +737,11 @@ def _demo_cli():
     from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
 
     import re
-    ir_text = Path(args.ir_file).read_text(errors="replace")
+    ir_text = apply_mem2reg(Path(args.ir_file).read_text(errors="replace"))
 
     import llvmlite.binding as _llvm
     try:
-        _mod = _llvm.parse_assembly(apply_mem2reg(ir_text))
+        _mod = _llvm.parse_assembly(ir_text)
     except Exception as exc:
         if args.debug:
             print(f"Module parse FAILED: {exc}")
