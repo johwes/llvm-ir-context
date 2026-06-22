@@ -889,7 +889,14 @@ def _detect_double_free(fn) -> dict:
     use_after_free = False
 
     def _canonical_ptr_id(op):
-        """Follow bitcast / inttoptr / addrspacecast chains to the base value."""
+        """Follow bitcast/inttoptr/load-from-alloca chains to the base value.
+
+        At -O0 LLVM stores pointers to alloca slots and loads them before
+        each use. Two loads from the same alloca have different SSA ids but
+        the same underlying storage. We peel through load instructions back
+        to their alloca source so the double-free detector sees the same
+        canonical id regardless of which load produced the freed pointer.
+        """
         seen = set()
         while True:
             pid = _ptr_id(op)
@@ -898,16 +905,20 @@ def _detect_double_free(fn) -> dict:
             seen.add(pid)
             if op.value_kind != VK_INSTRUCTION:
                 break
-            # Peek at opcode via string representation — llvmlite exposes no opcode
-            # on Value objects directly, only on Instruction objects.
-            # We use the ptr_to_id map built during graph construction, but here we
-            # don't have it, so fall back to checking operand count.
             try:
                 ops = list(op.operands)
             except Exception:
                 break
+            op_str = str(op)
+            # load ptr from an alloca slot — peel through to the alloca
+            if "load" in op_str and len(ops) >= 1:
+                src = ops[0]
+                if src.value_kind == VK_INSTRUCTION and "alloca" in str(src):
+                    op = src
+                    continue
+            # single-operand cast (bitcast / inttoptr / addrspacecast)
             if len(ops) == 1 and ops[0].value_kind in (VK_INSTRUCTION, VK_ARGUMENT):
-                op = ops[0]   # peel one layer of single-operand cast
+                op = ops[0]
             else:
                 break
         return _ptr_id(op)
