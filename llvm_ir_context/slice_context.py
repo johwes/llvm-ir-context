@@ -333,12 +333,16 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     # count becomes a 64-bit multiply: UINT32_MAX*324 ~= 87 GB, malloc returns
     # NULL, and the null check exits cleanly.  No overflow reachable on this
     # target.  Flag it so the scorer can apply a discount.
+    #
+    # Exclusion: standalone string writes (strcpy, gets, etc.) can introduce a
+    # separate overflow unrelated to the zext'd count, so block on those.
+    # memcpy/memmove/memset are intentionally NOT excluded: when paired with
+    # malloc they use the same zext'd count and are equally safe on 64-bit.
     _ALLOC_FNS = frozenset({
         "malloc", "calloc", "realloc", "xmalloc", "xrealloc",
     })
-    _BUFFER_WRITE_FNS_EARLY = frozenset({
+    _STANDALONE_WRITE_FNS = frozenset({
         "strcpy", "strncpy", "strcat", "strncat",
-        "memcpy", "memmove", "memset", "bcopy",
         "gets", "fgets", "sprintf", "vsprintf",
     })
     zext_count = sum(1 for opc in opcodes if opc == 49)
@@ -346,7 +350,7 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         zext_count > 0
         and not has_trunc          # trunc overrides — narrowing is still risky
         and any(s.get("fn") in _ALLOC_FNS for s in sinks)
-        and not any(s.get("fn") in _BUFFER_WRITE_FNS_EARLY for s in sinks)
+        and not any(s.get("fn") in _STANDALONE_WRITE_FNS for s in sinks)
     )
 
     # ---- deduplicate sinks by function name (preserve first-seen order) ----

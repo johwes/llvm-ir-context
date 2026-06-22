@@ -227,8 +227,9 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
     elif all_alloc_sinks:
         mult *= 0.70   # null-return / OOM bug, not overflow — lower severity
-        if safe_mul_via_zext:
-            mult *= 0.70   # zext i32→i64 before multiply: overflow unreachable on 64-bit
+
+    if safe_mul_via_zext:
+        mult *= 0.60   # zext i32→i64 before multiply: overflow unreachable on 64-bit target
     if has_free_sink and not has_buffer_write:
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
