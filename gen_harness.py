@@ -517,16 +517,18 @@ def build_task_block(fn_name: str, summary: dict) -> str:
             "  Size the output buffer from a compile-time expression, NEVER from\n"
             "  fuzz bytes. Use this pattern exactly:\n"
             "  ```c\n"
-            "  size_t out_cap = Size * 4 + 64;  /* output can exceed input */\n"
+            "  #define OUT_CAP_MAX (4 * 1024 * 1024)  /* 4 MB hard cap */\n"
+            "  size_t out_cap = Size * 4 + 64;         /* output can exceed input */\n"
+            "  if (out_cap > OUT_CAP_MAX) out_cap = OUT_CAP_MAX;\n"
             "  uint8_t *out_buf = malloc(out_cap);\n"
             "  if (!out_buf) return 0;\n"
             "  /* if using a z_stream / stream struct: */\n"
             "  strm.next_out  = out_buf;\n"
-            "  strm.avail_out = out_cap;  /* the cap, never (uint32_t)Size or Data-derived */\n"
+            "  strm.avail_out = (uInt)out_cap;  /* the cap, never (uint32_t)Size or Data-derived */\n"
             "  ```\n"
-            "  `malloc(Size)` is wrong — compressed/transformed output can be larger\n"
-            "  than the input. Reading any length from `Data` as `avail_out` or a\n"
-            "  malloc size is wrong — the fuzzer will produce overflow values."
+            "  `malloc(Size)` is wrong — output can be larger than input.\n"
+            "  Reading any length from `Data` as `avail_out` or malloc size is wrong.\n"
+            "  `Size * 4` with no cap is wrong — libFuzzer will grow inputs until OOM."
         )
 
     # --- M-07: Return 0 (always last) ---
