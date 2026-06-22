@@ -749,17 +749,18 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
         pass
 
     enriched = dict(summary)
+    define_re = re.compile(r"^define\b.*@(\w+)\s*\(", re.MULTILINE)
     for sibling_ll in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
-        if sibling_ll == ll_path:
-            continue
-        # Find function names defined in this .ll
-        define_re = re.compile(r"^define\b.*@(\w+)\s*\(", re.MULTILINE)
+        # Include same-file: callees of dispatch may live in src_handler.ll
         try:
-            sibling_text = Path(sibling_ll).read_text(errors="replace")
+            sibling_text = (Path(sibling_ll).read_text(errors="replace")
+                            if sibling_ll != ll_path else ll_text)
         except OSError:
             continue
         for m in define_re.finditer(sibling_text):
             callee = m.group(1)
+            if callee == fn_name:
+                continue  # skip the target itself
             # Check if callee is directly called by our target function:
             # presence in IR text (call @callee) or in C source text
             in_ir  = bool(re.search(rf"\bcall\b.*@{re.escape(callee)}\b", ll_text))
