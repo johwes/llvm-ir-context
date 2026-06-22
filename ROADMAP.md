@@ -138,6 +138,12 @@ goal is pipeline validation.
 | `scar_log` format string crash confirmed (`%+`, `%0`) | validated |
 | **P0.1** strcmp gate detection → `fuzz_fn_arg_idx` hint in context | `slice_context.py`, `preprocess_slice_pdg.py` |
 | **P0.2** Split-input hint for (ptr, len) functions | `slice_context.py` |
+| **P0.3** Routing gate (P-02): distinguish N-literal dispatch from credential gate | `slice_context.py`, `preprocess_slice_pdg.py` |
 | System prompt (security researcher framing, no safety caps) | `gen_harness.py` |
+| C source injection (`--src-dir`): target function body included in prompt | `gen_harness.py` |
+| **P-05** Interprocedural prompt (callee vulnerability + caller entry point) | `gen_harness.py` |
+| `scar_log` format string crash confirmed (`%+`, `%0`) | validated |
+| `handle_stats` divide-by-zero confirmed (SIGFPE on first input, `\012`) | validated |
 | `session_login` coverage: strcmp gate opened (cov 9→10); bug is latent (null-terminator only surfaces via caller) | validated |
-| `dispatch()` multi-step harness: targets double-free (handle_del) and divide-by-zero (handle_stats) | `harness_dispatch.c` in scarnet repo |
+| `patterns.md` — harness pattern taxonomy and evaluation rubric | documented |
+| `design.md` — design goals, boundary rules, generic-first principle | documented |
