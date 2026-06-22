@@ -385,8 +385,10 @@ def build_task_block(fn_name: str, summary: dict) -> str:
             f"- The function is a command router: the same argument selects different "
             f"handlers on each call. Make multiple calls in sequence (2–4 calls) — "
             f"earlier calls establish state that later calls depend on. "
-            f"Randomize the routed argument across all detected literals on each call "
-            f"so every handler branch is reachable"
+            f"Use a different byte from `Data` to select the routed argument on each "
+            f"call (e.g. `Data[0]`, `Data[1]`, …) so each call can independently pick "
+            f"any of the detected literals — do NOT derive the verb from `Size` or any "
+            f"value that is constant across the call sequence"
         )
     else:
         modules.append(
