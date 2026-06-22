@@ -83,6 +83,75 @@ def get_context(ll_path: str, fn_name: str) -> str:
     return r.stdout.strip()
 
 
+def extract_fn_source(src_text: str, fn_name: str) -> str:
+    """Extract the body of fn_name from C source text using brace matching.
+
+    Finds the function definition line then walks forward tracking brace depth
+    until the matching closing brace. Returns the full function text including
+    signature, or empty string if not found.
+    """
+    # Match a function definition: return-type fn_name(...) possibly across lines.
+    # We look for fn_name followed by '(' not preceded by another word char
+    # (to avoid matching calls or type names that contain fn_name).
+    pattern = re.compile(
+        rf'(?m)^[^\n#/][^\n]*\b{re.escape(fn_name)}\s*\([^;{{]*\{{'
+    )
+    m = pattern.search(src_text)
+    if not m:
+        # Fallback: find the opening brace on the next line after the signature
+        sig_pat = re.compile(rf'(?m)\b{re.escape(fn_name)}\s*\(')
+        sm = sig_pat.search(src_text)
+        if not sm:
+            return ""
+        # Walk forward from the match to find the first '{'
+        start = src_text.find('{', sm.start())
+        if start == -1:
+            return ""
+        fn_start = src_text.rfind('\n', 0, sm.start()) + 1
+    else:
+        start    = src_text.index('{', m.start())
+        fn_start = m.start()
+
+    depth = 0
+    i = start
+    while i < len(src_text):
+        ch = src_text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return src_text[fn_start:i + 1]
+        i += 1
+    return ""  # unterminated — should not happen for valid C
+
+
+def find_source_for_ll(ll_path: str, src_dir: str) -> str:
+    """Guess the C source file path from the .ll filename and src_dir.
+
+    Heuristic: src_handler.ll → handler.c, src_util.ll → util.c, etc.
+    Strips a leading 'src_' prefix and replaces the extension.
+    Also tries the stem directly (handler.ll → handler.c).
+    """
+    stem = Path(ll_path).stem          # e.g. "src_handler"
+    candidates = [
+        stem,                           # src_handler
+        re.sub(r'^src_', '', stem),    # handler
+        re.sub(r'^[^_]+_', '', stem),  # handler (strip any prefix)
+    ]
+    src_dir_path = Path(src_dir)
+    for cand in candidates:
+        for ext in (".c", ".cpp", ".cc"):
+            p = src_dir_path / (cand + ext)
+            if p.exists():
+                return str(p)
+            # also try src/ subdirectory
+            p2 = src_dir_path / "src" / (cand + ext)
+            if p2.exists():
+                return str(p2)
+    return ""
+
+
 def get_ir_signature(ll_path: str, fn_name: str) -> str:
     try:
         text = Path(ll_path).read_text(errors="replace")
@@ -195,7 +264,8 @@ def parse_top_score(output: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 def generate_one(ll_path: str, fn_name: str, header: str,
-                 include_dirs: list[str], output_dir: Path) -> bool:
+                 include_dirs: list[str], output_dir: Path,
+                 src_dir: str = "") -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
@@ -209,6 +279,24 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     if ir_sig:
         print(f"\nIR signature: {ir_sig}")
 
+    # C source extraction
+    src_block = ""
+    if src_dir:
+        src_file = find_source_for_ll(ll_path, src_dir)
+        if src_file:
+            try:
+                src_text = Path(src_file).read_text(errors="replace")
+                fn_src   = extract_fn_source(src_text, fn_name)
+                if fn_src:
+                    src_block = f"\n## Target function (C source)\n```c\n{fn_src}\n```"
+                    print(f"\nSource: {src_file} ({len(fn_src)} chars extracted)")
+                else:
+                    print(f"\nWARNING: could not extract {fn_name} from {src_file}")
+            except OSError as e:
+                print(f"\nWARNING: could not read {src_file}: {e}")
+        else:
+            print(f"\nWARNING: no C source found for {Path(ll_path).name} in {src_dir}")
+
     # Build prompt
     header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
@@ -218,12 +306,15 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 ## Static analysis (IR slicer output)
 {ctx}
 {sig_block}
+{src_block}
 {header_block}
 ## Task
 Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` targeting `{fn_name}`.
 
 Requirements:
 - Use the exact function signature from the IR / API reference above
+- Read the target function source carefully — understand what state must be \
+initialized before calling it and what the function does with its arguments
 - Check the API reference for required initialization and teardown functions and call them
 - Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size
 - If `Data` is used as a string (passed to a function expecting `const char *`), null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set the last byte to `\\0`
@@ -306,6 +397,10 @@ def main():
                     help="Directory to write harness_<fn>.c (default: cwd)")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Skip functions that already have a harness_<fn>.c calling the target")
+    ap.add_argument("--src-dir",      metavar="DIR", default="",
+                    help="Directory containing C source files; the target function body "
+                         "is extracted and included in the prompt so the model can reason "
+                         "about required state and call sequences")
     args = ap.parse_args()
 
     if args.ll and not args.function:
@@ -316,9 +411,11 @@ def main():
     header       = Path(args.header).read_text(errors="replace") if args.header else ""
     include_dirs = [str(Path(args.header).parent)] if args.header else []
     output_dir   = Path(args.output_dir)
+    src_dir      = args.src_dir
 
     if args.ll:
-        generate_one(args.ll, args.function, header, include_dirs, output_dir)
+        generate_one(args.ll, args.function, header, include_dirs, output_dir,
+                     src_dir=src_dir)
         return
 
     # ir-dir mode
@@ -334,7 +431,8 @@ def main():
                 print(f"\n── skipping {fn_name} — harness already exists ({existing})")
                 results["skipped"].append(fn_name)
                 continue
-        ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir)
+        ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir,
+                          src_dir=src_dir)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
