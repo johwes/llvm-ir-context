@@ -233,6 +233,150 @@ for fn, score, ctx in score_file(Path("/tmp/parse.ll")):
     print(ctx)
 ```
 
+## End-to-end walkthrough: scarnet
+
+This section walks through the full pipeline against
+[johwes/scarnet](https://github.com/johwes/scarnet) — an intentionally
+buggy C server used in the SCAR workshop. It assumes SCAR is cloned
+alongside llvm-ir-context.
+
+### Prerequisites
+
+```bash
+# LLVM 20 toolchain
+clang-20 --version   # must exist
+opt-20 --version     # must exist (for mem2reg)
+llvm-symbolizer-20   # for symbolized ASAN stacks
+
+# Python packages
+pip install llvm-ir-context   # or: pip install -e ~/llvm-ir-context/
+```
+
+### 1. Clone repos
+
+```bash
+cd ~
+git clone https://github.com/johwes/llvm-ir-context.git
+git clone https://github.com/johwes/scarnet.git
+git clone https://github.com/johwes/SCAR.git   # or wherever SCAR lives
+mkdir scarnet-ir scarnet-harnesses
+```
+
+### 2. Score scarnet (clones + compiles IR automatically)
+
+```bash
+cd ~/llvm-ir-context
+python -m llvm_ir_context.score_deterministic \
+  --scarnet --keep-ir ~/scarnet-ir/ \
+  --answer-key scarnet-answer-key.txt
+```
+
+Expected: 11/13 P@13, `handle_del` rank 1 with `+df`.
+
+### 3. Generate harnesses
+
+```bash
+python gen_harness.py \
+  --ir-dir ~/scarnet-ir/ \
+  --src-dir ~/scarnet/src/ \
+  --header ~/scarnet/include/scarnet.h \
+  --output-dir ~/scarnet-harnesses/ \
+  --top-k 7 --skip-existing
+```
+
+Expected: 7 harnesses generated (`scar_log`, `session_login`,
+`scar_alloc_copy`, `scar_atoi`, `dispatch`, `parse_cmd`, `session_frag`).
+
+### 4. Compile harnesses
+
+```bash
+cd ~/scarnet-harnesses
+
+for fn in scar_log session_login scar_alloc_copy scar_atoi dispatch parse_cmd session_frag; do
+  clang-20 -fsanitize=fuzzer,address -g \
+    -I ~/scarnet/include \
+    harness_${fn}.c ~/scarnet/src/*.c \
+    -o fuzzer_${fn}
+done
+```
+
+### 5. Fuzz
+
+```bash
+for fn in scar_log session_login scar_alloc_copy scar_atoi dispatch parse_cmd session_frag; do
+  echo "=== $fn ==="
+  mkdir -p crashes/${fn}
+  ./fuzzer_${fn} -runs=500000 -artifact_prefix=crashes/${fn}/ 2>&1 \
+    | grep -E 'SUMMARY|ERROR|Done'
+done
+```
+
+Expected crashes: `scar_log` (SEGV/format-string), `scar_alloc_copy`
+(alloc-too-big), `dispatch` (double-free via `handle_del`),
+`session_frag` (heap-buffer-overflow).
+
+### 6. Symbolize and convert crashes to SCAR findings
+
+```bash
+# Map function → IR file → source file
+declare -A LL=(
+  [scar_log]=src_util      [scar_alloc_copy]=src_util
+  [dispatch]=src_handler   [session_frag]=src_session
+)
+declare -A FN=(
+  [dispatch]=handle_del
+)
+
+for fn in scar_log scar_alloc_copy dispatch session_frag; do
+  crash=$(ls crashes/${fn}/crash-* 2>/dev/null | head -1)
+  [ -z "$crash" ] && continue
+  ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-20 \
+    ./fuzzer_${fn} "$crash" 2>crashes/${fn}/asan.log
+  target_fn=${FN[$fn]:-$fn}
+  python ~/llvm-ir-context/crash_to_findings.py \
+    --asan-log crashes/${fn}/asan.log \
+    --ll ~/scarnet-ir/${LL[$fn]}.ll \
+    --function "$target_fn" \
+    --repo ~/scarnet/ --replace
+done
+```
+
+### 7. Run SCAR repair loop
+
+```bash
+cd ~/SCAR
+python -m scar /tmp/no-ikos.sarif ~/scarnet/ --triage-rounds 3
+```
+
+Expected: 4/4 patches accepted, all `VALID` confidence 1.0.
+
+### 8. Apply patches
+
+```bash
+python ~/llvm-ir-context/apply_patch.py \
+  --results ~/SCAR/scar-results.json \
+  --repo ~/scarnet/
+```
+
+### 9. Re-fuzz to confirm fixes
+
+```bash
+cd ~/scarnet-harnesses
+
+for fn in scar_log scar_alloc_copy dispatch session_frag; do
+  clang-20 -fsanitize=fuzzer,address -g \
+    -I ~/scarnet/include \
+    harness_${fn}.c ~/scarnet/src/*.c \
+    -o fuzzer_${fn}_patched 2>/dev/null
+  echo "=== $fn ==="
+  ./fuzzer_${fn}_patched -runs=500000 2>&1 | grep -E 'SUMMARY|ERROR|Done'
+done
+```
+
+Expected: `Done 500000 runs` with no crashes for all 4.
+
+---
+
 ## What the slicer can and cannot detect
 
 **Detectable** — structural data-flow patterns:
