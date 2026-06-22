@@ -204,3 +204,9 @@ goal is pipeline validation.
 | `session_frag` heap-buffer-overflow confirmed (ASAN, READ 258 bytes past 28-byte alloc, pipeline harness) | validated |
 | `patterns.md` — harness pattern taxonomy and evaluation rubric | documented |
 | `design.md` — design goals, boundary rules, generic-first principle | documented |
+| SIGFPE → DIV_BY_ZERO rule_id fix in `crash_to_findings.py` | `crash_to_findings.py` |
+| `--replace` flag to drop stale same-file findings on re-run | `crash_to_findings.py` |
+| Sizeof guard rule: `Size >= N + sizeof(type)` for multi-byte reads | `gen_harness.py` system prompt |
+| State clamp rule: fuzz-seeded counts must be clamped to valid range | `gen_harness.py` system prompt |
+| fuzz→repair→fuzz loop validated end-to-end: handle_stats div-by-zero found, SCAR patched, re-fuzz confirmed fix, handle_del double-free unmasked | validated |
+| Clean-slate validation: fresh IR + fresh harnesses, 4/7 crashes found (parse_cmd heap-OOB, scar_alloc_copy alloc-too-big, scar_log format-string, session_frag heap-OOB), zero manual harness fixup | validated |
