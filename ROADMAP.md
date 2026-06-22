@@ -90,7 +90,25 @@ See `ideas.md § Interprocedural guard propagation` for caveats.
 
 ---
 
-### 5. Patch re-validation via slicer
+### 5. Model struct redefinition (parse_batch pipeline gap)
+**Observed:** `parse_batch` harness redefined the `kv_entry_t` struct inline instead of
+`#include "scarnet.h"`. The redefined layout may not match the actual struct, causing
+silent misuse. Harness stayed flat (cov:5, leaked 3 allocations, no crash).
+
+**Root cause:** The model sees the header path injected in the prompt but sometimes
+prefers to define types it recognises from the IR rather than include the header. This
+is a model reliability failure, not a slicer failure.
+
+**Fix:** Add an explicit system prompt rule: "Never redefine structs or typedefs — always
+`#include` the provided header. If a type is not in the header, use `void *` and cast."
+Also: inject the header file content (not just the path) into the prompt so the model
+can see the actual definitions.
+
+**File:** `gen_harness.py` (system prompt, and optionally `--header` content injection)
+
+---
+
+### 6. Patch re-validation via slicer
 After an LLM generates a fix, compile the patched function to IR and diff the
 `summarize_slice` output against the original. Reject if `guard_type` is still
 `none` for the same sink; flag for human review if sink count dropped to zero
@@ -146,5 +164,6 @@ goal is pipeline validation.
 | `handle_stats` divide-by-zero confirmed (SIGFPE on first input, `\012`) | validated |
 | `handle_del` double-free confirmed (ASAN, 2nd input, `\254\012`, SET→DEL harness) | validated |
 | `session_login` coverage: strcmp gate opened (cov 9→10); bug is latent (null-terminator only surfaces via caller) | validated |
+| `session_frag` heap-buffer-overflow confirmed (ASAN, READ 258 bytes past 28-byte alloc, pipeline harness) | validated |
 | `patterns.md` — harness pattern taxonomy and evaluation rubric | documented |
 | `design.md` — design goals, boundary rules, generic-first principle | documented |
