@@ -636,6 +636,11 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                     if ir_sig else "")
 
     summary_json = get_context_json(ll_path, fn_name)
+    if ir_dir:
+        summary_json = _enrich_with_callee_flags(
+            summary_json, fn_name, ll_path, ir_dir,
+            src_text=src_block,
+        )
     task_block   = build_task_block(fn_name, summary_json)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
@@ -720,6 +725,55 @@ def _find_ll_for_function(ir_dir: str, fn_name: str) -> str | None:
         except OSError:
             pass
     return None
+
+
+def _enrich_with_callee_flags(summary: dict, fn_name: str,
+                               ll_path: str, ir_dir: str,
+                               src_text: str = "") -> dict:
+    """Merge double_free/use_after_free from direct callees into summary.
+
+    Scans all .ll files in ir_dir. For each function found there, if it has
+    double_free=True or use_after_free=True AND its name appears in the target
+    function's C source (confirming it is a direct callee), OR in the
+    caller_names list of the callee's own summary, OR in the target's IR text,
+    propagate the flag into the returned summary dict.
+    """
+    if summary.get("double_free") and summary.get("use_after_free"):
+        return summary  # already set, nothing to do
+
+    import glob as _glob
+    ll_text = ""
+    try:
+        ll_text = Path(ll_path).read_text(errors="replace")
+    except OSError:
+        pass
+
+    enriched = dict(summary)
+    for sibling_ll in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
+        if sibling_ll == ll_path:
+            continue
+        # Find function names defined in this .ll
+        define_re = re.compile(r"^define\b.*@(\w+)\s*\(", re.MULTILINE)
+        try:
+            sibling_text = Path(sibling_ll).read_text(errors="replace")
+        except OSError:
+            continue
+        for m in define_re.finditer(sibling_text):
+            callee = m.group(1)
+            # Check if callee is directly called by our target function:
+            # presence in IR text (call @callee) or in C source text
+            in_ir  = bool(re.search(rf"\bcall\b.*@{re.escape(callee)}\b", ll_text))
+            in_src = bool(src_text and re.search(rf"\b{re.escape(callee)}\s*\(", src_text))
+            if not (in_ir or in_src):
+                continue
+            callee_summary = get_context_json(sibling_ll, callee)
+            if callee_summary.get("double_free") and not enriched.get("double_free"):
+                enriched["double_free"] = True
+            if callee_summary.get("use_after_free") and not enriched.get("use_after_free"):
+                enriched["use_after_free"] = True
+            if enriched.get("double_free") and enriched.get("use_after_free"):
+                return enriched
+    return enriched
 
 
 # ---------------------------------------------------------------------------
