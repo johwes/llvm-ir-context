@@ -92,6 +92,70 @@ under 50k runs with ASAN, it failed regardless of how clean it looks.
 
 ---
 
+## The intended workflow: fuzz → repair → fuzz
+
+The pipeline is designed for an iterative loop, not a single-shot run.
+
+```
+ir-score                    → rank functions by vulnerability signal
+gen_harness.py              → generate harness for top candidate
+fuzzer                      → find crash (or confirm clean)
+  ↓ crash found
+LLM repair                  → generate patch for the confirmed bug
+slicer re-validation        → diff summarize_slice before/after patch;
+                              reject if guard_type still "none" for same sink
+recompile + re-fuzz         → run same harness against patched binary
+  ↓ no new crash
+move to next ranked target
+```
+
+**Why iteration matters — the masking problem:**
+
+Shallow bugs block discovery of deeper bugs. When a function has multiple
+vulnerabilities, libFuzzer finds the easiest-to-reach one and stops. The
+deeper bug is never explored.
+
+Concrete example from scarnet:
+- `handle_stats` divide-by-zero: reachable with 1-byte input `\012` (STATS
+  verb, empty store). Found immediately.
+- `handle_del` double-free: requires SET then DEL with the same key — a
+  two-call sequence. Masked by the divide-by-zero; never reached.
+
+Trying to solve this with a smarter single-call harness (P-07) is the wrong
+approach. The right solution is the repair loop:
+
+1. Fuzzer finds `handle_stats` div-by-zero
+2. Repair loop patches it (add `nstore == 0` guard)
+3. Slicer validates patch — `sdiv` no longer reachable from unguarded input
+4. Fuzzer runs again — div-by-zero path closed, coverage opens into DEL path
+5. Fuzzer finds `handle_del` double-free
+6. Repeat until fuzzer runs clean or no unguarded sinks remain
+
+**The slicer's role in the repair loop:**
+
+The slicer validates each patch structurally — not by re-running the fuzzer,
+but by checking whether the IR slice for the patched function still shows an
+unguarded sink. This catches:
+- Incomplete patches (guard added but wrong condition)
+- Deleted functions (sink count drops to zero — suspicious, flag for review)
+- Regressions (new sink introduced by the patch)
+
+This is P1.3 in `ROADMAP.md` — not yet implemented, but the machinery exists:
+`summarize_slice` before and after the patch, diff `guard_type` and `n_sinks`.
+
+**What this means for harness design:**
+
+A harness does not need to be stateful or multi-step. It just needs to reach
+the target function's entry with fuzz-controlled input. The repair loop handles
+the sequencing across bugs — the fuzzer handles the sequencing within a run.
+
+The only case where a multi-step harness is genuinely needed is when two bugs
+are in the same function and one masks the other within a single call — which
+is rare. For interprocedural masking (bug in callee A masked by bug in callee B
+of the same dispatcher), the repair loop is always the right answer.
+
+---
+
 ## What this tool is not
 
 - **Not a full taint analysis.** We follow 1 hop up to the caller for guard
