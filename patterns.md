@@ -132,32 +132,81 @@ integer truncation: fuzz values at and above the truncation boundary
 
 ## P-05 · Interprocedural sink (danger in callee)
 
-**What it is:** The ranked/target function is a dispatcher or thin wrapper.
-Its own body is safe (routing logic, snprintf responses). The dangerous sinks
-are one call level down in internal helpers.
+**What it is:** A high-scoring function is not directly fuzzable because it
+is an internal helper — not in the public header. The dangerous sink is in
+this function but the fuzzer entry point must be its caller. The caller may
+itself be low-scoring locally because its own body is safe routing logic.
 
-**IR shape:**
-- Target function has many call sites to sub-functions
-- Sub-functions contain the actual dangerous sinks
-- Target function's own slice score is low (few direct dangerous ops)
+**Concrete example (scarnet):**
+- `handle_del` ranks #11 at 60% — double-free detected in its body
+- `handle_del` is not in `scarnet.h` — not directly fuzzable
+- `dispatch` is in `scarnet.h` but ranks #18 at 28% — its own body is safe
+- Correct target: `dispatch`, exercising the DEL path to reach `handle_del`
 
-**Scoring impact:** Target ranks low (dispatch: #18 at 28%) despite being the
-correct public entry point. Internal helpers rank high but are not directly
-fuzzable.
+**IR shape (callee — the vulnerable function):**
+- High local score with real sink (double-free, OOB write, etc.)
+- Not present in the public header
 
-**Hint:** No direct hint needed — the harness should target the dispatcher.
-The ranking problem is: how do we surface the dispatcher as the right target?
+**IR shape (caller — the harness entry point):**
+- Present in the public header
+- `caller_names` in the callee's slice summary names it (already tracked)
+- May have a routing gate (P-02) that must be navigated to reach the callee
+
+**Prompt shape needed:**
+```
+## Static analysis — vulnerable function: handle_del
+<IR slice context for handle_del — shows the double-free>
+
+## Vulnerable function (C source)
+<handle_del body>
+
+## Caller / harness entry point: dispatch
+<dispatch C source>
+
+## Task
+Write a harness targeting `dispatch` that drives it through the path
+that reaches `handle_del` to trigger the identified vulnerability.
+```
+
+This is a different prompt structure from the 1:1 case. The model sees the
+bug location (callee) and the entry point (caller) separately, and must
+reason about how to connect them.
 
 **Correct harness:**
-- Targets the dispatcher, not the internal helper
-- Drives the dispatcher through enough states to reach dangerous callees
+- Entry point is the caller (public API function)
+- Exercises the specific path through the caller that reaches the callee
+- Handles any gates on that path (auth, routing, etc.)
 
-**Status:** NOT implemented. Current ranking is purely local to the function's
-own IR slice. Cross-callee sink aggregation not yet built.
+**Status:** NOT implemented. Requires three new pieces:
 
-**Proposed fix (P1):** When scoring, if a function's callees contain
-unguarded sinks, propagate a fraction of that score up to the caller. Weight
-by whether the callee is reachable from a public-API function argument.
+**1. Detection (score_deterministic.py or gen_harness.py):**
+- After ranking, for each function not in the header, check if it has a
+  high score and a known caller that IS in the header
+- Signal: `not fn_in_header(fn, header) and score >= threshold
+  and caller_names non-empty and any caller in header`
+
+**2. Caller resolution:**
+- `caller_names` is already populated by the cross-file caller scan (task #11)
+- Need to pick the best caller: prefer the one that is in the header;
+  if multiple, prefer the one with the most direct path to the callee
+
+**3. Prompt assembly (gen_harness.py):**
+- Run `summarize_slice` on the callee → gets the vulnerability context
+- Run `extract_fn_source` on both callee and caller C source
+- Build the two-section prompt above
+- Set the harness target to the caller, not the callee
+- If caller has a routing gate (P-02), include that context too
+
+**Ranking fix (score_deterministic.py):**
+- When a non-public function scores high, propagate a weighted score
+  fraction to its public caller so the caller surfaces in `--top-k` output
+- Weight: caller_score_boost = callee_score × 0.6 (caller inherits danger
+  but is one step removed)
+- Only apply when the callee is not in the header and the caller is
+
+**Implementation order:**
+1. Detection + prompt assembly in gen_harness.py (highest value, no ranking change)
+2. Score propagation in score_deterministic.py (surfaces the right target automatically)
 
 ---
 
