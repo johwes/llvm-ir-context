@@ -56,7 +56,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
+from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg, apply_mem2reg
 from llvm_ir_context.slice_context        import summarize_slice
 
 _SCARNET_REPO = "https://github.com/johwes/scarnet.git"
@@ -266,7 +266,7 @@ def _collect_functions(ir_path: Path) -> list[tuple[str, str, Path]]:
     files = [ir_path] if ir_path.is_file() else sorted(ir_path.glob("**/*.ll"))
     out   = []
     for f in files:
-        ir_text = f.read_text(errors="replace")
+        ir_text = apply_mem2reg(f.read_text(errors="replace"))
         try:
             mod = llvm.parse_assembly(ir_text)
             for fn in mod.functions:
@@ -416,7 +416,7 @@ def main() -> None:
         if ir_id not in seen_ir:
             seen_ir.add(ir_id)
             try:
-                all_modules.append(_llvm.parse_assembly(fn_ir))
+                all_modules.append(_llvm.parse_assembly(apply_mem2reg(fn_ir)))
             except Exception:
                 pass
 

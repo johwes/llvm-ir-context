@@ -79,57 +79,10 @@ weights matter less — dispatch will eventually be picked when higher-ranked
 functions are exhausted. Propagation primarily ensures dispatch isn't buried
 so deep it takes dozens of iterations to reach.
 
-**Known gap — typestate analysis at -O0:** `_detect_double_free` in
-`preprocess_slice_pdg.py` misses double-frees in -O0 IR where the freed
-pointer is loaded from an alloca slot before each `free()` call. The two
-loads have different SSA canonical IDs so the typestate machine sees two
-distinct pointers. The `_canonical_ptr_id` helper was extended to peel
-load-from-alloca chains but the fix is not yet effective.
-Workaround in place: `_enrich_with_callee_flags` in `gen_harness.py` falls
-back to a text-level scan (`_ir_has_double_free`) that counts `call @free`
-occurrences — if ≥ 2, `double_free=True` is set in the prompt summary.
-This is sufficient for the M-05 module to fire. The typestate fix remains
-open for correctness.
-
 **File:** `llvm_ir_context/score_deterministic.py`, `preprocess_slice_pdg.py`
 
 ---
 
-### 5. mem2reg IR pass before slicing
-
-**Problem:** At -O0, Clang spills all locals to `alloca`/`store`/`load` rather
-than keeping them in SSA registers. This causes two concrete failures:
-
-1. `_detect_double_free` sees two `load`s from the same alloca slot as two
-   distinct canonical pointer IDs — both `free()` calls appear to free different
-   pointers, so `double_free=False` even when the same allocation is freed twice.
-   Currently papered over by an IR text-level fallback (`_ir_has_double_free`).
-
-2. The graph builder in `preprocess_slice_pdg.py` requires a synthetic
-   store→load bridge in Pass 3 to reconnect data flow across alloca hops — an
-   ad-hoc workaround for the same root cause.
-
-**Fix:** Run `opt-20 -passes=mem2reg` on each `.ll` file immediately after
-`clang-20` produces it, before loading with llvmlite. `mem2reg` promotes alloca
-variables into SSA `%registers` — this is the canonical LLVM approach, not a
-hack. After this pass:
-- `_detect_double_free` will see both `free()` calls on the same SSA value → `double_free=True`
-- The synthetic store→load bridge can be removed from the graph builder
-- `_ir_has_double_free` text fallback can be removed from `gen_harness.py`
-
-**Where to add:** The IR compilation step is in `score_deterministic.py`
-(`pick_public_functions` calls `ir-score` which loads `.ll` files) and
-`gen_harness.py` (`compile_to_ir`). The cleanest insertion point is where
-`.ll` files are first produced — either in the user's build step (documented
-in README) or as a post-processing pass in `score_deterministic.py` before
-loading with llvmlite.
-
-**Effort:** Small — one `subprocess.run(["opt-20", "-passes=mem2reg", ...])` call.
-**Impact:** Removes two workarounds and makes typestate analysis correct.
-
-**File:** `score_deterministic.py` or build documentation
-
----
 
 ### 6. tree-sitter-c for C source extraction
 
@@ -297,3 +250,4 @@ goal is pipeline validation.
 | `--function` / `--ir-dir` bug fix: `_find_ll_for_function` regex uses `@fn\s*(` not `\b@fn\b` | `gen_harness.py` |
 | `dispatch` → `handle_del` double-free confirmed via pipeline: IR scoring → M-02+M-05 prompt → SET→DEL harness → ASAN crash | validated |
 | `_generate_interprocedural` updated to use `build_task_block` (consistent with `generate_one`) | `gen_harness.py` |
+| mem2reg pass: `apply_mem2reg()` wraps every `parse_assembly` call — fixes typestate analysis, removes -O0 alloca workarounds | `preprocess_slice_pdg.py`, `score_deterministic.py`, `slice_context.py` |

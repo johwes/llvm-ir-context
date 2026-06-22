@@ -41,10 +41,37 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import shutil
+import subprocess
+
 import numpy as np
 import llvmlite.binding as llvm
 
 HERE = Path(__file__).parent
+
+
+def apply_mem2reg(ir_text: str) -> str:
+    """Run mem2reg on IR text and return the promoted IR text.
+
+    mem2reg promotes alloca/store/load patterns (emitted by clang -O0) into
+    proper SSA registers. This makes data-flow analysis correct without
+    requiring -O1 optimisations that would alter the vulnerability surface.
+
+    Falls back to the original text if opt-20/opt is not available or fails.
+    """
+    for opt in ("opt-20", "opt"):
+        if not shutil.which(opt):
+            continue
+        try:
+            r = subprocess.run(
+                [opt, "-passes=mem2reg", "-S", "-o", "-", "-"],
+                input=ir_text, capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout
+        except Exception:
+            pass
+    return ir_text
 DATA = HERE / "data"
 
 # ---------------------------------------------------------------------------
@@ -579,7 +606,7 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
     Caller adds 'y' and 'idx'.
     """
     try:
-        mod = llvm.parse_assembly(ir_text)
+        mod = llvm.parse_assembly(apply_mem2reg(ir_text))
     except Exception:
         return None
 

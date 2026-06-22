@@ -25,6 +25,8 @@ import json
 import sys
 from pathlib import Path
 
+from llvm_ir_context.preprocess_slice_pdg import apply_mem2reg
+
 # ---------------------------------------------------------------------------
 # Opcode constants (must match OPCODE_VOCAB in preprocess_slice_pdg.py)
 # ---------------------------------------------------------------------------
@@ -739,7 +741,7 @@ def _demo_cli():
 
     import llvmlite.binding as _llvm
     try:
-        _mod = _llvm.parse_assembly(ir_text)
+        _mod = _llvm.parse_assembly(apply_mem2reg(ir_text))
     except Exception as exc:
         if args.debug:
             print(f"Module parse FAILED: {exc}")
