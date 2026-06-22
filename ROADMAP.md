@@ -90,21 +90,26 @@ See `ideas.md § Interprocedural guard propagation` for caveats.
 
 ---
 
-### 5. Model struct redefinition (parse_batch pipeline gap)
-**Observed:** `parse_batch` harness redefined the `kv_entry_t` struct inline instead of
-`#include "scarnet.h"`. The redefined layout may not match the actual struct, causing
-silent misuse. Harness stayed flat (cov:5, leaked 3 allocations, no crash).
+### 5. 64-bit integer overflow false positive (parse_batch)
+**Observed:** `parse_batch` harness correctly applied split-input (count diverged from
+buffer size), no struct redefinition, no caps. Harness stayed flat: leak only, no crash.
 
-**Root cause:** The model sees the header path injected in the prompt but sometimes
-prefers to define types it recognises from the IR rather than include the header. This
-is a model reliability failure, not a slicer failure.
+**Root cause:** Slicer false positive on 64-bit targets. `count * sizeof(kv_entry_t)`
+where `count` is `uint32_t` and `sizeof` returns 64-bit `size_t` — the multiply is
+64-bit, so no wraparound. `UINT32_MAX × 324 ≈ 87 GB`; malloc returns NULL and the
+null check exits cleanly. The bug is only reachable on 32-bit platforms where
+`size_t` is 32-bit and the multiply wraps.
 
-**Fix:** Add an explicit system prompt rule: "Never redefine structs or typedefs — always
-`#include` the provided header. If a type is not in the header, use `void *` and cast."
-Also: inject the header file content (not just the path) into the prompt so the model
-can see the actual definitions.
+**Also fixed (resolved):** Model struct redefinition — adding `#include` rule to system
+prompt fixed the redefinition. The harness now correctly uses `#include "scarnet.h"`.
 
-**File:** `gen_harness.py` (system prompt, and optionally `--header` content injection)
+**Fix for the false positive:** In `score_deterministic.py`, when the multiplication
+operands are `(u)int32_t × sizeof()` on a 64-bit IR target, the result is a 64-bit
+multiply with no overflow path. Detect this: if the `mul` operand is zero-extended from
+i32 before the multiply (a `zext i32 to i64` node in the slice), and the other operand
+is a constant (`sizeof`), the overflow is not reachable on this target — reduce score.
+
+**File:** `llvm_ir_context/score_deterministic.py`, `llvm_ir_context/preprocess_slice_pdg.py`
 
 ---
 
