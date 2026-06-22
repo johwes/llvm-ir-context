@@ -44,13 +44,19 @@ def _apply_patch_python(source: str, patch: str) -> str | None:
         old_start = int(m.group(1)) - 1  # 0-indexed
         i += 1
 
-        removed, added = [], []
+        removed, added, pre_context = [], [], []
+        seen_add = False
         while i < len(patch_lines) and not hunk_re.match(patch_lines[i]):
             line = patch_lines[i]
             if line.startswith("-") and not line.startswith("---"):
                 removed.append(line[1:])
+                seen_add = False
             elif line.startswith("+") and not line.startswith("+++"):
                 added.append(line[1:])
+                seen_add = True
+            elif not seen_add:
+                # context line before the first addition — potential anchor
+                pre_context.append(line[1:])
             i += 1
 
         if not removed and not added:
@@ -76,7 +82,19 @@ def _apply_patch_python(source: str, patch: str) -> str | None:
             result[found_at:found_at + len(removed)] = added
             offset += len(added) - len(removed)
         else:
-            found_at = min(target, len(result))
+            # Pure insertion: anchor on the last pre-context line so the
+            # addition lands immediately after it, not at the raw line number.
+            found_at = None
+            if pre_context:
+                anchor = pre_context[-1].rstrip()
+                search_start = max(0, target - 20)
+                search_end = min(len(result), target + 20)
+                for pos in range(search_start, search_end):
+                    if result[pos].rstrip() == anchor:
+                        found_at = pos + 1  # insert after the anchor line
+                        break
+            if found_at is None:
+                found_at = min(target, len(result))
             result[found_at:found_at] = added
             offset += len(added)
 
