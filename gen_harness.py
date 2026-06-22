@@ -410,9 +410,18 @@ def build_task_block(fn_name: str, summary: dict) -> str:
     if summary.get("double_free") or summary.get("use_after_free"):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
         modules.append(
-            f"- A {bug} is detected in the slice. This class of bug requires a resource "
-            f"to exist before the vulnerable call — identify which call creates the "
-            f"resource and make that call first to establish the precondition"
+            f"- A {bug} is detected in a callee. This bug requires a specific "
+            f"call sequence: one call creates a resource (e.g. stores a key, allocates "
+            f"a buffer, opens a handle), and a later call frees or mishandles it. "
+            f"Structure the harness as two fixed phases:\n"
+            f"  1. SETUP: make a hardcoded call that creates the resource using a fixed "
+            f"identifier (e.g. a constant key string derived from fuzz bytes, not random). "
+            f"This call must always succeed before continuing.\n"
+            f"  2. TRIGGER: make a second call that targets the same identifier/resource "
+            f"to trigger the {bug}. Randomize the second call's other arguments from fuzz "
+            f"input to vary the execution path.\n"
+            f"  Do NOT randomize the resource identifier across calls — the {bug} only "
+            f"fires when both calls operate on the same resource."
         )
 
     # --- M-06: Streaming / incremental call pattern ---
