@@ -212,20 +212,27 @@ def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
                 continue
 
             # Check each operand for a direct or GEP-based reference to a @.str global.
+            # Track the 0-based argument index (excluding callee operand) so the hint
+            # can tell the LLM exactly which parameter to hardcode.
+            arg_idx = 0
             for op in ops:
-                if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
+                if op.value_kind == VK_FUNCTION:
+                    continue  # callee — not an argument
+                if op.value_kind == VK_GLOBAL_VAR:
                     gname = op.name.lstrip("@")
                     if gname in str_globals:
                         lit = str_globals[gname]
                         if lit not in seen_lits:
                             seen_lits.add(lit)
-                            guards.append({"fn": callee_name, "literal": lit})
+                            guards.append({"fn": callee_name, "literal": lit,
+                                           "const_arg_idx": arg_idx})
                         break
                 elif op.value_kind == VK_INSTRUCTION:
                     # Typed-pointer IR: GEP into @.str
                     try:
                         gep_ops = list(op.operands)
                     except Exception:
+                        arg_idx += 1
                         continue
                     if gep_ops and gep_ops[0].value_kind == VK_GLOBAL_VAR:
                         gname = gep_ops[0].name.lstrip("@")
@@ -233,8 +240,10 @@ def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
                             lit = str_globals[gname]
                             if lit not in seen_lits:
                                 seen_lits.add(lit)
-                                guards.append({"fn": callee_name, "literal": lit})
+                                guards.append({"fn": callee_name, "literal": lit,
+                                               "const_arg_idx": arg_idx})
                             break
+                arg_idx += 1
 
     return guards
 

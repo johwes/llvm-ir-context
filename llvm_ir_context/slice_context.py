@@ -458,15 +458,23 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     # strcmp gate: function has a hardcoded credential/constant check that will
     # freeze fuzzer coverage unless the harness bypasses it.
     if strcmp_guards:
-        # Most functions have a single gate; list all if there are multiple.
-        gate_strs = ", ".join(
-            f'`{g["fn"]}` against "{g["literal"]}"'
-            for g in strcmp_guards
-        )
-        # Identify which argument position(s) are fuzzable (i.e. not the constant).
-        # Without precise alias info we can only say "the non-constant argument".
+        parts = []
+        for sg in strcmp_guards:
+            const_idx = sg.get("const_arg_idx")
+            if const_idx is not None:
+                # The other argument (0-based, excluding the constant) is fuzzable.
+                # Use ordinal label (argument 0 / argument 1) for clarity.
+                fuzz_idx = 1 - const_idx  # works for 2-arg strcmp; generalises below
+                parts.append(
+                    f'`{sg["fn"]}` against "{sg["literal"]}" '
+                    f'(argument {const_idx} is the constant — '
+                    f'hardcode it; fuzz argument {fuzz_idx})'
+                )
+            else:
+                parts.append(f'`{sg["fn"]}` against "{sg["literal"]}"')
+        gate_strs = ", ".join(parts)
         hint_parts.append(
-            f"strcmp gate detected ({gate_strs}) — this check will prevent the fuzzer "
+            f"strcmp gate detected: {gate_strs} — this check will prevent the fuzzer "
             f"from reaching the dangerous sink; hardcode the constant value in the harness "
             f"and fuzz only the other argument(s)"
         )
@@ -483,7 +491,7 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     has_ptr_len_sink = any(s.get("fn") in _PTR_LEN_SINKS for s in sinks)
     if (has_ptr_len_sink
             and "function_argument" in input_channels
-            and not has_guard
+            and guard_type in ("none", "null_check")
             and arg_count >= 2):
         hint_parts.append(
             "split-input pattern required: both the buffer pointer and the length "
@@ -625,7 +633,9 @@ def format_for_llm(summary: dict, score: float | None = None,
     strcmp_guards = summary.get("strcmp_guards", [])
     if strcmp_guards:
         gate_strs = "; ".join(
-            f'{g["fn"]}("{g["literal"]}")'
+            (f'{g["fn"]}("{g["literal"]}", arg{g["const_arg_idx"]}=const)'
+             if g.get("const_arg_idx") is not None
+             else f'{g["fn"]}("{g["literal"]}")')
             for g in strcmp_guards
         )
         lines.append(f"Strcmp gate     : {gate_strs}  — hardcode constant, fuzz other arg(s)")
