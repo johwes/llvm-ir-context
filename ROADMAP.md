@@ -79,7 +79,19 @@ weights matter less — dispatch will eventually be picked when higher-ranked
 functions are exhausted. Propagation primarily ensures dispatch isn't buried
 so deep it takes dozens of iterations to reach.
 
-**File:** `llvm_ir_context/score_deterministic.py`
+**Known gap — typestate analysis at -O0:** `_detect_double_free` in
+`preprocess_slice_pdg.py` misses double-frees in -O0 IR where the freed
+pointer is loaded from an alloca slot before each `free()` call. The two
+loads have different SSA canonical IDs so the typestate machine sees two
+distinct pointers. The `_canonical_ptr_id` helper was extended to peel
+load-from-alloca chains but the fix is not yet effective.
+Workaround in place: `_enrich_with_callee_flags` in `gen_harness.py` falls
+back to a text-level scan (`_ir_has_double_free`) that counts `call @free`
+occurrences — if ≥ 2, `double_free=True` is set in the prompt summary.
+This is sufficient for the M-05 module to fire. The typestate fix remains
+open for correctness.
+
+**File:** `llvm_ir_context/score_deterministic.py`, `preprocess_slice_pdg.py`
 
 ---
 
@@ -218,3 +230,12 @@ goal is pipeline validation.
 | System prompt: `#include` header rule (no struct redefinition) | `gen_harness.py` |
 | System prompt: `free()` pointer return values rule | `gen_harness.py` |
 | `--save-prompt` flag: writes full LLM prompt to `harness_<fn>_prompt.md` | `gen_harness.py` |
+| Prompt module system (`build_task_block`): M-01–M-07 modules selected by slicer signals | `gen_harness.py` |
+| M-02 routing gate module: multi-call sequence, `Data[i]` verb selection per call | `gen_harness.py` |
+| M-05 double-free precondition module: two-phase SETUP+TRIGGER harness structure | `gen_harness.py` |
+| Callee flag propagation (`_enrich_with_callee_flags`): double_free/UAF from direct callees merged into prompt summary | `gen_harness.py` |
+| IR text fallback for double-free detection: `_ir_has_double_free` counts `call @free` ≥ 2 | `gen_harness.py` |
+| `--function` with `--ir-dir`: bypass ranking, generate exactly the named function | `gen_harness.py` |
+| `--function` / `--ir-dir` bug fix: `_find_ll_for_function` regex uses `@fn\s*(` not `\b@fn\b` | `gen_harness.py` |
+| `dispatch` → `handle_del` double-free confirmed via pipeline: IR scoring → M-02+M-05 prompt → SET→DEL harness → ASAN crash | validated |
+| `_generate_interprocedural` updated to use `build_task_block` (consistent with `generate_one`) | `gen_harness.py` |
