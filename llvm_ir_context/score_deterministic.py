@@ -471,7 +471,7 @@ def main() -> None:
         callee_score = rule_scores.get(fn_name, 0.0)
         if callee_score < _PROPAGATION_THRESHOLD:
             continue
-        for caller in summary.get("caller_names", []):
+        for caller in set(summary.get("caller_names", [])):  # dedup: caller_names may repeat
             if caller not in rule_scores:
                 continue
             boost = callee_score * _PROPAGATION_WEIGHT
