@@ -271,6 +271,9 @@ def main() -> None:
                     help="Override: source file path of the bug (skips ASAN log parsing)")
     ap.add_argument("--line",     metavar="N", type=int,
                     help="Override: line number of the bug (skips ASAN log parsing)")
+    ap.add_argument("--replace",  action="store_true",
+                    help="Remove all existing findings for the same --file before appending. "
+                         "Prevents stale entries from accumulating when re-running on the same target.")
     args = ap.parse_args()
 
     # --- Get ASAN output ---
@@ -368,6 +371,9 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing = _load_existing(out_path)
+    if args.replace and args.file:
+        target_file = str(Path(args.file).resolve())
+        existing = [f for f in existing if str(Path(f["file_path"]).resolve()) != target_file]
     merged   = _dedup(existing + [finding])
     out_path.write_text(json.dumps(merged, indent=2))
 
