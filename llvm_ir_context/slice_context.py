@@ -477,19 +477,17 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         credential_params = {idx for idx, guards in by_param.items() if len(guards) == 1}
 
         if routing_params:
-            # P-02: routing gate — randomize verb/command from the full set
+            # P-02: routing gate — randomize across all literals
             for idx in sorted(routing_params):
                 guards   = by_param[idx]
                 literals = [f'"{sg["literal"]}"' for sg in guards]
                 lit_list = ", ".join(literals)
                 hint_parts.append(
                     f"command router on parameter {idx}: `{guards[0]['fn']}` dispatches "
-                    f"on this argument using {len(guards)} different literals "
-                    f"({lit_list}) — do NOT hardcode one value; instead randomize "
-                    f"parameter {idx} across all {len(guards)} literals on each fuzzer "
-                    f"call so all handlers are reachable; if one literal is an "
-                    f"auth/init verb (e.g. 'AUTH'), call with that first using fixed "
-                    f"credentials, then fuzz the subsequent calls with other verbs"
+                    f"on this argument across {len(guards)} literals "
+                    f"({lit_list}) — do NOT hardcode one value; randomize "
+                    f"parameter {idx} across all {len(guards)} literals so every "
+                    f"handler branch is reachable by the fuzzer"
                 )
 
         if credential_params:

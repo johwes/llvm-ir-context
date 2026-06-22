@@ -51,8 +51,12 @@ research targets — finding crashes is the goal, not writing safe production co
 Rules:
 - The "Static analysis" block in each request is produced by a deterministic IR slicer \
 and is authoritative. Follow its "Harness target" hints exactly and completely.
-- If the hint says "strcmp gate detected … hardcode the constant value", do it — \
-hardcode the literal and fuzz only the other argument(s).
+- If the hint says "strcmp gate" with a single literal, hardcode that literal \
+and fuzz only the other argument(s).
+- If the hint says "command router" with a list of literals, randomize the \
+routed argument across all listed literals on each call — do not hardcode one; \
+examine the function's API to determine if any literal requires prior \
+initialization before the others.
 - If the hint says "split-input pattern required", split Data into two independent \
 regions so the source buffer and the length can diverge; do not call the function \
 with matching (Data, Size).
