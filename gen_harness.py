@@ -434,12 +434,13 @@ def build_task_block(fn_name: str, summary: dict) -> str:
         )
 
     # --- M-08: Output buffer sizing ---
-    # Fires when the function writes into a caller-supplied output buffer.
-    # Structural signal: a buffer-write sink is present and the function takes
-    # enough arguments to have both an input and an output buffer.
-    # The model's failure mode is to read fuzz bytes as the malloc size or to
-    # declare a stack buffer of `Size` bytes — both make harness crashes that
-    # have nothing to do with the target.
+    # Fires when a buffer-write sink is present.  The arg_count >= 3 guard is
+    # intentionally removed: streaming APIs like deflate(z_stream*, int) have
+    # only 2 arguments but the output buffer is inside the struct — the model
+    # still needs the sizing instruction.
+    # Two failure modes observed in the wild:
+    #   1. malloc(Size) — output of a transform can be larger than input
+    #   2. avail_out = *(uint32_t*)(Data) — reads output size from fuzz bytes
     _OUTPUT_WRITE_SINKS = frozenset({
         "memcpy", "memmove", "memset", "bcopy",
         "compress", "compress2", "uncompress",
@@ -448,16 +449,17 @@ def build_task_block(fn_name: str, summary: dict) -> str:
         "LZ4_compress_default", "LZ4_decompress_safe",
     })
     sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
-    arg_count = summary.get("arg_count", 0)
-    if sink_fns & _OUTPUT_WRITE_SINKS and arg_count >= 3:
+    if sink_fns & _OUTPUT_WRITE_SINKS:
         modules.append(
             "- The function writes into a caller-supplied output buffer. "
-            "Size that buffer from a compile-time constant (e.g. `4 * Size` or a "
-            "fixed cap such as `1 << 20`), never from fuzz bytes directly. "
-            "Do NOT call `malloc(len)` where `len` is read from `Data` without a "
-            "cap — the fuzzer will synthesise multi-gigabyte sizes and OOM. "
-            "Do NOT declare a stack buffer of `Size` bytes — the output of a "
-            "transform can be larger than the input."
+            "Size that buffer from a compile-time constant — use `Size + 64` or "
+            "a fixed cap like `deflateBound(...)` / `4 * Size + 64` for "
+            "compress/deflate — never from fuzz bytes directly. "
+            "Do NOT write `malloc(Size)` for the output buffer: the compressed "
+            "or transformed output can be larger than the raw input. "
+            "Do NOT read any size or length value from `Data` and use it "
+            "unmodified as `avail_out`, `malloc` argument, or buffer dimension — "
+            "the fuzzer will produce values that overflow the allocation."
         )
 
     # --- M-07: Return 0 (always last) ---
