@@ -152,6 +152,92 @@ INPUT_SOURCES = frozenset({
 
 _SINK_SUFFIXES = tuple(DANGEROUS_SINKS)
 
+_STRCMP_FNS = frozenset({
+    "strcmp", "strncmp", "memcmp", "strcasecmp", "strncasecmp",
+})
+
+
+def _extract_str_globals(ir_text: str) -> dict[str, str]:
+    """Return {global_name: decoded_string} for all i8-array string constants.
+
+    Handles LLVM IR string escapes (\\XX hex only).  Strips trailing null bytes.
+    """
+    result: dict[str, str] = {}
+    pattern = re.compile(
+        r'@([\w.$]+)\s*=.*?constant\s+\[\d+\s+x\s+i8\]\s+c"((?:[^"\\]|\\[0-9a-fA-F]{2})*)"'
+    )
+    for m in pattern.finditer(ir_text):
+        name = m.group(1)
+        raw  = m.group(2)
+        decoded = re.sub(r'\\([0-9a-fA-F]{2})',
+                         lambda h: chr(int(h.group(1), 16)), raw)
+        result[name] = decoded.rstrip('\x00')
+    return result
+
+
+def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
+    """Scan target_fn body for strcmp/strncmp/memcmp calls against a string literal.
+
+    Returns list of {"fn": "strcmp", "literal": "scarnet123"}.  Does not require
+    the strcmp to be in the backward slice — any strcmp-against-literal in the
+    function body is reported, because any such gate can block fuzzer coverage.
+
+    Handles both modern opaque-pointer IR (ptr @.str directly as an operand) and
+    older typed-pointer IR (getelementptr inbounds @.str → VK_INSTRUCTION operand).
+    """
+    guards: list[dict] = []
+    seen_lits: set[str] = set()
+
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode != "call":
+                continue
+            ops = list(instr.operands)
+            # The callee is the last operand in llvmlite's operand list and has
+            # VK_FUNCTION kind.  Check VK_FUNCTION first; fall back to VK_GLOBAL_VAR
+            # only when no VK_FUNCTION operand is present (indirect call via function
+            # pointer stored in a global).  This prevents @.str global arguments from
+            # being mistaken for the callee.
+            callee_name = ""
+            for op in ops:
+                if op.value_kind == VK_FUNCTION:
+                    callee_name = _normalize_sink_name(op.name.lstrip("@"))
+                    break
+            if not callee_name:
+                for op in ops:
+                    if op.value_kind == VK_GLOBAL_VAR:
+                        callee_name = _normalize_sink_name(op.name.lstrip("@"))
+                        break
+            if callee_name not in _STRCMP_FNS:
+                continue
+
+            # Check each operand for a direct or GEP-based reference to a @.str global.
+            for op in ops:
+                if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
+                    gname = op.name.lstrip("@")
+                    if gname in str_globals:
+                        lit = str_globals[gname]
+                        if lit not in seen_lits:
+                            seen_lits.add(lit)
+                            guards.append({"fn": callee_name, "literal": lit})
+                        break
+                elif op.value_kind == VK_INSTRUCTION:
+                    # Typed-pointer IR: GEP into @.str
+                    try:
+                        gep_ops = list(op.operands)
+                    except Exception:
+                        continue
+                    if gep_ops and gep_ops[0].value_kind == VK_GLOBAL_VAR:
+                        gname = gep_ops[0].name.lstrip("@")
+                        if gname in str_globals:
+                            lit = str_globals[gname]
+                            if lit not in seen_lits:
+                                seen_lits.add(lit)
+                                guards.append({"fn": callee_name, "literal": lit})
+                            break
+
+    return guards
+
 
 def _normalize_sink_name(name: str) -> str:
     """Strip compiler-added decorations to recover the base function name.
@@ -588,6 +674,15 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
         g = {"x": x, "edge_index": edge_index, "edge_type": edge_type,
              "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
              "_sliced": False, "_n_sinks": 0}
+
+    # strcmp-against-literal gates: detect hardcoded credential checks that block
+    # fuzzer coverage.  Scan the full IR text for @.str globals first.
+    str_globals  = _extract_str_globals(ir_text)
+    strcmp_guards = _detect_strcmp_guards(target_fn, str_globals)
+    g["strcmp_guards"] = strcmp_guards
+
+    # Count function arguments so the split-input hint can reference them by name.
+    g["arg_count"] = sum(1 for _ in target_fn.arguments)
 
     # Attach free-pairing analysis (intra-procedural; independent of slice).
     free_info = _detect_double_free(target_fn)

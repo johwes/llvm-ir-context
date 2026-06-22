@@ -180,6 +180,8 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     caller_validated: bool  = g.get("caller_validated", False)
     caller_count:     int   = g.get("caller_count", 0)
     caller_names:     list  = g.get("caller_names", [])
+    strcmp_guards:    list  = g.get("strcmp_guards", [])
+    arg_count:        int   = g.get("arg_count", 0)
     sink_mask = g.get("sink_mask", None)
 
     # ---- build DFG adjacency (used for distance + guard path analysis) -----
@@ -453,6 +455,45 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
             "fuzz use-after-free: free pointer then access via alias or stale reference"
         )
 
+    # strcmp gate: function has a hardcoded credential/constant check that will
+    # freeze fuzzer coverage unless the harness bypasses it.
+    if strcmp_guards:
+        # Most functions have a single gate; list all if there are multiple.
+        gate_strs = ", ".join(
+            f'`{g["fn"]}` against "{g["literal"]}"'
+            for g in strcmp_guards
+        )
+        # Identify which argument position(s) are fuzzable (i.e. not the constant).
+        # Without precise alias info we can only say "the non-constant argument".
+        hint_parts.append(
+            f"strcmp gate detected ({gate_strs}) — this check will prevent the fuzzer "
+            f"from reaching the dangerous sink; hardcode the constant value in the harness "
+            f"and fuzz only the other argument(s)"
+        )
+
+    # Split-input pattern: when both buffer pointer and length are independent
+    # function arguments feeding the same sink with no guard, calling the function
+    # with matching (Data, Size) will never trigger an overflow because libFuzzer
+    # guarantees Data is exactly Size bytes.  The harness must create a mismatch.
+    _PTR_LEN_SINKS = frozenset({
+        "memcpy", "memmove", "memset", "bcopy",
+        "strcpy", "strncpy", "strcat", "strncat",
+        "read", "recv", "recvfrom", "pread",
+    })
+    has_ptr_len_sink = any(s.get("fn") in _PTR_LEN_SINKS for s in sinks)
+    if (has_ptr_len_sink
+            and "function_argument" in input_channels
+            and not has_guard
+            and arg_count >= 2):
+        hint_parts.append(
+            "split-input pattern required: both the buffer pointer and the length "
+            "are independent function arguments — calling with (Data, Size) will not "
+            "trigger an overflow because they always match; instead, derive the source "
+            "buffer from a small fixed-size region (e.g. first 64 bytes of Data) and "
+            "let the length argument be fuzzed freely from the remaining bytes so the "
+            "two can diverge"
+        )
+
     harness_hint = " | ".join(hint_parts)
 
     return {
@@ -482,6 +523,8 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         "caller_validated":   caller_validated,
         "caller_count":       caller_count,
         "caller_names":       caller_names,
+        "strcmp_guards":      strcmp_guards,
+        "arg_count":          arg_count,
         "natural_language":   natural_language,
         "harness_hint":       harness_hint,
     }
@@ -579,6 +622,13 @@ def format_for_llm(summary: dict, score: float | None = None,
         callers = summary.get("caller_names", [])
         caller_str = ", ".join(callers[:3]) + (" ..." if len(callers) > 3 else "")
         lines.append(f"Caller guard    : icmp found in caller(s): {caller_str}  — may be validated upstream")
+    strcmp_guards = summary.get("strcmp_guards", [])
+    if strcmp_guards:
+        gate_strs = "; ".join(
+            f'{g["fn"]}("{g["literal"]}")'
+            for g in strcmp_guards
+        )
+        lines.append(f"Strcmp gate     : {gate_strs}  — hardcode constant, fuzz other arg(s)")
     lines.append("Harness target  : " + summary["harness_hint"])
     lines.append(f"Slice           : {summary['slice_size']} nodes, "
                  f"{summary['n_sinks']} sink(s)")
