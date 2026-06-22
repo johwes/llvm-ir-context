@@ -328,6 +328,18 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
     # Compiler-derived C-level type names (best-effort)
     terms |= _clang_ast_type_names(header_text, fn_name, include_dirs)
 
+    # Expand terms transitively: if 'z_stream' is known and a typedef block says
+    # 'typedef struct z_stream_s { ... } z_stream;', also add 'z_stream_s' so
+    # the block-tracking filter below can capture the full struct body.
+    # One pass is sufficient — C typedefs don't recurse in practice.
+    _typedef_re = re.compile(r'\btypedef\b[^;]+;', re.DOTALL)
+    snapshot = set(terms)
+    for _m in _typedef_re.finditer(header_text):
+        block = _m.group(0)
+        if any(t in block for t in snapshot):
+            for ident in re.findall(r'\b([A-Za-z_]\w+)\b', block):
+                terms.add(ident)
+
     # Filter header lines using the collected terms
     lines = header_text.splitlines(keepends=True)
     keep: list[str] = []
@@ -335,6 +347,11 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
     brace_depth = 0
 
     for line in lines:
+        # Always keep integer/hex constant macros — LLM needs Z_OK, Z_NO_FLUSH, etc.
+        if re.match(r'\s*#define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?', line):
+            keep.append(line)
+            continue
+
         if re.match(r'\s*(typedef|struct|#define|#ifndef|#endif)', line):
             if any(t in line for t in terms):
                 keep.append(line)
@@ -354,6 +371,12 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
             keep.append(line)
 
     trimmed = "".join(keep)
+
+    # If filtering produced almost nothing (clang AST failed + opaque IR ptr),
+    # fall back to hard truncation — verbose header beats an empty one.
+    if len(trimmed) < 200:
+        trimmed = header_text
+
     if len(trimmed) <= char_limit:
         return trimmed
 
