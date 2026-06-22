@@ -249,7 +249,17 @@ opt-20 --version     # must exist (for mem2reg)
 llvm-symbolizer-20   # for symbolized ASAN stacks
 
 # Python packages
-pip install llvm-ir-context   # or: pip install -e ~/llvm-ir-context/
+pip install llvm-ir-context   # or: pip install -e ~/openshift/llvm-ir-context/
+```
+
+**Model:** `gen_harness.py` defaults to `Qwen3.6-35B-A22B` but is configured
+via environment variables. `deepseek-r1-distill-qwen-14b` is recommended for
+reliable multi-constraint instruction following:
+
+```bash
+export LLM_ENDPOINT=https://<your-litellm-endpoint>/v1/chat/completions
+export LLM_MODEL=deepseek-r1-distill-qwen-14b
+export LLM_API_KEY=sk-...
 ```
 
 ### 1. Clone repos
