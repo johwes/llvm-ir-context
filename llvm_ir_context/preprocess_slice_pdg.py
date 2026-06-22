@@ -220,28 +220,45 @@ def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
         for instr in block.instructions:
             instr_by_pid[_ptr_id(instr)] = instr
 
-    def _trace_to_fn_arg(op) -> "int | None":
+    def _trace_to_fn_arg(op, _depth: int = 0) -> "int | None":
         """Return the 0-based function argument index that op ultimately loads from.
 
         Handles:
           - direct argument reference (VK_ARGUMENT)
           - load from an alloca that stored a function argument (-O0 pattern)
+          - getelementptr (struct field / array index access): follow the base
+            pointer operand, which is itself a load from an alloca holding the
+            struct pointer argument (e.g. cmd->verb where cmd is arg 0)
         """
+        if _depth > 4:  # guard against pathological chains
+            return None
         if op.value_kind == VK_ARGUMENT:
             return arg_ptr_ids.get(_ptr_id(op))
         if op.value_kind == VK_INSTRUCTION:
-            # Look up the instruction object by ptr_id so we can read its operands.
-            load_instr = instr_by_pid.get(_ptr_id(op))
-            if load_instr is None or load_instr.opcode != "load":
+            instr = instr_by_pid.get(_ptr_id(op))
+            if instr is None:
                 return None
             try:
-                load_ops = list(load_instr.operands)
+                ops = list(instr.operands)
             except Exception:
                 return None
-            if not load_ops:
-                return None
-            alloca_op = load_ops[0]  # pointer operand of the load
-            return alloca_to_arg.get(_ptr_id(alloca_op))
+            if instr.opcode == "load":
+                if not ops:
+                    return None
+                alloca_op = ops[0]  # pointer operand of the load
+                # Direct load-from-alloca-of-arg
+                result = alloca_to_arg.get(_ptr_id(alloca_op))
+                if result is not None:
+                    return result
+                # May be a load of a pointer that itself needs tracing (e.g.
+                # loading the struct pointer before a GEP)
+                return _trace_to_fn_arg(alloca_op, _depth + 1)
+            if instr.opcode == "getelementptr":
+                # ops[0] is the base pointer (the struct or array being indexed).
+                # Trace through it to find the originating function argument.
+                if not ops:
+                    return None
+                return _trace_to_fn_arg(ops[0], _depth + 1)
         return None
 
     for block in target_fn.blocks:
