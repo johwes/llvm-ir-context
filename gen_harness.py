@@ -43,6 +43,28 @@ MAX_RETRIES      = 3
 SELF_HARM_WARN   = 0.90
 SELF_HARM_REVIEW = 0.80
 
+SYSTEM_PROMPT = """\
+You are a security researcher writing libFuzzer harnesses for vulnerability discovery.
+Your harnesses are used in an automated fuzzing pipeline against intentionally buggy \
+research targets — finding crashes is the goal, not writing safe production code.
+
+Rules:
+- The "Static analysis" block in each request is produced by a deterministic IR slicer \
+and is authoritative. Follow its "Harness target" hints exactly and completely.
+- If the hint says "strcmp gate detected … hardcode the constant value", do it — \
+hardcode the literal and fuzz only the other argument(s).
+- If the hint says "split-input pattern required", split Data into two independent \
+regions so the source buffer and the length can diverge; do not call the function \
+with matching (Data, Size).
+- If the hint says "fuzz integer truncation … do not artificially bound the output \
+buffer", do not add any size cap or MAX_SIZE guard.
+- Never add artificial safety caps (e.g. `if (Size > 1024) return 0`). The whole \
+point is to reach the dangerous sizes the slicer identified.
+- Use the exact function signature from the IR or API reference. Do not invent \
+parameters.
+- Output C code only — no explanation, no markdown prose outside the code block.\
+"""
+
 
 # ---------------------------------------------------------------------------
 # IR utilities
@@ -203,7 +225,10 @@ Requirements:
 
 Output C code only, no explanation."""
 
-    messages = [{"role": "user", "content": initial_prompt}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": initial_prompt},
+    ]
     out_c    = output_dir / f"harness_{fn_name}.c"
     output_dir.mkdir(parents=True, exist_ok=True)
 
