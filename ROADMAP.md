@@ -57,20 +57,27 @@ See `ideas.md § Harness IR validation` for full implementation sketch.
 
 ---
 
-### 4. Interprocedural guard propagation
-Internal helpers (e.g., `lm_init` in zlib) consistently score high because
-their guards live in the caller. `header-aware auto-pick` filters them from
-harness generation, but they still pollute the ranking output and require
-`--no-gep-only` to suppress.
+### 4. Interprocedural score propagation — calibration
 
-When `caller_validated=True` and all input channels are
-`external_call_return` (no direct `function_argument`), apply a score
-reduction (×0.70) to reflect the likely upstream guard.
+**Implemented (basic form):** When a callee scores ≥ 0.50, its score × 0.75
+is propagated to known callers. This lifts `dispatch` from rank 18 (28%) to
+rank 8 (61.9%) — correctly surfacing it for harness generation.
 
-Requires tracking which caller `icmp` guards which argument slot — a
-meaningful extension to the cross-file caller scan.
+**Open question:** The weights (0.75, 0.50) were tuned against scarnet. A more
+principled approach propagates **categorical signals** rather than score fractions:
+- callee has `double_free=True` → caller gets double_free floor (0.92)
+- callee has `use_after_free=True` → caller gets UAF floor (0.88)
+- callee has unguarded call sink + `function_argument` → caller gets fixed
+  interprocedural floor (e.g. 0.70)
 
-See `ideas.md § Interprocedural guard propagation` for caveats.
+This makes propagation defensible on any codebase without knowing the answer
+key. The current continuous approach is correct in direction but scarnet-tuned
+in magnitude.
+
+**Note:** In a priority-queue loop (`--skip-if-unchanged`), exact propagation
+weights matter less — dispatch will eventually be picked when higher-ranked
+functions are exhausted. Propagation primarily ensures dispatch isn't buried
+so deep it takes dozens of iterations to reach.
 
 **File:** `llvm_ir_context/score_deterministic.py`
 
@@ -105,6 +112,40 @@ first call without refilling, so even with valid input no deep state was reached
 **File:** `llvm_ir_context/slice_context.py` (hints), `gen_harness.py` (system prompt)
 
 See `patterns.md § P-08` for full spec.
+
+---
+
+### 6. IR-hash + coverage change detection (CI integration)
+
+**Problem:** `--skip-existing` skips functions that already have a harness,
+permanently. New dangerous code introduced in a refactor is invisible to the
+pipeline — the function already has a harness so it's never re-scored or
+re-fuzzed.
+
+**Two-layer detection:**
+
+**Layer 1 — IR hash:** On each pipeline run, hash the compiled IR for each
+function. If the hash changed since the harness was generated, re-score and
+re-generate the harness. IR change = code change = harness may be stale.
+
+**Layer 2 — Coverage regression:** Even if the IR looks structurally similar,
+the existing harness may not exercise new paths. Store a coverage baseline
+(edge count or branch bitmap) per harness. If coverage drops on re-fuzz,
+flag for harness review — new code may be unreachable.
+
+**Reframes `--skip-existing` as `--skip-if-unchanged`:**
+- unchanged = same IR hash AND coverage hasn't regressed
+- Cheap to compute (IR hashing is fast, no LLM cost)
+- Maps naturally to CI: run scoring + hash check on every PR, spend LLM
+  tokens only when IR actually changed
+
+**Relationship to OSS-Fuzz-Gen:** Coverage is used here as a change detector,
+not as the primary discovery signal. IR structural scoring remains the driver
+for which functions to fuzz; coverage validates that existing harnesses stay
+effective as code evolves.
+
+**File:** `gen_harness.py` (`--skip-if-unchanged` flag), new `ir_hash.py`
+utility, coverage baseline storage in `.llvm-ir-context/coverage/`
 
 ---
 
