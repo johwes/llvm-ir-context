@@ -455,30 +455,66 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
             "fuzz use-after-free: free pointer then access via alias or stale reference"
         )
 
-    # strcmp gate: function has a hardcoded credential/constant check that will
-    # freeze fuzzer coverage unless the harness bypasses it.
+    # strcmp gate / routing gate (P-01 / P-02):
+    # Group guards by which function parameter is the non-const operand.
+    # If one parameter index appears in ≥2 guards with different literals →
+    # routing gate (P-02): the function dispatches on that argument; the harness
+    # must randomize across all literals, not hardcode one.
+    # If each parameter index appears only once → credential gate (P-01): hardcode
+    # the literal to get past the check and fuzz the other argument.
     if strcmp_guards:
-        parts = []
+        from collections import defaultdict
+        by_param: dict = defaultdict(list)
+        no_param: list = []
         for sg in strcmp_guards:
-            fuzz_fn_idx = sg.get("fuzz_fn_arg_idx")
-            if fuzz_fn_idx is not None:
-                # Name the target function's parameter directly.
+            idx = sg.get("fuzz_fn_arg_idx")
+            if idx is not None:
+                by_param[idx].append(sg)
+            else:
+                no_param.append(sg)
+
+        routing_params  = {idx for idx, guards in by_param.items() if len(guards) >= 2}
+        credential_params = {idx for idx, guards in by_param.items() if len(guards) == 1}
+
+        if routing_params:
+            # P-02: routing gate — randomize verb/command from the full set
+            for idx in sorted(routing_params):
+                guards   = by_param[idx]
+                literals = [f'"{sg["literal"]}"' for sg in guards]
+                lit_list = ", ".join(literals)
+                hint_parts.append(
+                    f"command router on parameter {idx}: `{guards[0]['fn']}` dispatches "
+                    f"on this argument using {len(guards)} different literals "
+                    f"({lit_list}) — do NOT hardcode one value; instead randomize "
+                    f"parameter {idx} across all {len(guards)} literals on each fuzzer "
+                    f"call so all handlers are reachable; if one literal is an "
+                    f"auth/init verb (e.g. 'AUTH'), call with that first using fixed "
+                    f"credentials, then fuzz the subsequent calls with other verbs"
+                )
+
+        if credential_params:
+            # P-01: credential gate — hardcode the literal
+            parts = []
+            for idx in sorted(credential_params):
+                sg = by_param[idx][0]
                 parts.append(
                     f'`{sg["fn"]}` against "{sg["literal"]}" — '
                     f'hardcode "{sg["literal"]}" as the constant string argument; '
-                    f'pass `Data` (as a null-terminated copy) into parameter {fuzz_fn_idx} '
+                    f'pass `Data` (as a null-terminated copy) into parameter {idx} '
                     f'of `{fn_name}` (the non-constant argument)'
                 )
-            else:
-                parts.append(
-                    f'`{sg["fn"]}` against "{sg["literal"]}" — '
-                    f'hardcode the constant and fuzz the other argument'
-                )
-        gate_strs = " | ".join(parts)
-        hint_parts.append(
-            f"strcmp gate: {gate_strs} — without this, the fuzzer cannot reach "
-            f"the dangerous sink past the credential check"
-        )
+            gate_strs = " | ".join(parts)
+            hint_parts.append(
+                f"strcmp gate: {gate_strs} — without this, the fuzzer cannot reach "
+                f"the dangerous sink past the credential check"
+            )
+
+        if no_param:
+            # Guards where we couldn't trace back to a function parameter
+            parts = [f'`{sg["fn"]}` against "{sg["literal"]}" — '
+                     f'hardcode the constant and fuzz the other argument'
+                     for sg in no_param]
+            hint_parts.append("strcmp gate: " + " | ".join(parts))
 
     # Split-input pattern: when both buffer pointer and length are independent
     # function arguments feeding the same sink with no guard, calling the function
@@ -633,14 +669,21 @@ def format_for_llm(summary: dict, score: float | None = None,
         lines.append(f"Caller guard    : icmp found in caller(s): {caller_str}  — may be validated upstream")
     strcmp_guards = summary.get("strcmp_guards", [])
     if strcmp_guards:
-        _target = summary.get("fn_name", "target")
-        gate_strs = "; ".join(
-            (f'{g["fn"]}("{g["literal"]}") → fuzz param {g["fuzz_fn_arg_idx"]} of {_target}'
-             if g.get("fuzz_fn_arg_idx") is not None
-             else f'{g["fn"]}("{g["literal"]}")')
-            for g in strcmp_guards
-        )
-        lines.append(f"Strcmp gate     : {gate_strs}  — hardcode constant, fuzz other arg(s)")
+        from collections import defaultdict as _dd
+        _by_param: dict = _dd(list)
+        for _g in strcmp_guards:
+            _by_param[_g.get("fuzz_fn_arg_idx")].append(_g)
+        _routing  = {idx for idx, gs in _by_param.items() if idx is not None and len(gs) >= 2}
+        _parts = []
+        for idx, gs in sorted(_by_param.items(), key=lambda kv: (kv[0] is None, kv[0])):
+            lits = "; ".join(f'"{g["literal"]}"' for g in gs)
+            if idx in _routing:
+                _parts.append(f"param {idx} → router({lits})")
+            elif idx is not None:
+                _parts.append(f'{gs[0]["fn"]}("{gs[0]["literal"]}") → credential gate param {idx}')
+            else:
+                _parts.append("; ".join(f'{g["fn"]}("{g["literal"]}")' for g in gs))
+        lines.append("Strcmp gate     : " + "; ".join(_parts))
     lines.append("Harness target  : " + summary["harness_hint"])
     lines.append(f"Slice           : {summary['slice_size']} nodes, "
                  f"{summary['n_sinks']} sink(s)")
