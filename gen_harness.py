@@ -333,6 +333,108 @@ def save_prompt_file(path: Path, messages: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt module system
+# ---------------------------------------------------------------------------
+# Each module is a self-contained instruction block selected by a structural
+# signal from the slicer summary. Modules are generic — no target-specific
+# content. The slicer output is the condition; the module is the instruction.
+
+def build_task_block(fn_name: str, summary: dict) -> str:
+    """Compose the Task requirements block from slicer-detected patterns.
+
+    Modules are selected by structural signals in the summary dict.
+    Each module is independent and testable in isolation.
+    """
+    hint = summary.get("harness_hint", "")
+    strcmp_guards = summary.get("strcmp_guards", [])
+
+    # Classify strcmp_guards into routing vs credential
+    from collections import defaultdict
+    by_param: dict = defaultdict(list)
+    for sg in strcmp_guards:
+        idx = sg.get("fuzz_fn_arg_idx")
+        if idx is not None:
+            by_param[idx].append(sg)
+    routing_params = {idx for idx, gs in by_param.items() if len(gs) >= 2}
+
+    modules = []
+
+    # --- M-01: Base requirements (always present) ---
+    modules.append(
+        f"- Use the exact function signature from the IR / API reference above\n"
+        f"- Read the target function source carefully — understand what state must be "
+        f"initialized before calling it and what the function does with its arguments\n"
+        f"- Check the API reference for required initialization and teardown functions "
+        f"and call them"
+    )
+
+    # --- M-02: Input passing — mutually exclusive modules ---
+    if "split-input" in hint:
+        # P-03: (ptr, len) split-input pattern
+        modules.append(
+            "- Follow the split-input hint in the Static analysis block exactly — "
+            "derive the source buffer and the length from different regions of Data "
+            "so they can diverge; do not call the function with matching (Data, Size)"
+        )
+    elif routing_params:
+        # P-02: stateful command router — multi-call sequence required
+        # Structural signal: same argument routes to N different handlers.
+        # Each handler may depend on state established by a prior call.
+        # Generic instruction: make multiple calls in sequence to exercise all paths.
+        modules.append(
+            f"- The function is a command router: the same argument selects different "
+            f"handlers on each call. Make multiple calls in sequence (2–4 calls) — "
+            f"earlier calls establish state that later calls depend on. "
+            f"Randomize the routed argument across all detected literals on each call "
+            f"so every handler branch is reachable"
+        )
+    else:
+        modules.append(
+            f"- Pass `Data` and `Size` into `{fn_name}` — "
+            f"do not add artificial caps on Size"
+        )
+
+    # --- M-03: String null-termination (always) ---
+    modules.append(
+        "- If `Data` is used as a string (passed to a function expecting `const char *`), "
+        "null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set "
+        "the last byte to `\\0`"
+    )
+
+    # --- M-04: State setup and teardown (always) ---
+    modules.append("- Initialize any required state before the call; clean it up after")
+
+    # --- M-05: Double-free / UAF — stateful precondition ---
+    if summary.get("double_free") or summary.get("use_after_free"):
+        bug = "double-free" if summary.get("double_free") else "use-after-free"
+        modules.append(
+            f"- A {bug} is detected in the slice. This class of bug requires a resource "
+            f"to exist before the vulnerable call — identify which call creates the "
+            f"resource and make that call first to establish the precondition"
+        )
+
+    # --- M-06: Streaming / incremental call pattern ---
+    if "streaming" in hint or "call in a loop" in hint:
+        modules.append(
+            "- This function uses a streaming call model: call it in a loop until "
+            "the return value indicates completion or error; refill any output buffer "
+            "each iteration"
+        )
+
+    # --- M-07: Return 0 (always last) ---
+    modules.append("- Return 0")
+
+    requirements = "\n".join(modules)
+    return (
+        f"## Task\n"
+        f"Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` "
+        f"targeting `{fn_name}`.\n\n"
+        f"Requirements:\n{requirements}\n\n"
+        f"Output C code only, no explanation."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Source extraction helper (shared by 1:1 and interprocedural paths)
 # ---------------------------------------------------------------------------
 
@@ -396,6 +498,23 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
     print(f"\n── Caller context ({caller_fn}) ──")
     print(caller_ctx)
 
+    caller_summary = get_context_json(caller_ll, caller_fn)
+    # Interprocedural: always include the double-free/UAF module from the callee
+    # so the model knows to establish the precondition via the caller path.
+    merged_summary = {**caller_summary,
+                      "double_free":   caller_summary.get("double_free")
+                                       or get_context_json(vuln_ll, vuln_fn).get("double_free"),
+                      "use_after_free": caller_summary.get("use_after_free")
+                                        or get_context_json(vuln_ll, vuln_fn).get("use_after_free")}
+    task_block = build_task_block(caller_fn, merged_summary)
+    # Prepend the interprocedural-specific constraint
+    interp_note = (
+        f"- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly\n"
+        f"- Read both function sources carefully: understand the path through "
+        f"`{caller_fn}` that reaches `{vuln_fn}` and set up any required preconditions"
+    )
+    task_block = task_block.replace("Requirements:\n", f"Requirements:\n{interp_note}\n")
+
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
 The vulnerability is in `{vuln_fn}` but it is an internal function not \
@@ -411,22 +530,7 @@ the public API function that calls `{vuln_fn}`.
 {caller_sig_block}
 {caller_src}
 {header_block}
-## Task
-Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` \
-targeting `{caller_fn}`.
-
-Requirements:
-- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly
-- Read both function sources carefully: understand the path through `{caller_fn}` \
-that reaches `{vuln_fn}` and set up any required preconditions (state, prior calls, \
-argument values) to exercise that path
-- Check the API reference for required initialization and teardown functions and call them
-- Pass fuzz-controlled data into `{caller_fn}` — do not add artificial caps on Size
-- If data is used as a string, null-terminate it first
-- Initialize any required state before the call; clean it up after
-- Return 0
-
-Output C code only, no explanation."""
+{task_block}"""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -529,21 +633,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
 
-    # Suppress the generic "pass Data and Size" instruction when the slicer
-    # emitted a split-input hint — the two instructions contradict each other
-    # and the model tends to follow the Task bullet over the Harness target hint.
-    summary_json  = get_context_json(ll_path, fn_name)
-    has_split_input = "split-input" in summary_json.get("harness_hint", "")
-    if has_split_input:
-        data_size_rule = (
-            "- Follow the split-input hint in the Static analysis block exactly — "
-            "derive the source buffer and the length from different regions of Data "
-            "so they can diverge; do not call the function with matching (Data, Size)"
-        )
-    else:
-        data_size_rule = (
-            f"- Pass `Data` and `Size` into `{fn_name}` — do not add artificial caps on Size"
-        )
+    summary_json = get_context_json(ll_path, fn_name)
+    task_block   = build_task_block(fn_name, summary_json)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
@@ -552,20 +643,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 {sig_block}
 {src_block}
 {header_block}
-## Task
-Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` targeting `{fn_name}`.
-
-Requirements:
-- Use the exact function signature from the IR / API reference above
-- Read the target function source carefully — understand what state must be \
-initialized before calling it and what the function does with its arguments
-- Check the API reference for required initialization and teardown functions and call them
-{data_size_rule}
-- If `Data` is used as a string (passed to a function expecting `const char *`), null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set the last byte to `\\0`
-- Initialize any required state before the call; clean it up after
-- Return 0
-
-Output C code only, no explanation."""
+{task_block}"""
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
