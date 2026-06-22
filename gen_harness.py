@@ -451,15 +451,20 @@ def build_task_block(fn_name: str, summary: dict) -> str:
     sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
     if sink_fns & _OUTPUT_WRITE_SINKS:
         modules.append(
-            "- The function writes into a caller-supplied output buffer. "
-            "Size that buffer from a compile-time constant — use `Size + 64` or "
-            "a fixed cap like `deflateBound(...)` / `4 * Size + 64` for "
-            "compress/deflate — never from fuzz bytes directly. "
-            "Do NOT write `malloc(Size)` for the output buffer: the compressed "
-            "or transformed output can be larger than the raw input. "
-            "Do NOT read any size or length value from `Data` and use it "
-            "unmodified as `avail_out`, `malloc` argument, or buffer dimension — "
-            "the fuzzer will produce values that overflow the allocation."
+            "- The function writes into a caller-supplied output buffer.\n"
+            "  Size the output buffer from a compile-time expression, NEVER from\n"
+            "  fuzz bytes. Use this pattern exactly:\n"
+            "  ```c\n"
+            "  size_t out_cap = Size * 4 + 64;  /* output can exceed input */\n"
+            "  uint8_t *out_buf = malloc(out_cap);\n"
+            "  if (!out_buf) return 0;\n"
+            "  /* if using a z_stream / stream struct: */\n"
+            "  strm.next_out  = out_buf;\n"
+            "  strm.avail_out = out_cap;  /* the cap, never (uint32_t)Size or Data-derived */\n"
+            "  ```\n"
+            "  `malloc(Size)` is wrong — compressed/transformed output can be larger\n"
+            "  than the input. Reading any length from `Data` as `avail_out` or a\n"
+            "  malloc size is wrong — the fuzzer will produce overflow values."
         )
 
     # --- M-07: Return 0 (always last) ---
