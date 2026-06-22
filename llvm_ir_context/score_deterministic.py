@@ -464,8 +464,8 @@ def main() -> None:
     # Weight: 0.60 — caller inherits danger but is one step removed; guards and
     # routing logic in the caller's own body are not reflected by the callee score.
     # Only propagate from callees scoring >= 0.75 (real vulnerability signal).
-    _PROPAGATION_WEIGHT = 0.60
-    _PROPAGATION_THRESHOLD = 0.75
+    _PROPAGATION_WEIGHT    = 0.75   # caller inherits 75% of callee's danger score
+    _PROPAGATION_THRESHOLD = 0.50   # propagate from any callee with a real vulnerability signal
     propagated_into: dict[str, list[tuple[str, float]]] = {}  # caller → [(callee, boost)]
     for fn_name, summary in summaries.items():
         callee_score = rule_scores.get(fn_name, 0.0)
@@ -475,11 +475,14 @@ def main() -> None:
             if caller not in rule_scores:
                 continue
             boost = callee_score * _PROPAGATION_WEIGHT
-            if boost > rule_scores[caller]:
-                rule_scores[caller] = boost
-                propagated_into.setdefault(caller, []).append((fn_name, boost))
+            propagated_into.setdefault(caller, []).append((fn_name, boost))
     for caller, sources in propagated_into.items():
-        src_str = "+".join(f"{fn}×{_PROPAGATION_WEIGHT}" for fn, _ in sources)
+        best_boost = max(b for _, b in sources)
+        if best_boost > rule_scores[caller]:
+            rule_scores[caller] = best_boost
+        # Show all contributing callees in the details column regardless
+        src_str = "+".join(f"{fn}({b:.0%})" for fn, b in
+                           sorted(sources, key=lambda x: -x[1]))
         details[caller] = details.get(caller, "") + f"  [+prop:{src_str}]"
 
     # --- --no-gep-only filter ---
