@@ -293,7 +293,8 @@ def extract_c(text: str) -> str:
 
 def compile_to_ir(src: Path, include_dirs: list[str] | None = None) -> tuple[Path | None, str]:
     out = src.with_suffix(".ll")
-    cmd = ["clang-20", "-O0", "-g", "-fno-inline", "-S", "-emit-llvm", "-w"]
+    cmd = ["clang-20", "-O0", "-Xclang", "-disable-O0-optnone",
+           "-g", "-fno-inline", "-S", "-emit-llvm", "-w"]
     for d in (include_dirs or []):
         cmd += ["-I", d]
     cmd += [str(src), "-o", str(out)]

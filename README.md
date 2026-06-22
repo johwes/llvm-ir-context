@@ -22,7 +22,7 @@ Requires `clang-20` on `$PATH` for IR compilation. `llvmlite` must match your LL
 
 ```bash
 # Compile your target to unoptimised IR
-clang-20 -O0 -fno-inline -S -emit-llvm -I include -w src/parse.c -o /tmp/parse.ll
+clang-20 -O0 -Xclang -disable-O0-optnone -fno-inline -S -emit-llvm -I include -w src/parse.c -o /tmp/parse.ll
 
 # Rank all functions by vulnerability risk
 ir-score --ir-dir /tmp/

@@ -319,7 +319,8 @@ def _setup_scarnet_ir(keep_ir: Path | None) -> tuple[Path, Path | None]:
         base   = rel.replace("/", "_").removesuffix(".c")
         out_ll = ir_out / f"{base}.ll"
         result = subprocess.run(
-            ["clang-20", "-O0", "-fno-inline", "-S", "-emit-llvm",
+            ["clang-20", "-O0", "-Xclang", "-disable-O0-optnone",
+             "-fno-inline", "-S", "-emit-llvm",
              "-I", str(clone_dir / "include"),
              "-w", str(cf), "-o", str(out_ll)],
             capture_output=True)

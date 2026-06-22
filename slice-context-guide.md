@@ -29,7 +29,7 @@ Three files do all the work:
 
 ```bash
 # Compile your target to LLVM IR
-clang-20 -O0 -fno-inline -S -emit-llvm -w src/foo.c -o /tmp/foo.ll
+clang-20 -O0 -Xclang -disable-O0-optnone -fno-inline -S -emit-llvm -w src/foo.c -o /tmp/foo.ll
 
 # Score all functions in an IR directory (no answer key needed)
 python score_deterministic.py --ir-dir /tmp/ --no-gep-only
@@ -47,12 +47,12 @@ that lose the original sink→source relationships.
 
 ```bash
 # Single file
-clang-20 -O0 -fno-inline -S -emit-llvm -w src/parse.c -o /tmp/parse.ll
+clang-20 -O0 -Xclang -disable-O0-optnone -fno-inline -S -emit-llvm -w src/parse.c -o /tmp/parse.ll
 
 # Multiple files — compile each separately, pass -I for headers
 mkdir -p /tmp/ir
 for f in src/*.c; do
-    clang-20 -O0 -fno-inline -S -emit-llvm -I include -w "$f" \
+    clang-20 -O0 -Xclang -disable-O0-optnone -fno-inline -S -emit-llvm -I include -w "$f" \
         -o "/tmp/ir/$(basename ${f%.c}).ll"
 done
 
