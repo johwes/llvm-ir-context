@@ -245,9 +245,8 @@ goal is pipeline validation.
 | M-02 routing gate module: multi-call sequence, `Data[i]` verb selection per call | `gen_harness.py` |
 | M-05 double-free precondition module: two-phase SETUP+TRIGGER harness structure | `gen_harness.py` |
 | Callee flag propagation (`_enrich_with_callee_flags`): double_free/UAF from direct callees merged into prompt summary | `gen_harness.py` |
-| IR text fallback for double-free detection: `_ir_has_double_free` counts `call @free` ≥ 2 | `gen_harness.py` |
 | `--function` with `--ir-dir`: bypass ranking, generate exactly the named function | `gen_harness.py` |
 | `--function` / `--ir-dir` bug fix: `_find_ll_for_function` regex uses `@fn\s*(` not `\b@fn\b` | `gen_harness.py` |
 | `dispatch` → `handle_del` double-free confirmed via pipeline: IR scoring → M-02+M-05 prompt → SET→DEL harness → ASAN crash | validated |
 | `_generate_interprocedural` updated to use `build_task_block` (consistent with `generate_one`) | `gen_harness.py` |
-| mem2reg pass: `apply_mem2reg()` wraps every `parse_assembly` call — fixes typestate analysis, removes -O0 alloca workarounds | `preprocess_slice_pdg.py`, `score_deterministic.py`, `slice_context.py` |
+| sroa+mem2reg pass: `apply_mem2reg()` strips `optnone`, runs `sroa,mem2reg` — fully promotes -O0 array/scalar allocas; typestate `double_free` detection now works correctly; `_ir_has_double_free` text fallback removed | `preprocess_slice_pdg.py`, `gen_harness.py` |
