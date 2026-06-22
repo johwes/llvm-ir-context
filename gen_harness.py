@@ -455,7 +455,14 @@ def build_task_block(fn_name: str, summary: dict) -> str:
     )
 
     # --- M-04: State setup and teardown (always) ---
-    modules.append("- Initialize any required state before the call; clean it up after")
+    modules.append(
+        "- Initialize any required state before the call; clean it up after. "
+        "Teardown (e.g. `deflateEnd`, `inflateEnd`, `free`) MUST be called on "
+        "every exit path including early returns — use `goto cleanup` or ensure "
+        "every `return 0` is preceded by the teardown calls. "
+        "Do NOT use `deflateReset` as a substitute for `deflateEnd` — reset "
+        "keeps internal state alive and leaks memory."
+    )
 
     # --- M-05: Double-free / UAF — stateful precondition ---
     if summary.get("double_free") or summary.get("use_after_free"):
