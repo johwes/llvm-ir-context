@@ -50,6 +50,20 @@ import llvmlite.binding as llvm
 HERE = Path(__file__).parent
 
 
+_OPTNONE_RE = re.compile(r'\boptnone\b\s*')
+
+
+def _strip_optnone(ir_text: str) -> str:
+    """Remove optnone attribute from IR so mem2reg can promote allocas.
+
+    clang -O0 sets the optnone function attribute, which causes opt to skip
+    all optimization passes including mem2reg. Stripping it before running
+    mem2reg is safe here — we only want SSA promotion for analysis, not
+    full optimization.
+    """
+    return _OPTNONE_RE.sub('', ir_text)
+
+
 def apply_mem2reg(ir_text: str) -> str:
     """Run mem2reg on IR text and return the promoted IR text.
 
@@ -59,13 +73,15 @@ def apply_mem2reg(ir_text: str) -> str:
 
     Falls back to the original text if opt-20/opt is not available or fails.
     """
+    # Strip optnone so opt does not skip -O0-compiled functions.
+    prepped = _strip_optnone(ir_text)
     for opt in ("opt-20", "opt"):
         if not shutil.which(opt):
             continue
         try:
             r = subprocess.run(
                 [opt, "-passes=mem2reg", "-S", "-o", "-", "-"],
-                input=ir_text, capture_output=True, text=True, timeout=30,
+                input=prepped, capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout
