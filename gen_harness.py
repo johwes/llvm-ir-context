@@ -281,7 +281,8 @@ def ask_qwen(messages: list[dict]) -> str:
         json={"model": MODEL, "messages": messages},
         timeout=120,
     )
-    r.raise_for_status()
+    if not r.ok:
+        sys.exit(f"API error {r.status_code}: {r.text[:500]}")
     return r.json()["choices"][0]["message"]["content"]
 
 
