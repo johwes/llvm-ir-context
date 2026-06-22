@@ -73,6 +73,9 @@ parameters.
 def get_context(ll_path: str, fn_name: str) -> str:
     r = subprocess.run(["ir-context", ll_path, "--function", fn_name],
                        capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        err = r.stderr.strip() or "(no output)"
+        print(f"WARNING: ir-context returned no context (rc={r.returncode}):\n  {err}")
     return r.stdout.strip()
 
 

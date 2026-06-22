@@ -633,8 +633,9 @@ def format_for_llm(summary: dict, score: float | None = None,
         lines.append(f"Caller guard    : icmp found in caller(s): {caller_str}  — may be validated upstream")
     strcmp_guards = summary.get("strcmp_guards", [])
     if strcmp_guards:
+        _target = summary.get("fn_name", "target")
         gate_strs = "; ".join(
-            (f'{g["fn"]}("{g["literal"]}") → fuzz param {g["fuzz_fn_arg_idx"]} of {fn_name}'
+            (f'{g["fn"]}("{g["literal"]}") → fuzz param {g["fuzz_fn_arg_idx"]} of {_target}'
              if g.get("fuzz_fn_arg_idx") is not None
              else f'{g["fn"]}("{g["literal"]}")')
             for g in strcmp_guards
