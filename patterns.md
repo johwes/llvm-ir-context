@@ -233,6 +233,82 @@ Documented here as a known blind spot.
 
 ---
 
+## P-07 · Stateful / multi-step bug
+
+**What it is:** The vulnerability requires a specific sequence of calls to
+reach. A single-call harness can never trigger it because the precondition
+must be established by a prior call.
+
+**Concrete example (scarnet):**
+- `handle_del` double-free: `log_key` freed on match inside the loop, then
+  freed again unconditionally. Requires: SET a key → DEL the same key.
+- A single-call harness with an empty store never finds a match — the loop
+  body never runs — so the double-free is unreachable.
+- Masked by shallower bug: `handle_stats` divide-by-zero crashes on input
+  `\012` (STATS verb, nstore=0) before the fuzzer explores DEL at all.
+
+**IR shape (detection signals):**
+- Double-free or use-after-free detected in the slice (`double_free=True`)
+- The freed pointer originates from a prior allocation that must be seeded
+  via a different code path (different verb, different call)
+- Coverage stays flat because the precondition branch is never taken
+
+**The masking problem:**
+When a shallow bug (few instructions from entry, small input space) coexists
+with a deeper stateful bug, libFuzzer always finds the shallow one first and
+stops. The stateful bug is effectively invisible without a targeted harness.
+
+**Correct harness:**
+- Multi-step: call a setup function first to establish precondition state
+- Then fuzz the triggering call with state already in place
+- Harness must understand the state model — which call creates the resource
+  that the vulnerable call then mishandles
+
+**What the pipeline must do:**
+The slicer already detects the double-free (`double_free=True` in the slice
+summary). What's missing is translating that into a multi-step harness hint.
+
+**Hint (not yet implemented):**
+```
+double-free detected: this bug requires a prior call to establish the
+resource that is freed twice. Identify which call creates the freed pointer
+and call it first to seed the state before fuzzing the vulnerable path.
+```
+
+**Prompt shape needed:**
+```
+## Static analysis — vulnerable function: handle_del
+<IR slice context showing double_free=True>
+<handle_del C source — shows log_key freed twice>
+
+## Caller / harness entry point: dispatch
+<dispatch C source — shows SET populates store, DEL reads it>
+
+## Task
+The double-free in handle_del requires a key to exist in the store before
+DEL is called. Call dispatch with SET first (hardcoded key), then call
+dispatch with DEL on the same key to trigger the double-free.
+```
+
+**Status:** NOT implemented as an automatic hint. Manually confirmed:
+- `handle_del` double-free: ASAN crash on 2nd input with SET→DEL harness
+- Crash input: `\254\012` (2 bytes)
+- The pipeline detected `double_free=True` in the slice but did not generate
+  the multi-step harness automatically
+
+**Implementation path:**
+1. In `slice_context.py`: when `double_free=True`, emit a hint naming the
+   setup step — requires identifying which public function creates the resource
+   (cross-function analysis, harder than 1-hop)
+2. In `gen_harness.py`: when the hint says "double-free requires prior call",
+   include both the setup function source and the target function source, and
+   instruct the model to call setup first
+3. Short-term workaround: the P-05 two-section prompt already gives the model
+   `dispatch` source — a smarter model might infer the SET→DEL sequence if
+   the hint says "double-free detected, establish precondition first"
+
+---
+
 ## Evaluation rubric
 
 Given a generated harness, mark it:

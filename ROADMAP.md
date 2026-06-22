@@ -144,6 +144,7 @@ goal is pipeline validation.
 | **P-05** Interprocedural prompt (callee vulnerability + caller entry point) | `gen_harness.py` |
 | `scar_log` format string crash confirmed (`%+`, `%0`) | validated |
 | `handle_stats` divide-by-zero confirmed (SIGFPE on first input, `\012`) | validated |
+| `handle_del` double-free confirmed (ASAN, 2nd input, `\254\012`, SET→DEL harness) | validated |
 | `session_login` coverage: strcmp gate opened (cov 9→10); bug is latent (null-terminator only surfaces via caller) | validated |
 | `patterns.md` — harness pattern taxonomy and evaluation rubric | documented |
 | `design.md` — design goals, boundary rules, generic-first principle | documented |
