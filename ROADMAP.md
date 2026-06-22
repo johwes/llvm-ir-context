@@ -9,54 +9,40 @@ documented in `ideas.md`.
 
 ## P0 — Must fix (confirmed harness failures)
 
-### 1. strcmp gate → coverage flatness
-**Observed:** `session_login` fuzzer ran 10,000 iterations at `cov: 9 ft: 10` —
-flat from start to finish. A `strcmp(pass, "scarnet123")` early-exit prevents
-the fuzzer from reaching the `memcpy` null-terminator bug.
-
-**Fix (two parts, implement together):**
-
-a. **Strcmp hint in `slice_context.py`** — when the slicer detects an `icmp`
-fed by `call @strcmp`/`@strncmp`/`@memcmp` against a known `@.str` global,
-emit a harness hint: "argument `X` is gated by a strcmp against the literal
-`"scarnet123"` — hardcode that value and fuzz only the other arguments."
-Same mechanism as the existing `trunc` hint.
-
-b. **String literal dict extraction** — walk `@.str*` globals referenced in
-the function body, decode the byte array, write a `<fn_name>.dict` file.
-Pass to libFuzzer via `-dict=`. Low effort, complementary to (a).
-
-Detection: in the backward slice, look for `icmp` node whose operand is a
-`call @strcmp` where one argument is a `getelementptr` into a `@.str` global.
-
-**File:** `llvm_ir_context/slice_context.py` (hint), `llvm_ir_context/score_deterministic.py` or new `dict_extract.py` (dict)
-
----
-
-### 2. Split-input pattern for (ptr, len) functions
-**Observed:** `scar_alloc_copy` fuzzer ran 10,000 iterations at `cov: 5 ft: 6`
-— flat. The harness called `scar_alloc_copy(Data, Size)` — libFuzzer
-guarantees `Data` is exactly `Size` bytes so `memcpy(buf, s, len)` never
-reads out of bounds. The vulnerability is caller-side API misuse: `len`
-larger than `s`'s actual allocation.
-
-**Fix:** Detect the (ptr, len) pattern and emit a split-input hint.
-
-Conditions: function takes a buffer pointer + length; dangerous sink uses the
-length parameter; length comes from `function_argument`; no guard compares
-length against the allocation.
-
-Hint text: "split input — derive `len` from one region and `s` from another
-so they can diverge; use a small fixed-size source buffer (e.g., 64 bytes)
-and let `len` be fuzzed freely."
-
-**File:** `llvm_ir_context/slice_context.py`
+*All P0 items resolved. See Completed table.*
 
 ---
 
 ## P1 — High value, clear implementation path
 
-### 3. Harness IR validation (blank-shooter check)
+### 1. Routing gate (P-02) — dispatch not fuzzed ← ACTIVE
+**Observed:** `dispatch` never appears in `--top-k` output because it has a
+low local score (routing logic only, no dangerous sinks in its own body). The
+dangerous sinks are in its callees (`handle_del` double-free, `handle_stats`
+div-by-zero). The routing gate hint exists for the credential gate (single
+strcmp) but not for the multi-literal dispatcher case.
+
+**What's missing:** When the slicer detects N ≥ 2 strcmp calls on the same
+`fuzz_fn_arg_idx`, it currently emits a credential gate hint (wrong — hardcodes
+one literal). It should instead emit a routing gate hint that names all literals
+and instructs the harness to randomize among them.
+
+**Detection (already in preprocess_slice_pdg.py):** `strcmp_guards` list with
+≥ 2 entries sharing the same `fuzz_fn_arg_idx` → routing gate.
+
+**Hint to emit:**
+```
+command router — verb must be one of: "AUTH", "SET", "GET", "DEL", "STATS",
+"FRAG"; randomize verb from this set on each call
+```
+
+**File:** `llvm_ir_context/slice_context.py` (hint emission logic)
+
+See `patterns.md § P-02` for full spec.
+
+---
+
+### 2. Harness IR validation (blank-shooter check)
 Compile harness + target to combined IR via `llvm-link`, run slicer with
 `fn_name="LLVMFuzzerTestOneInput"`. Check `"function_argument" in
 summary["input_channels"]` — if false, `Data`/`Size` never reach the sink.
@@ -90,30 +76,7 @@ See `ideas.md § Interprocedural guard propagation` for caveats.
 
 ---
 
-### 5. 64-bit integer overflow false positive (parse_batch)
-**Observed:** `parse_batch` harness correctly applied split-input (count diverged from
-buffer size), no struct redefinition, no caps. Harness stayed flat: leak only, no crash.
-
-**Root cause:** Slicer false positive on 64-bit targets. `count * sizeof(kv_entry_t)`
-where `count` is `uint32_t` and `sizeof` returns 64-bit `size_t` — the multiply is
-64-bit, so no wraparound. `UINT32_MAX × 324 ≈ 87 GB`; malloc returns NULL and the
-null check exits cleanly. The bug is only reachable on 32-bit platforms where
-`size_t` is 32-bit and the multiply wraps.
-
-**Also fixed (resolved):** Model struct redefinition — adding `#include` rule to system
-prompt fixed the redefinition. The harness now correctly uses `#include "scarnet.h"`.
-
-**Fix for the false positive:** In `score_deterministic.py`, when the multiplication
-operands are `(u)int32_t × sizeof()` on a 64-bit IR target, the result is a 64-bit
-multiply with no overflow path. Detect this: if the `mul` operand is zero-extended from
-i32 before the multiply (a `zext i32 to i64` node in the slice), and the other operand
-is a constant (`sizeof`), the overflow is not reachable on this target — reduce score.
-
-**File:** `llvm_ir_context/score_deterministic.py`, `llvm_ir_context/preprocess_slice_pdg.py`
-
----
-
-### 6. Structured-input / streaming pattern (P-08) — zlib inflate validated
+### 5. Structured-input / streaming pattern (P-08) — zlib inflate validated
 
 **Observed (zlib validation run):** `inflate` harness compiled clean, called
 `inflateInit` correctly without any hint (model read the header — generality
@@ -210,3 +173,7 @@ goal is pipeline validation.
 | State clamp rule: fuzz-seeded counts must be clamped to valid range | `gen_harness.py` system prompt |
 | fuzz→repair→fuzz loop validated end-to-end: handle_stats div-by-zero found, SCAR patched, re-fuzz confirmed fix, handle_del double-free unmasked | validated |
 | Clean-slate validation: fresh IR + fresh harnesses, 4/7 crashes found (parse_cmd heap-OOB, scar_alloc_copy alloc-too-big, scar_log format-string, session_frag heap-OOB), zero manual harness fixup | validated |
+| **P1.5** zext64 false positive: `zext i32→i64` before mul → overflow unreachable on 64-bit; ×0.60 score discount + `+zext64` flag | `score_deterministic.py`, `slice_context.py` |
+| System prompt: `#include` header rule (no struct redefinition) | `gen_harness.py` |
+| System prompt: `free()` pointer return values rule | `gen_harness.py` |
+| `--save-prompt` flag: writes full LLM prompt to `harness_<fn>_prompt.md` | `gen_harness.py` |
