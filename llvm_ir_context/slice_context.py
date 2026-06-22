@@ -460,23 +460,24 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     if strcmp_guards:
         parts = []
         for sg in strcmp_guards:
-            const_idx = sg.get("const_arg_idx")
-            if const_idx is not None:
-                # The other argument (0-based, excluding the constant) is fuzzable.
-                # Use ordinal label (argument 0 / argument 1) for clarity.
-                fuzz_idx = 1 - const_idx  # works for 2-arg strcmp; generalises below
+            fuzz_fn_idx = sg.get("fuzz_fn_arg_idx")
+            if fuzz_fn_idx is not None:
+                # Name the target function's parameter directly.
                 parts.append(
-                    f'`{sg["fn"]}` against "{sg["literal"]}" '
-                    f'(argument {const_idx} is the constant — '
-                    f'hardcode it; fuzz argument {fuzz_idx})'
+                    f'`{sg["fn"]}` against "{sg["literal"]}" — '
+                    f'hardcode "{sg["literal"]}" as the constant string argument; '
+                    f'pass `Data` (as a null-terminated copy) into parameter {fuzz_fn_idx} '
+                    f'of `{fn_name}` (the non-constant argument)'
                 )
             else:
-                parts.append(f'`{sg["fn"]}` against "{sg["literal"]}"')
-        gate_strs = ", ".join(parts)
+                parts.append(
+                    f'`{sg["fn"]}` against "{sg["literal"]}" — '
+                    f'hardcode the constant and fuzz the other argument'
+                )
+        gate_strs = " | ".join(parts)
         hint_parts.append(
-            f"strcmp gate detected: {gate_strs} — this check will prevent the fuzzer "
-            f"from reaching the dangerous sink; hardcode the constant value in the harness "
-            f"and fuzz only the other argument(s)"
+            f"strcmp gate: {gate_strs} — without this, the fuzzer cannot reach "
+            f"the dangerous sink past the credential check"
         )
 
     # Split-input pattern: when both buffer pointer and length are independent
@@ -633,8 +634,8 @@ def format_for_llm(summary: dict, score: float | None = None,
     strcmp_guards = summary.get("strcmp_guards", [])
     if strcmp_guards:
         gate_strs = "; ".join(
-            (f'{g["fn"]}("{g["literal"]}", arg{g["const_arg_idx"]}=const)'
-             if g.get("const_arg_idx") is not None
+            (f'{g["fn"]}("{g["literal"]}") → fuzz param {g["fuzz_fn_arg_idx"]} of {fn_name}'
+             if g.get("fuzz_fn_arg_idx") is not None
              else f'{g["fn"]}("{g["literal"]}")')
             for g in strcmp_guards
         )

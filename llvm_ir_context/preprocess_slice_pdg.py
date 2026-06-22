@@ -188,6 +188,62 @@ def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
     guards: list[dict] = []
     seen_lits: set[str] = set()
 
+    # Build argument identity map: ptr_id → 0-based argument index in target_fn.
+    arg_ptr_ids: dict[int, int] = {}
+    for idx, arg in enumerate(target_fn.arguments):
+        arg_ptr_ids[_ptr_id(arg)] = idx
+
+    # At -O0, clang stores each argument into a local alloca immediately on entry.
+    # Track alloca ptr_id → function argument index so we can trace strcmp operands
+    # through the load/store chain back to the originating function argument.
+    alloca_to_arg: dict[int, int] = {}
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode != "store":
+                continue
+            ops = list(instr.operands)
+            if len(ops) < 2:
+                continue
+            val_op, ptr_op = ops[0], ops[1]
+            if ptr_op.value_kind != VK_INSTRUCTION:
+                continue
+            if val_op.value_kind == VK_ARGUMENT:
+                aidx = arg_ptr_ids.get(_ptr_id(val_op))
+                if aidx is not None:
+                    alloca_to_arg[_ptr_id(ptr_op)] = aidx
+
+    # Build ptr_id → Instruction map for this function so we can follow
+    # load → alloca chains without relying on Value.operands (which llvmlite
+    # only supports on Instruction objects, not on generic Value operands).
+    instr_by_pid: dict[int, object] = {}
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            instr_by_pid[_ptr_id(instr)] = instr
+
+    def _trace_to_fn_arg(op) -> "int | None":
+        """Return the 0-based function argument index that op ultimately loads from.
+
+        Handles:
+          - direct argument reference (VK_ARGUMENT)
+          - load from an alloca that stored a function argument (-O0 pattern)
+        """
+        if op.value_kind == VK_ARGUMENT:
+            return arg_ptr_ids.get(_ptr_id(op))
+        if op.value_kind == VK_INSTRUCTION:
+            # Look up the instruction object by ptr_id so we can read its operands.
+            load_instr = instr_by_pid.get(_ptr_id(op))
+            if load_instr is None or load_instr.opcode != "load":
+                return None
+            try:
+                load_ops = list(load_instr.operands)
+            except Exception:
+                return None
+            if not load_ops:
+                return None
+            alloca_op = load_ops[0]  # pointer operand of the load
+            return alloca_to_arg.get(_ptr_id(alloca_op))
+        return None
+
     for block in target_fn.blocks:
         for instr in block.instructions:
             if instr.opcode != "call":
@@ -211,39 +267,59 @@ def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
             if callee_name not in _STRCMP_FNS:
                 continue
 
-            # Check each operand for a direct or GEP-based reference to a @.str global.
-            # Track the 0-based argument index (excluding callee operand) so the hint
-            # can tell the LLM exactly which parameter to hardcode.
-            arg_idx = 0
+            # Find the literal operand and the non-literal operand.
+            # The non-literal operand is traced back to the target function's
+            # argument index — that is the parameter the harness should fuzz.
+            # const_arg_idx is the strcmp-call argument index (for display);
+            # fuzz_fn_arg_idx is the function-level parameter index to fuzz.
+            str_arg_call_idx:  "int | None" = None
+            lit_found:         "str | None" = None
+            non_const_op  = None
+
+            call_arg_idx = 0
             for op in ops:
                 if op.value_kind == VK_FUNCTION:
-                    continue  # callee — not an argument
+                    continue  # callee
                 if op.value_kind == VK_GLOBAL_VAR:
                     gname = op.name.lstrip("@")
                     if gname in str_globals:
-                        lit = str_globals[gname]
-                        if lit not in seen_lits:
-                            seen_lits.add(lit)
-                            guards.append({"fn": callee_name, "literal": lit,
-                                           "const_arg_idx": arg_idx})
-                        break
+                        str_arg_call_idx = call_arg_idx
+                        lit_found        = str_globals[gname]
+                    else:
+                        non_const_op = op
                 elif op.value_kind == VK_INSTRUCTION:
-                    # Typed-pointer IR: GEP into @.str
+                    # Typed-pointer GEP into @.str
                     try:
                         gep_ops = list(op.operands)
                     except Exception:
-                        arg_idx += 1
+                        non_const_op = op
+                        call_arg_idx += 1
                         continue
                     if gep_ops and gep_ops[0].value_kind == VK_GLOBAL_VAR:
                         gname = gep_ops[0].name.lstrip("@")
                         if gname in str_globals:
-                            lit = str_globals[gname]
-                            if lit not in seen_lits:
-                                seen_lits.add(lit)
-                                guards.append({"fn": callee_name, "literal": lit,
-                                               "const_arg_idx": arg_idx})
-                            break
-                arg_idx += 1
+                            str_arg_call_idx = call_arg_idx
+                            lit_found        = str_globals[gname]
+                        else:
+                            non_const_op = op
+                    else:
+                        non_const_op = op
+                else:
+                    non_const_op = op
+                call_arg_idx += 1
+
+            if lit_found is not None and lit_found not in seen_lits:
+                seen_lits.add(lit_found)
+                fuzz_fn_arg_idx = (
+                    _trace_to_fn_arg(non_const_op) if non_const_op is not None
+                    else None
+                )
+                guards.append({
+                    "fn":               callee_name,
+                    "literal":          lit_found,
+                    "const_arg_idx":    str_arg_call_idx,   # strcmp arg position
+                    "fuzz_fn_arg_idx":  fuzz_fn_arg_idx,    # function param to fuzz
+                })
 
     return guards
 
