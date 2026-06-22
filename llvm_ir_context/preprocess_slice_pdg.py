@@ -80,7 +80,7 @@ def apply_mem2reg(ir_text: str) -> str:
             continue
         try:
             r = subprocess.run(
-                [opt, "-passes=mem2reg", "-S", "-o", "-", "-"],
+                [opt, "-passes=sroa,mem2reg", "-S", "-o", "-", "-"],
                 input=prepped, capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0 and r.stdout.strip():
