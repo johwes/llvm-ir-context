@@ -5,6 +5,71 @@ cannot do, and where it fits in the SCAR harness generation workflow.
 
 ---
 
+## The translation layer framing
+
+This pipeline is best understood as a **structured translation layer** between
+a static analysis tool and a language model. That framing is worth making
+explicit because it distinguishes the approach from how most existing work is
+structured.
+
+The current research landscape has two broad strategies:
+
+**LLM-only** (TitanFuzz, FuzzGPT): ask the model to read source code, reason
+about data flow, identify dangerous sinks, and write a harness. This works for
+small, well-understood targets but is expensive, unreliable, and model-dependent.
+A 35B sparse model cannot hold the full data flow of a non-trivial function in
+its working context while simultaneously generating correct C.
+
+**SAST → LLM** (OSS-Fuzz-Gen, CodeQL-based approaches): run a static tool,
+pipe its raw output into the prompt. The LLM gets a list of findings but no
+guidance on *how to exercise them*. It still has to reason about fuzzing
+strategy — which input values trigger the condition, how to structure the
+harness to reach the vulnerable path, which arguments to vary and which to fix.
+The raw tool output answers "what is wrong" but not "what to fuzz."
+
+**The translation layer approach** is structurally different: the slicer does
+the hard part (data flow, guard characterisation, sink identification), and the
+context layer translates those structural facts into *actionable harness
+instructions* before the LLM ever sees them. The model only has to do the easy
+part — write code from a precise specification.
+
+Critically, the translation layer is **bidirectional**: it doesn't just
+summarise what the slicer found, it encodes knowledge about LLM failure modes
+and preemptively corrects for them. Observed failure modes that are now handled
+structurally:
+
+- **strcmp gates freeze coverage** — a hardcoded credential check early in a
+  function prevents the fuzzer from reaching the dangerous sink. The slicer
+  detects `strcmp`-against-literal patterns, identifies which argument is the
+  constant and which is fuzzable (tracing through the `-O0` alloca/store/load
+  chain back to the function's parameter list), and emits a concrete instruction:
+  "hardcode `pass=\"scarnet123\"`, fuzz parameter 2."
+
+- **Matching (Data, Size) never triggers an overflow** — libFuzzer guarantees
+  the buffer is exactly `Size` bytes. A harness that calls
+  `scar_alloc_copy(Data, Size)` will never produce a mismatch. The slicer
+  detects the `(ptr, len)` pattern and instructs the LLM to derive source and
+  length from independent regions of the fuzzer input.
+
+- **LLM adds artificial safety caps** — when the slicer reports integer
+  truncation, the LLM's training-time instincts produce `if (Size > 1048576)
+  return 0`. The system prompt and the trunc hint together counter this: the
+  hint says explicitly "do not artificially bound the output buffer."
+
+Each of these is a *structural observation about why the LLM will produce a
+bad harness*, not just a description of the vulnerability. That is the part
+that does not exist in published work. Most papers treat the LLM as a black box
+that either works or doesn't. The translation layer treats the LLM as a system
+with known failure modes that can be engineered around deterministically.
+
+The practical consequence is that model choice becomes less critical. Any model
+capable of following a precise specification benefits from a better
+specification. Swapping Qwen for a different model would not require changing
+the slicer or the context layer — only the system prompt phrasing might need
+adjustment for a different model's instruction-following style.
+
+---
+
 ## The problem it solves
 
 LLM-based harness generation works well when the model knows three things:
@@ -14,7 +79,7 @@ LLM-based harness generation works well when the model knows three things:
 3. What input values are likely to trigger a bug
 
 Without pre-computed structural context, a small model spends most of its
-token budget on step 1 and 2 — reading source, tracing data flow, identifying
+token budget on steps 1 and 2 — reading source, tracing data flow, identifying
 sinks — and has little capacity left for step 3. The output is a generic
 harness that covers the happy path but misses the specific boundary condition
 that matters.
