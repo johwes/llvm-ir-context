@@ -704,6 +704,23 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_ll_for_function(ir_dir: str, fn_name: str) -> str | None:
+    """Return the .ll file path that defines fn_name, or None."""
+    import glob as _glob
+    pattern = re.compile(rf"^define\b.*\b@{re.escape(fn_name)}\b", re.MULTILINE)
+    for ll_path in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
+        try:
+            if pattern.search(Path(ll_path).read_text(errors="replace")):
+                return ll_path
+        except OSError:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -713,7 +730,8 @@ def main():
     src.add_argument("--ll",          metavar="FILE")
     src.add_argument("--ir-dir",      metavar="DIR")
     ap.add_argument("--function",     metavar="FN",
-                    help="Required with --ll")
+                    help="Target function. Required with --ll. "
+                         "With --ir-dir: skip ranking, generate exactly this function.")
     ap.add_argument("--no-gep-only",  action="store_true")
     ap.add_argument("--header",       metavar="FILE")
     ap.add_argument("--top-k",        metavar="N", type=int, default=1,
@@ -749,6 +767,15 @@ def main():
         return
 
     # ir-dir mode
+    if args.function:
+        # --function with --ir-dir: locate the .ll that defines this function, skip ranking
+        ll_path = _find_ll_for_function(args.ir_dir, args.function)
+        if not ll_path:
+            ap.error(f"--function {args.function!r} not found in any .ll file under {args.ir_dir}")
+        generate_one(ll_path, args.function, header, include_dirs, output_dir,
+                     src_dir=src_dir, ir_dir=args.ir_dir, save_prompt=args.save_prompt)
+        return
+
     print(f"── ranking functions in {args.ir_dir} ──────────────")
     targets = pick_public_functions(args.ir_dir, args.no_gep_only, header, args.top_k)
     print(f"   Selected {len(targets)} target(s): {', '.join(fn for _, fn in targets)}")
