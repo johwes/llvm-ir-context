@@ -95,7 +95,65 @@ open for correctness.
 
 ---
 
-### 5. Structured-input / streaming pattern (P-08) — zlib inflate validated
+### 5. mem2reg IR pass before slicing
+
+**Problem:** At -O0, Clang spills all locals to `alloca`/`store`/`load` rather
+than keeping them in SSA registers. This causes two concrete failures:
+
+1. `_detect_double_free` sees two `load`s from the same alloca slot as two
+   distinct canonical pointer IDs — both `free()` calls appear to free different
+   pointers, so `double_free=False` even when the same allocation is freed twice.
+   Currently papered over by an IR text-level fallback (`_ir_has_double_free`).
+
+2. The graph builder in `preprocess_slice_pdg.py` requires a synthetic
+   store→load bridge in Pass 3 to reconnect data flow across alloca hops — an
+   ad-hoc workaround for the same root cause.
+
+**Fix:** Run `opt-20 -passes=mem2reg` on each `.ll` file immediately after
+`clang-20` produces it, before loading with llvmlite. `mem2reg` promotes alloca
+variables into SSA `%registers` — this is the canonical LLVM approach, not a
+hack. After this pass:
+- `_detect_double_free` will see both `free()` calls on the same SSA value → `double_free=True`
+- The synthetic store→load bridge can be removed from the graph builder
+- `_ir_has_double_free` text fallback can be removed from `gen_harness.py`
+
+**Where to add:** The IR compilation step is in `score_deterministic.py`
+(`pick_public_functions` calls `ir-score` which loads `.ll` files) and
+`gen_harness.py` (`compile_to_ir`). The cleanest insertion point is where
+`.ll` files are first produced — either in the user's build step (documented
+in README) or as a post-processing pass in `score_deterministic.py` before
+loading with llvmlite.
+
+**Effort:** Small — one `subprocess.run(["opt-20", "-passes=mem2reg", ...])` call.
+**Impact:** Removes two workarounds and makes typestate analysis correct.
+
+**File:** `score_deterministic.py` or build documentation
+
+---
+
+### 6. tree-sitter-c for C source extraction
+
+**Problem:** `extract_fn_source` in `gen_harness.py` uses regex + brace
+counting to extract function bodies from `.c` files. This breaks on:
+- Macros that expand to `{` or `}`
+- `#ifdef` blocks that alter brace nesting
+- Inline assembly with curly braces
+- Unconventional formatting (K&R style, single-line bodies)
+
+**Fix:** Replace with `tree-sitter-c` (Python bindings via `tree-sitter` +
+`tree-sitter-c` packages). Parse the file, query for
+`(function_definition)` nodes by name, extract the exact source range.
+100% syntactically correct, handles all valid C.
+
+**Effort:** Medium — add `tree-sitter` dependency, rewrite `extract_fn_source`.
+**Impact:** Production correctness for arbitrary codebases; scarnet/zlib work
+fine with current regex so this is only visible on unusual C code.
+
+**File:** `gen_harness.py` (`extract_fn_source`)
+
+---
+
+### 7. Structured-input / streaming pattern (P-08) — zlib inflate validated
 
 **Observed (zlib validation run):** `inflate` harness compiled clean, called
 `inflateInit` correctly without any hint (model read the header — generality
