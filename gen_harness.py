@@ -286,7 +286,7 @@ def extract_c(text: str) -> str:
 
 def compile_to_ir(src: Path, include_dirs: list[str] | None = None) -> tuple[Path | None, str]:
     out = src.with_suffix(".ll")
-    cmd = ["clang-20", "-O0", "-fno-inline", "-S", "-emit-llvm", "-w"]
+    cmd = ["clang-20", "-O0", "-g", "-fno-inline", "-S", "-emit-llvm", "-w"]
     for d in (include_dirs or []):
         cmd += ["-I", d]
     cmd += [str(src), "-o", str(out)]
@@ -473,7 +473,7 @@ Output C code only, no explanation."""
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address{inc} {out_c} <target_lib> "
+    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> "
           f"-o fuzzer_{vuln_fn}_via_{caller_fn}")
     print(f"  ./fuzzer_{vuln_fn}_via_{caller_fn}")
     return True
@@ -613,7 +613,7 @@ Output C code only, no explanation."""
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
+    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
     print(f"  ./fuzzer_{fn_name}")
     return True
 

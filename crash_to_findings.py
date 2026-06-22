@@ -246,9 +246,11 @@ def main() -> None:
     if parsed is None:
         sys.exit(
             "ERROR: could not extract file/line from ASAN output.\n"
-            "Check that the binary was built with -fsanitize=address and that "
-            "the source was compiled with debug info (-g) or at least without "
-            "full stripping."
+            "The stack trace must include function names and file paths.\n"
+            "Rebuild the fuzzer with debug info:\n"
+            "  clang-20 -fsanitize=fuzzer,address -g -I include \\\n"
+            "      harness_<fn>.c src/*.c -o fuzzer_<fn>\n"
+            "Then re-run to capture a new asan.log."
         )
 
     print(f"  Bug type  : {parsed['bug_type'] or '(unknown)'}")
