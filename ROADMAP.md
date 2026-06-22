@@ -254,3 +254,5 @@ goal is pipeline validation.
 | `apply_patch.py`: strips markdown fences, `--all` flag, pure-insertion anchor fix, auto-applies all SCAR patches from `scar-results.json` | `apply_patch.py` |
 | `crash_to_findings.py`: auto-detects `llvm-symbolizer-20`, injects `ASAN_SYMBOLIZER_PATH` when re-running fuzzer binary | `crash_to_findings.py` |
 | End-to-end scarnet walkthrough: 4/4 bugs found+patched+verified on clean repo (scar_log, scar_alloc_copy, dispatch→handle_del, session_frag) | `slice-context-guide.md` |
+| **M-08** output buffer sizing module: fires when buffer-write sink present + arg_count ≥ 3; instructs model to use compile-time constant, never fuzz bytes, for output buffer size | `gen_harness.py` |
+| zlib validation: inflate/deflate harness bugs root-caused (deflate OOM from uncapped malloc, inflate OOM from stack buffer of Size bytes); P-08 streaming gap confirmed for inflateBack | validated |

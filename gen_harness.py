@@ -433,6 +433,33 @@ def build_task_block(fn_name: str, summary: dict) -> str:
             "each iteration"
         )
 
+    # --- M-08: Output buffer sizing ---
+    # Fires when the function writes into a caller-supplied output buffer.
+    # Structural signal: a buffer-write sink is present and the function takes
+    # enough arguments to have both an input and an output buffer.
+    # The model's failure mode is to read fuzz bytes as the malloc size or to
+    # declare a stack buffer of `Size` bytes — both make harness crashes that
+    # have nothing to do with the target.
+    _OUTPUT_WRITE_SINKS = frozenset({
+        "memcpy", "memmove", "memset", "bcopy",
+        "compress", "compress2", "uncompress",
+        "deflate", "inflate", "deflateEnd", "inflateEnd",
+        "BZ2_bzCompress", "BZ2_bzDecompress",
+        "LZ4_compress_default", "LZ4_decompress_safe",
+    })
+    sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
+    arg_count = summary.get("arg_count", 0)
+    if sink_fns & _OUTPUT_WRITE_SINKS and arg_count >= 3:
+        modules.append(
+            "- The function writes into a caller-supplied output buffer. "
+            "Size that buffer from a compile-time constant (e.g. `4 * Size` or a "
+            "fixed cap such as `1 << 20`), never from fuzz bytes directly. "
+            "Do NOT call `malloc(len)` where `len` is read from `Data` without a "
+            "cap — the fuzzer will synthesise multi-gigabyte sizes and OOM. "
+            "Do NOT declare a stack buffer of `Size` bytes — the output of a "
+            "transform can be larger than the input."
+        )
+
     # --- M-07: Return 0 (always last) ---
     modules.append("- Return 0")
 
