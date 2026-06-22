@@ -29,6 +29,7 @@ Validation steps:
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -81,6 +82,50 @@ def get_context(ll_path: str, fn_name: str) -> str:
         err = r.stderr.strip() or "(no output)"
         print(f"WARNING: ir-context returned no context (rc={r.returncode}):\n  {err}")
     return r.stdout.strip()
+
+
+def get_context_json(ll_path: str, fn_name: str) -> dict:
+    """Return the raw slice summary dict from ir-context --json, or {}."""
+    r = subprocess.run(["ir-context", ll_path, "--function", fn_name, "--json"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def resolve_public_caller(ll_path: str, fn_name: str,
+                          header_text: str, ir_dir: str) -> "tuple[str, str] | None":
+    """Find the best public caller of fn_name.
+
+    Uses caller_names from the slice JSON. Searches all .ll files in ir_dir
+    for a function that (a) is in the header and (b) appears in caller_names.
+    Returns (caller_ll_path, caller_fn_name) or None.
+    """
+    if not header_text:
+        return None
+    summary = get_context_json(ll_path, fn_name)
+    caller_names = summary.get("caller_names", [])
+    if not caller_names:
+        return None
+
+    public_callers = [c for c in caller_names if fn_in_header(c, header_text)]
+    if not public_callers:
+        return None
+
+    # Find which .ll file defines each public caller
+    search_dir = Path(ir_dir) if ir_dir else Path(ll_path).parent
+    for ll in search_dir.glob("*.ll"):
+        try:
+            text = ll.read_text(errors="replace")
+        except OSError:
+            continue
+        for caller in public_callers:
+            if re.search(rf'^define\b[^@]*@{re.escape(caller)}\b', text, re.MULTILINE):
+                return (str(ll), caller)
+    return None
 
 
 def extract_fn_source(src_text: str, fn_name: str) -> str:
@@ -260,47 +305,196 @@ def parse_top_score(output: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Source extraction helper (shared by 1:1 and interprocedural paths)
+# ---------------------------------------------------------------------------
+
+def _source_block(ll_path: str, fn_name: str, src_dir: str,
+                  label: str = "Target function") -> str:
+    """Return a markdown source block for fn_name, or empty string."""
+    if not src_dir:
+        return ""
+    src_file = find_source_for_ll(ll_path, src_dir)
+    if not src_file:
+        print(f"  WARNING: no C source found for {Path(ll_path).name} in {src_dir}")
+        return ""
+    try:
+        src_text = Path(src_file).read_text(errors="replace")
+    except OSError as e:
+        print(f"  WARNING: could not read {src_file}: {e}")
+        return ""
+    fn_src = extract_fn_source(src_text, fn_name)
+    if not fn_src:
+        print(f"  WARNING: could not extract {fn_name} from {src_file}")
+        return ""
+    print(f"  Source ({label}): {src_file} ({len(fn_src)} chars)")
+    return f"\n## {label} (C source)\n```c\n{fn_src}\n```"
+
+
+# ---------------------------------------------------------------------------
+# Interprocedural harness generation (P-05)
+# ---------------------------------------------------------------------------
+
+def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
+                               caller_ll: str, caller_fn: str,
+                               header: str, include_dirs: list[str],
+                               output_dir: Path, src_dir: str) -> bool:
+    """Build a two-section prompt: vulnerable callee context + caller entry point.
+
+    The model sees where the bug is (vuln_fn) and where the harness must
+    enter (caller_fn), and must reason about how to drive caller_fn into
+    the path that reaches vuln_fn.
+    """
+    # Vulnerability context from the callee
+    vuln_ctx    = get_context(vuln_ll, vuln_fn)
+    vuln_sig    = get_ir_signature(vuln_ll, vuln_fn)
+    vuln_src    = _source_block(vuln_ll, vuln_fn, src_dir,
+                                label=f"Vulnerable function: {vuln_fn}")
+
+    # Caller context (for routing gates etc.)
+    caller_ctx  = get_context(caller_ll, caller_fn)
+    caller_sig  = get_ir_signature(caller_ll, caller_fn)
+    caller_src  = _source_block(caller_ll, caller_fn, src_dir,
+                                label=f"Harness entry point: {caller_fn}")
+
+    header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
+    vuln_sig_block   = (f"\n## Vulnerable function signature (from IR)\n```\n{vuln_sig}\n```"
+                        if vuln_sig else "")
+    caller_sig_block = (f"\n## Entry point signature (from IR)\n```\n{caller_sig}\n```"
+                        if caller_sig else "")
+
+    print(f"\n── Vulnerability context ({vuln_fn}) ──")
+    print(vuln_ctx)
+    print(f"\n── Caller context ({caller_fn}) ──")
+    print(caller_ctx)
+
+    initial_prompt = f"""Write a libFuzzer harness in C for security testing.
+
+The vulnerability is in `{vuln_fn}` but it is an internal function not \
+directly accessible. The harness must enter via `{caller_fn}`, which is \
+the public API function that calls `{vuln_fn}`.
+
+## Static analysis — vulnerable function: {vuln_fn}
+{vuln_ctx}
+{vuln_sig_block}
+{vuln_src}
+## Static analysis — harness entry point: {caller_fn}
+{caller_ctx}
+{caller_sig_block}
+{caller_src}
+{header_block}
+## Task
+Write `int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)` \
+targeting `{caller_fn}`.
+
+Requirements:
+- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly
+- Read both function sources carefully: understand the path through `{caller_fn}` \
+that reaches `{vuln_fn}` and set up any required preconditions (state, prior calls, \
+argument values) to exercise that path
+- Check the API reference for required initialization and teardown functions and call them
+- Pass fuzz-controlled data into `{caller_fn}` — do not add artificial caps on Size
+- If data is used as a string, null-terminate it first
+- Initialize any required state before the call; clean it up after
+- Return 0
+
+Output C code only, no explanation."""
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": initial_prompt},
+    ]
+    out_c = output_dir / f"harness_{vuln_fn}_via_{caller_fn}.c"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    harness_ll = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
+        reply = ask_qwen(messages)
+        code  = extract_c(reply)
+        out_c.write_text(code)
+        print(code)
+        print(f"\n→ saved: {out_c}")
+
+        print("\n── compiling harness to IR ──────────────────────────")
+        harness_ll, stderr = compile_to_ir(out_c, include_dirs)
+        if harness_ll:
+            print(f"OK → {harness_ll}")
+            break
+
+        print("COMPILE ERROR:\n" + stderr)
+        if attempt == MAX_RETRIES:
+            print(f"VALIDATION: FAIL — {vuln_fn} via {caller_fn} skipped "
+                  f"after {MAX_RETRIES} compile errors")
+            return False
+
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({
+            "role": "user",
+            "content": (
+                "The harness failed to compile. Fix the C code and output "
+                "corrected C only (no explanation).\n\n"
+                f"Compiler error:\n```\n{stderr.strip()}\n```"
+            ),
+        })
+
+    print("\n── ir-score on harness (self-harm check) ────────────")
+    r = subprocess.run(["ir-score", "--ir-dir", str(harness_ll)],
+                       capture_output=True, text=True)
+    print(r.stdout or "(no sinks — harness is trivially clean)")
+
+    score = parse_top_score(r.stdout)
+    if score is not None:
+        print(f"Self-harm verdict: {self_harm_verdict(score)}")
+
+    inc = f" -I {include_dirs[0]}" if include_dirs else ""
+    print(f"\nTo fuzz:")
+    print(f"  clang-20 -fsanitize=fuzzer,address{inc} {out_c} <target_lib> "
+          f"-o fuzzer_{vuln_fn}_via_{caller_fn}")
+    print(f"  ./fuzzer_{vuln_fn}_via_{caller_fn}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Single harness generation
 # ---------------------------------------------------------------------------
 
 def generate_one(ll_path: str, fn_name: str, header: str,
                  include_dirs: list[str], output_dir: Path,
-                 src_dir: str = "") -> bool:
+                 src_dir: str = "", ir_dir: str = "") -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
     print(f"Target: {fn_name}  ({ll_path})")
     print('='*60)
 
-    # Slice context
+    # Detect interprocedural case: fn_name not in header but has a public caller.
+    # When detected, delegate to the interprocedural prompt builder.
+    if header and not fn_in_header(fn_name, header):
+        search_dir = ir_dir or str(Path(ll_path).parent)
+        caller = resolve_public_caller(ll_path, fn_name, header, search_dir)
+        if caller:
+            caller_ll, caller_fn = caller
+            print(f"  P-05: {fn_name} not in header — "
+                  f"fuzz via caller `{caller_fn}` ({caller_ll})")
+            return _generate_interprocedural(
+                vuln_ll=ll_path, vuln_fn=fn_name,
+                caller_ll=caller_ll, caller_fn=caller_fn,
+                header=header, include_dirs=include_dirs,
+                output_dir=output_dir, src_dir=src_dir,
+            )
+
+    # Standard 1:1 path
     ctx    = get_context(ll_path, fn_name)
     ir_sig = get_ir_signature(ll_path, fn_name)
     print(ctx)
     if ir_sig:
         print(f"\nIR signature: {ir_sig}")
 
-    # C source extraction
-    src_block = ""
-    if src_dir:
-        src_file = find_source_for_ll(ll_path, src_dir)
-        if src_file:
-            try:
-                src_text = Path(src_file).read_text(errors="replace")
-                fn_src   = extract_fn_source(src_text, fn_name)
-                if fn_src:
-                    src_block = f"\n## Target function (C source)\n```c\n{fn_src}\n```"
-                    print(f"\nSource: {src_file} ({len(fn_src)} chars extracted)")
-                else:
-                    print(f"\nWARNING: could not extract {fn_name} from {src_file}")
-            except OSError as e:
-                print(f"\nWARNING: could not read {src_file}: {e}")
-        else:
-            print(f"\nWARNING: no C source found for {Path(ll_path).name} in {src_dir}")
-
-    # Build prompt
+    src_block    = _source_block(ll_path, fn_name, src_dir)
     header_block = f"\n## API reference\n```c\n{header}\n```" if header else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
+
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
 ## Static analysis (IR slicer output)
@@ -415,7 +609,8 @@ def main():
 
     if args.ll:
         generate_one(args.ll, args.function, header, include_dirs, output_dir,
-                     src_dir=src_dir)
+                     src_dir=src_dir,
+                     ir_dir=str(Path(args.ll).parent))
         return
 
     # ir-dir mode
@@ -432,7 +627,7 @@ def main():
                 results["skipped"].append(fn_name)
                 continue
         ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir,
-                          src_dir=src_dir)
+                          src_dir=src_dir, ir_dir=args.ir_dir)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
