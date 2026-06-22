@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Diagnostic: trace _enrich_with_callee_flags for dispatch."""
-import sys, re, glob
+import sys, re, glob, ctypes
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from gen_harness import (get_context_json, _enrich_with_callee_flags,
                          _source_block, _fn_ir_body, _ir_has_double_free)
+from llvm_ir_context.preprocess_slice_pdg import _ptr_id, VK_INSTRUCTION, VK_FUNCTION, VK_GLOBAL_VAR
 
 IR_DIR  = Path.home() / "scarnet-ir-clean"
 LL_PATH = str(IR_DIR / "src_handler.ll")
@@ -42,3 +43,31 @@ for ll in sorted(glob.glob(str(IR_DIR / "*.ll"))):
 result = _enrich_with_callee_flags(summary, FN_NAME, LL_PATH, str(IR_DIR), src_text=src_block)
 print(f"\nEnriched: double_free={result.get('double_free')}, "
       f"use_after_free={result.get('use_after_free')}")
+
+# Deep-dive: trace _detect_double_free on handle_del directly
+print("\n--- tracing _detect_double_free on handle_del ---")
+import llvmlite.binding as llvm
+llvm.initialize(); llvm.initialize_native_target(); llvm.initialize_native_asmprinter()
+ll_text = Path(LL_PATH).read_text(errors="replace")
+mod = llvm.parse_assembly(ll_text)
+for fn in mod.functions:
+    if fn.name != "handle_del":
+        continue
+    free_calls = []
+    for block in fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode == "call":
+                ops = list(instr.operands)
+                for op in ops:
+                    if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR) and "free" in op.name:
+                        ptr_args = [o for o in ops if o.value_kind not in (VK_FUNCTION, VK_GLOBAL_VAR)]
+                        if ptr_args:
+                            p = ptr_args[0]
+                            pid = _ptr_id(p)
+                            p_str = str(p).strip()
+                            free_calls.append((pid, p_str))
+                            print(f"  free() call: ptr_id={pid:#x}  repr={p_str[:80]}")
+    if len(free_calls) >= 2:
+        same = free_calls[0][0] == free_calls[1][0]
+        print(f"  same ptr_id: {same}  ({free_calls[0][0]:#x} vs {free_calls[1][0]:#x})")
+    break
