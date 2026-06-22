@@ -230,31 +230,117 @@ def fn_in_header(fn_name: str, header_text: str) -> bool:
     return bool(re.search(rf'\b{re.escape(fn_name)}\s*\(', header_text))
 
 
-def _trim_header(header_text: str, fn_name: str, char_limit: int = 6000) -> str:
-    """Return a trimmed view of the header focused on fn_name.
+def _clang_ast_type_names(header_text: str, fn_name: str,
+                           include_dirs: list[str] | None = None) -> set[str]:
+    """Ask clang to parse the header and return C type names used by fn_name.
 
-    Large headers (e.g. zlib.h at ~16K tokens) overflow small-context models.
-    Strategy: keep lines that mention fn_name or its close relatives, plus
-    typedef/struct blocks, up to char_limit characters. Falls back to a hard
-    character truncation if the focused extract is still too large.
+    Writes the header to a temp file, runs clang -fsyntax-only -Xclang -ast-dump,
+    streams text output until it finds the FunctionDecl for fn_name, then collects
+    type names from ParmVarDecl and return-type lines.
+
+    Returns an empty set on any failure (timeout, parse error, fn not found).
+    """
+    import tempfile
+    terms: set[str] = set()
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".h", mode="w",
+                                         delete=False) as tmp:
+            tmp.write(header_text)
+            tmp_path = tmp.name
+
+        cmd = ["clang-20", "-fsyntax-only", "-w",
+               "-Xclang", "-ast-dump", "-x", "c", tmp_path]
+        for d in (include_dirs or []):
+            cmd += ["-I", d]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+
+        in_fn = False
+        lines_after = 0
+        type_re = re.compile(r"'([A-Za-z_]\w*(?:\s*\*)*)'")
+
+        for raw in proc.stdout:  # type: ignore[union-attr]
+            line = raw.rstrip()
+            if not in_fn:
+                if "FunctionDecl" in line and re.search(
+                    rf'\b{re.escape(fn_name)}\b', line
+                ):
+                    in_fn = True
+                    for m in type_re.finditer(line):
+                        terms.add(m.group(1).rstrip(" *").strip())
+                continue
+
+            for m in type_re.finditer(line):
+                t = m.group(1).rstrip(" *").strip()
+                if t:
+                    terms.add(t)
+
+            lines_after += 1
+            # Stop when the next sibling (un-indented) node begins
+            if lines_after > 5 and re.match(r"[A-Z]", line.lstrip("-| ")):
+                break
+            if lines_after > 60:
+                break
+
+        proc.kill()
+        proc.wait()
+    except Exception:
+        pass
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    return terms
+
+
+def _extract_header_for_fn(header_text: str, fn_name: str,
+                            ir_signature: str = "",
+                            include_dirs: list[str] | None = None,
+                            char_limit: int = 6000) -> str:
+    """Return a compiler-informed trimmed view of the header focused on fn_name.
+
+    Builds a term set from two compiler-derived sources:
+      1. IR signature  -- struct names from %struct.NAME patterns (free, no subprocess)
+      2. clang AST     -- C-level typedef/type names from ParmVarDecl nodes
+
+    Keeps typedef/struct blocks and declaration lines that mention any collected
+    term. Falls back to hard truncation at char_limit if still too large.
+    Gracefully degrades to IR-only terms if clang fails.
     """
     if len(header_text) <= char_limit:
         return header_text
 
+    # Function name family: deflateInit2_ -> deflate
+    base = fn_name.rstrip("0123456789_")
+    terms: set[str] = {fn_name, base}
+
+    # IR-derived struct names: %struct.z_stream_s -> z_stream_s + z_stream
+    for m in re.finditer(r'%struct\.(\w+)', ir_signature):
+        sname = m.group(1)
+        terms.add(sname)
+        terms.add(re.sub(r'[_][st]$', '', sname))  # strip _s/_t suffix conventions
+
+    # Compiler-derived C-level type names (best-effort)
+    terms |= _clang_ast_type_names(header_text, fn_name, include_dirs)
+
+    # Filter header lines using the collected terms
     lines = header_text.splitlines(keepends=True)
-    # Collect line indices that are relevant to fn_name
-    base = fn_name.rstrip("0123456789")  # deflate → deflate, deflateInit → deflate
     keep: list[str] = []
     in_block = False
     brace_depth = 0
 
     for line in lines:
-        # Always keep typedef/struct/define blocks (they carry type definitions)
         if re.match(r'\s*(typedef|struct|#define|#ifndef|#endif)', line):
-            keep.append(line)
-            if '{' in line:
-                in_block = True
-                brace_depth += line.count('{') - line.count('}')
+            if any(t in line for t in terms):
+                keep.append(line)
+                if '{' in line:
+                    in_block = True
+                    brace_depth = line.count('{') - line.count('}')
             continue
 
         if in_block:
@@ -264,15 +350,13 @@ def _trim_header(header_text: str, fn_name: str, char_limit: int = 6000) -> str:
                 in_block = False
             continue
 
-        # Keep lines that mention the function family
-        if base in line or fn_name in line:
+        if any(t in line for t in terms):
             keep.append(line)
 
     trimmed = "".join(keep)
     if len(trimmed) <= char_limit:
         return trimmed
 
-    # Hard truncation with a note so the model knows it's partial
     return trimmed[:char_limit] + "\n/* ... header truncated ... */\n"
 
 
@@ -597,7 +681,7 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
     caller_src  = _source_block(caller_ll, caller_fn, src_dir,
                                 label=f"Harness entry point: {caller_fn}")
 
-    header_trimmed = _trim_header(header, vuln_fn) if header else ""
+    header_trimmed = _extract_header_for_fn(header, vuln_fn, vuln_sig, include_dirs) if header else ""
     header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     vuln_sig_block   = (f"\n## Vulnerable function signature (from IR)\n```\n{vuln_sig}\n```"
                         if vuln_sig else "")
@@ -740,7 +824,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print(f"\nIR signature: {ir_sig}")
 
     src_block    = _source_block(ll_path, fn_name, src_dir)
-    header_trimmed = _trim_header(header, fn_name) if header else ""
+    header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
     header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
