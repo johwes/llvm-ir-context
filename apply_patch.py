@@ -111,8 +111,10 @@ def main() -> None:
                     help="Path to scar-results.json")
     ap.add_argument("--repo",    metavar="DIR",  required=True,
                     help="Root of the target repository")
-    ap.add_argument("--index",   metavar="N", type=int, default=0,
-                    help="Index into the results array (default: 0)")
+    ap.add_argument("--index",   metavar="N", type=int, default=None,
+                    help="Index into the results array (default: apply all)")
+    ap.add_argument("--all",     action="store_true",
+                    help="Apply all patches in the results file (default behaviour when --index omitted)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the patched file to stdout instead of writing it")
     args = ap.parse_args()
@@ -123,40 +125,57 @@ def main() -> None:
     data = json.loads(results_path.read_text())
     if not isinstance(data, list) or len(data) == 0:
         sys.exit("ERROR: results file is empty or not a list")
-    if args.index >= len(data):
-        sys.exit(f"ERROR: --index {args.index} out of range (file has {len(data)} entries)")
 
-    entry   = data[args.index]
-    patch   = entry.get("patch", "")
-    finding = entry.get("finding", {})
-    file_path = Path(finding.get("file_path", ""))
+    indices = [args.index] if args.index is not None else list(range(len(data)))
 
-    if not patch.strip():
-        sys.exit("ERROR: patch field is empty")
-    if not file_path.parts:
-        sys.exit("ERROR: finding has no file_path")
+    ok = 0
+    for idx in indices:
+        if idx >= len(data):
+            print(f"  SKIP: index {idx} out of range")
+            continue
 
-    # Resolve relative to repo root if the path doesn't exist as-is
-    if not file_path.exists():
-        candidate = repo_root / file_path
-        if candidate.exists():
-            file_path = candidate
+        entry   = data[idx]
+        patch   = entry.get("patch", "")
+        finding = entry.get("finding", {})
+        file_path = Path(finding.get("file_path", ""))
+
+        # Strip markdown code fences that LLM sometimes wraps around the diff
+        patch = re.sub(r"^```[a-z]*\n?", "", patch, flags=re.MULTILINE)
+        patch = re.sub(r"^```\s*$",      "", patch, flags=re.MULTILINE)
+
+        if not patch.strip():
+            print(f"  SKIP [{idx}]: patch field is empty")
+            continue
+        if not file_path.parts:
+            print(f"  SKIP [{idx}]: finding has no file_path")
+            continue
+
+        # Resolve relative to repo root if the path doesn't exist as-is
+        if not file_path.exists():
+            candidate = repo_root / file_path
+            if candidate.exists():
+                file_path = candidate
+            else:
+                print(f"  SKIP [{idx}]: source file not found: {file_path}")
+                continue
+
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+        print(f"  [{idx}] Applying patch to {file_path}  (line {finding.get('line', '?')})")
+
+        patched = _apply_patch_python(source, patch)
+        if patched is None:
+            print(f"  [{idx}] ERROR: patch application failed — skipping")
+            continue
+
+        if args.dry_run:
+            print(f"\n--- [{idx}] patched output ---")
+            print(patched)
         else:
-            sys.exit(f"ERROR: source file not found: {file_path}")
+            file_path.write_text(patched, encoding="utf-8")
+            print(f"  [{idx}] Written: {file_path}")
+        ok += 1
 
-    source = file_path.read_text(encoding="utf-8", errors="replace")
-    print(f"  Applying patch to {file_path}  (finding line {finding.get('line', '?')})")
-
-    patched = _apply_patch_python(source, patch)
-    if patched is None:
-        sys.exit("ERROR: patch application failed — see above")
-
-    if args.dry_run:
-        print("\n--- patched output ---")
-        print(patched)
-    else:
-        file_path.write_text(patched, encoding="utf-8")
-        print(f"  Written: {file_path}")
+    print(f"\n{ok}/{len(indices)} patch(es) applied{'(dry run)' if args.dry_run else ''}.")
 
 
 if __name__ == "__main__":
