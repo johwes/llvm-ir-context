@@ -449,7 +449,12 @@ def build_task_block(fn_name: str, summary: dict) -> str:
         "LZ4_compress_default", "LZ4_decompress_safe",
     })
     sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
-    if sink_fns & _OUTPUT_WRITE_SINKS:
+    # Fire when any sinks are present — not just named buffer-write calls.
+    # Streaming APIs like deflate/inflate write through z_stream struct fields
+    # (GEP sinks), not via a named memcpy, so the named-sink check silently
+    # skips them. The instruction is harmless for functions without output
+    # buffers; the cost of skipping it is a harness OOM.
+    if summary.get("n_sinks", 0) > 0:
         modules.append(
             "- The function writes into a caller-supplied output buffer.\n"
             "  Size the output buffer from a compile-time expression, NEVER from\n"
