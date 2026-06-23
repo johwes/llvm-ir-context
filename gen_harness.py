@@ -647,16 +647,18 @@ def build_task_block(fn_name: str, summary: dict,
         if hdr:
             required_headers.setdefault(hdr, set()).add(fn)
 
-    header_parts = ["<stdint.h>", "<stddef.h>"]
-    for hdr, fns in sorted(required_headers.items()):
-        header_parts.append(f"{hdr} (for {', '.join(sorted(fns))})")
+    import os as _os
+    include_lines = ["#include <stdint.h>", "#include <stddef.h>"]
+    for hdr in sorted(required_headers.keys()):
+        include_lines.append(f"#include {hdr}")
     if target_header:
-        import os as _os
-        header_parts.append(f'"{_os.path.basename(target_header)}"')
+        include_lines.append(f'#include "{_os.path.basename(target_header)}"')
 
     modules.append(
-        f"- Start with these includes (in this order): "
-        + ", ".join(f"`{h}`" for h in header_parts)
+        f"- The harness MUST open with exactly these includes — copy them verbatim:\n"
+        f"  ```c\n"
+        + "\n".join(f"  {l}" for l in include_lines) +
+        f"\n  ```"
     )
 
     # --- M-01: Base requirements (always present) ---
