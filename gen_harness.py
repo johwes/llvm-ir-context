@@ -920,7 +920,7 @@ def build_task_block(fn_name: str, summary: dict,
                 f"Structure the harness as TWO separate socketpair setups and TWO calls:\n"
                 f"  1. SETUP call: create a new socketpair, write a fixed command that "
                 f"causes {callee_any} to create/acquire a resource with a known "
-                f"identifier (e.g. \"SET fuzzkey\\n\"). Close the write end, call "
+                f"identifier. IMPORTANT: derive the exact SETUP command syntax from the injected source code above — do NOT guess. Read what the relevant handler expects (number of tokens, format) and construct a syntactically valid command. Use a short, fixed key (e.g. a single letter) so mutations find the matching release command faster. Close the write end, call "
                 f"`{fn_name}(sv[0])`, close the read end.\n"
                 f"  2. TRIGGER call: create a second socketpair, write fuzz-derived bytes "
                 f"(from Data/Size) targeting the same identifier to trigger the {bug}. "
