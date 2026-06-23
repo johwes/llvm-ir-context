@@ -442,7 +442,8 @@ _DIV_OPCODES  = frozenset({5, 6, 7, 8})    # udiv, sdiv, urem, srem
 
 def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
                        instr_to_block, block_preds, block_last_instr,
-                       extra_sinks: frozenset | None = None):
+                       extra_sinks: frozenset | None = None,
+                       mock_is_function: set | None = None):
     """
     PDG backward slice: DFG backward BFS + control dependence (block terminators).
 
@@ -603,10 +604,12 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
     # when the function has internal linkage and @main is suppressed.
     _sink_names  = {_canonical_name(nm) for nm in sink_fn_names.values()}
     _input_names = set(INPUT_SOURCES)
+    _fn_nodes = mock_is_function or set()
     global_vars_read = sorted({
         _canonical_name(nm)
         for nid, nm in mock_names.items()
         if nid in old_to_new
+        and nid not in _fn_nodes              # exclude VK_FUNCTION entries
         and _canonical_name(nm) not in _sink_names
         and _canonical_name(nm) not in _input_names
         and not _is_sink(_canonical_name(nm))
@@ -726,8 +729,9 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
 
     # -- Pass 3: DFG edges + mock name tracking --------------------------------
     constant_cache = {}
-    mock_cache     = {}
-    mock_names     = {}
+    mock_cache        = {}
+    mock_names        = {}
+    mock_is_function  = set()  # node IDs added as VK_FUNCTION (not global vars)
 
     # Pre-pass: record store mappings so load instructions can trace values back
     # through alloca/store/load chains. At -O0, clang emits alloca+store+load for
@@ -805,8 +809,10 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
                 elif vk in (VK_GLOBAL_VAR, VK_FUNCTION):
                     name = op.name
                     if name not in mock_cache:
-                        mock_cache[name]     = node_counter
-                        mock_names[node_counter] = name
+                        mock_cache[name]          = node_counter
+                        mock_names[node_counter]  = name
+                        if vk == VK_FUNCTION:
+                            mock_is_function.add(node_counter)
                         node_opcodes.append(IDX_MOCK)
                         node_counter += 1
                     edges_src.append(mock_cache[name])
@@ -837,7 +843,8 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
 
     g = _extract_slice_pdg(x, edge_index, edge_type, mock_names,
                             instr_to_block, block_preds, block_last_instr,
-                            extra_sinks=extra_sinks)
+                            extra_sinks=extra_sinks,
+                            mock_is_function=mock_is_function)
     if g is None:
         g = {"x": x, "edge_index": edge_index, "edge_type": edge_type,
              "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
