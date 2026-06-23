@@ -856,15 +856,17 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-05: Double-free / UAF — stateful precondition ---
     if summary.get("double_free") or summary.get("use_after_free"):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
-        df_callee = summary.get("df_callee") or summary.get("uaf_callee") or ""
-        if df_callee:
+        df_callees = sorted(summary.get("df_callees") or summary.get("uaf_callees") or [])
+        if df_callees:
+            callee_list = ", ".join(f"`{c}`" for c in df_callees)
+            callee_any  = df_callees[0] if len(df_callees) == 1 else f"one of {callee_list}"
             modules.append(
-                f"- A {bug} is detected in `{df_callee}`, which `{fn_name}` calls. "
-                f"To trigger it, route `{fn_name}` into `{df_callee}` twice with the "
+                f"- A {bug} is detected in {callee_list}, which `{fn_name}` calls. "
+                f"To trigger it, route `{fn_name}` into {callee_any} twice with the "
                 f"same resource identifier. Structure the harness as two fixed phases:\n"
-                f"  1. SETUP: craft input so `{fn_name}` invokes `{df_callee}` to "
+                f"  1. SETUP: craft input so `{fn_name}` invokes {callee_any} to "
                 f"create or acquire a resource. This must always succeed before continuing.\n"
-                f"  2. TRIGGER: craft input so `{fn_name}` invokes `{df_callee}` again "
+                f"  2. TRIGGER: craft input so `{fn_name}` invokes {callee_any} again "
                 f"with the same resource identifier to trigger the {bug}. Randomize other "
                 f"arguments from fuzz input to vary the execution path.\n"
                 f"  Do NOT randomize the resource identifier — the {bug} only fires when "
@@ -1370,9 +1372,6 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
     its slicer double_free/use_after_free flags into the caller summary so
     that M-05 fires in the prompt when a callee has the vulnerable pattern.
     """
-    if summary.get("double_free") and summary.get("use_after_free"):
-        return summary  # already set, nothing to do
-
     import glob as _glob
     ll_text = ""
     try:
@@ -1397,14 +1396,12 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
             if not (in_ir or in_src):
                 continue
             callee_summary = get_context_json(sibling_ll, callee)
-            if callee_summary.get("double_free") and not enriched.get("double_free"):
+            if callee_summary.get("double_free"):
                 enriched["double_free"] = True
-                enriched["df_callee"] = callee
-            if callee_summary.get("use_after_free") and not enriched.get("use_after_free"):
+                enriched.setdefault("df_callees", set()).add(callee)
+            if callee_summary.get("use_after_free"):
                 enriched["use_after_free"] = True
-                enriched["uaf_callee"] = callee
-            if enriched.get("double_free") and enriched.get("use_after_free"):
-                return enriched
+                enriched.setdefault("uaf_callees", set()).add(callee)
     return enriched
 
 
