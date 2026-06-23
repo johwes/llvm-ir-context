@@ -590,7 +590,8 @@ def save_prompt_file(path: Path, messages: list[dict]) -> None:
 # signal from the slicer summary. Modules are generic — no target-specific
 # content. The slicer output is the condition; the module is the instruction.
 
-def build_task_block(fn_name: str, summary: dict) -> str:
+def build_task_block(fn_name: str, summary: dict,
+                     target_header: str = "") -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
@@ -610,9 +611,10 @@ def build_task_block(fn_name: str, summary: dict) -> str:
 
     modules = []
 
-    # --- M-00: Required headers (fired by detected sink functions) ---
-    # Maps sink function names to the headers that declare them.
-    # Only emitted when at least one matching sink is present — not a blanket rule.
+    # --- M-00: Required headers ---
+    # <stdint.h> and <stddef.h> are always required for the LLVMFuzzerTestOneInput
+    # signature (uint8_t, size_t). Sink-specific headers are added when detected.
+    # The project header (if provided) is always required for the target function.
     _SINK_HEADERS: dict[str, str] = {
         # <string.h>
         "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
@@ -639,20 +641,23 @@ def build_task_block(fn_name: str, summary: dict) -> str:
         "recv": "<sys/socket.h>", "recvfrom": "<sys/socket.h>",
     }
     sink_fn_names = {s.get("fn", "") for s in summary.get("sinks", [])}
-    required_headers: dict[str, set[str]] = {}  # header → set of fns that need it
+    required_headers: dict[str, set[str]] = {}
     for fn in sink_fn_names:
         hdr = _SINK_HEADERS.get(fn)
         if hdr:
             required_headers.setdefault(hdr, set()).add(fn)
-    if required_headers:
-        header_list = ", ".join(
-            f"`{h}` (for {', '.join(sorted(fns))})"
-            for h, fns in sorted(required_headers.items())
-        )
-        modules.append(
-            f"- Include the following headers — the detected sinks require them: "
-            f"{header_list}"
-        )
+
+    header_parts = ["<stdint.h>", "<stddef.h>"]
+    for hdr, fns in sorted(required_headers.items()):
+        header_parts.append(f"{hdr} (for {', '.join(sorted(fns))})")
+    if target_header:
+        import os as _os
+        header_parts.append(f'"{_os.path.basename(target_header)}"')
+
+    modules.append(
+        f"- Start with these includes (in this order): "
+        + ", ".join(f"`{h}`" for h in header_parts)
+    )
 
     # --- M-01: Base requirements (always present) ---
     modules.append(
@@ -861,7 +866,7 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                        or get_context_json(vuln_ll, vuln_fn).get("double_free"),
                       "use_after_free": caller_summary.get("use_after_free")
                                         or get_context_json(vuln_ll, vuln_fn).get("use_after_free")}
-    task_block = build_task_block(caller_fn, merged_summary)
+    task_block = build_task_block(caller_fn, merged_summary, target_header=header)
     # Prepend the interprocedural-specific constraint
     interp_note = (
         f"- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly\n"
@@ -1008,7 +1013,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             summary_json, fn_name, ll_path, ir_dir,
             src_text=src_block,
         )
-    task_block   = build_task_block(fn_name, summary_json)
+    task_block   = build_task_block(fn_name, summary_json, target_header=header)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
