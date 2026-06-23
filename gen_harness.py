@@ -40,11 +40,8 @@ from pathlib import Path
 
 import requests
 
-ENDPOINT         = os.environ.get(
-    "LLM_ENDPOINT",
-    "https://litellm-litemaas.apps.prod.rhoai.rh-aiservices-bu.com/v1/chat/completions",
-)
-MODEL            = os.environ.get("LLM_MODEL", "Qwen3.6-35B-A3B")
+ENDPOINT         = os.environ.get("LLM_ENDPOINT", "")
+MODEL            = os.environ.get("LLM_MODEL", "")
 MAX_RETRIES      = 3
 SELF_HARM_WARN   = 0.90
 SELF_HARM_REVIEW = 0.80
@@ -445,6 +442,10 @@ def pick_public_functions(ir_dir: str, no_gep_only: bool,
 # ---------------------------------------------------------------------------
 
 def ask_qwen(messages: list[dict]) -> str:
+    if not ENDPOINT:
+        sys.exit("Set LLM_ENDPOINT env var (e.g. https://your-litellm-host/v1/chat/completions).")
+    if not MODEL:
+        sys.exit("Set LLM_MODEL env var (e.g. deepseek-r1-distill-qwen-14b).")
     key = os.environ.get("LLM_API_KEY") or os.environ.get("QWEN_API_KEY", "")
     if not key:
         sys.exit("Set LLM_API_KEY (or QWEN_API_KEY) env var first.")
