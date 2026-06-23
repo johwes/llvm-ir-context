@@ -281,11 +281,13 @@ See `ideas.md § Patch re-validation via slicer`.
 | `apply_patch.py`: strips markdown fences, `--all` flag, pure-insertion anchor fix, auto-applies all SCAR patches from `scar-results.json` | `apply_patch.py` |
 | `crash_to_findings.py`: auto-detects `llvm-symbolizer-20`, injects `ASAN_SYMBOLIZER_PATH` when re-running fuzzer binary | `crash_to_findings.py` |
 | End-to-end scarnet walkthrough: 4/4 bugs found+patched+verified on clean repo (scar_log, scar_alloc_copy, dispatch→handle_del, session_frag) | `slice-context-guide.md` |
-| **M-08** output buffer sizing module: fires on buffer-write sinks only (not printf/format-string); code template with 4MB cap (`OUT_CAP_MAX`), never from fuzz bytes; `_trim_header()` trims large headers to ~6KB focused on target function | `gen_harness.py` |
+| **M-08** output buffer sizing module: fires on buffer-write sinks only (not printf/format-string); generic constraint (no malloc(Size), hard cap, no Data-derived sizes) — zlib-specific code template removed | `gen_harness.py` |
+| **M-04** generic teardown: zlib-specific names removed; `deflateReset` anti-pattern note now conditional on streaming sinks only | `gen_harness.py` |
+| **M-05** generic resource language: "stores a key" (scarnet-specific) replaced with "creates or acquires a resource" | `gen_harness.py` |
 | **P1.1** blank-shooter check: slice `LLVMFuzzerTestOneInput` using target fn as extra sink; fail if `function_argument` not in `input_channels`; retry with specific message; OK line shows node count + guard type | `gen_harness.py` |
 | Bug fix: `_build_include_preamble` received header file content instead of path, producing garbage `#include` line; renamed to `header_path`, threaded `args.header` through `generate_one` and `_generate_interprocedural` | `gen_harness.py` |
 | Bug fix: system prompt `#include` rule contradicted M-00; replaced with "do not write any `#include` lines — they are injected automatically" | `gen_harness.py` |
-| **M-04** teardown hardened: require `deflateEnd`/`inflateEnd`/`free` on all exit paths; prohibit `deflateReset` misuse; recommend `goto cleanup` pattern | `gen_harness.py` |
+| Validation: generic prompt modules confirmed on scarnet top-k 7 — 5/7 crashes (scar_log SEGV, scar_alloc_copy alloc-too-big, dispatch heap-OOB, parse_cmd heap-OOB, session_frag heap-OOB); parse_cmd newly found vs prior 4/7 baseline | validated |
 | `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` env vars: switch model without code change | `gen_harness.py` |
 | zlib validation (deepseek-r1-distill-qwen-14b): inflate+deflate both `Done 50000 runs` clean; model follows multi-constraint prompts reliably | validated |
 | `_extract_header_for_fn`: drop multi-line comment blocks outside struct bodies (99KB→12KB for inflate) | `gen_harness.py` |

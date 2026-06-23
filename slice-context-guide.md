@@ -339,8 +339,9 @@ done
 ```
 
 Expected crashes: `scar_log` (SEGV/format-string), `scar_alloc_copy`
-(alloc-too-big), `dispatch` (double-free via `handle_del`),
-`session_frag` (heap-buffer-overflow).
+(alloc-too-big), `dispatch` (heap-buffer-overflow via `handle_del`),
+`parse_cmd` (heap-buffer-overflow), `session_frag` (heap-buffer-overflow).
+`session_login` and `scar_atoi` run to Done with no crash.
 
 ### 6. Symbolize and convert crashes to SCAR findings
 
