@@ -633,7 +633,7 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
     # Rename every reference to @main (definition + call sites) to avoid
     # collision with libFuzzer's main. Use \\b word boundary to avoid matching
     # @main_loop, @main_config, or other @main-prefixed symbols.
-    text = re.sub(r'@main\b', '@__scar_disabled_main', text)
+    text = re.sub(r'@main\b', '@__fuzzer_disabled_main', text)
     out = ll_path.with_name(ll_path.stem + "_promoted.ll")
     out.write_text(text)
     return out
@@ -864,13 +864,11 @@ def build_task_block(fn_name: str, summary: dict,
     )
 
     # --- M-04: State setup and teardown (always) ---
-    _STREAMING_SINKS = frozenset({"deflate", "inflate", "deflateEnd", "inflateEnd",
-                                   "BZ2_bzCompress", "BZ2_bzDecompress",
-                                   "LZ4_compress_default", "LZ4_decompress_safe"})
-    _has_streaming = bool({s.get("fn") for s in summary.get("sinks", [])} & _STREAMING_SINKS)
+    # Streaming detection: use the slicer hint, not hardcoded library names.
+    _has_streaming = "streaming" in hint or "call in a loop" in hint
     teardown_note = (
-        " Do NOT use `deflateReset`/`inflateReset` as a substitute for "
-        "`deflateEnd`/`inflateEnd` — reset keeps internal state alive and leaks memory."
+        " Do NOT use a reset function as a substitute for a full teardown — "
+        "reset keeps internal state alive and leaks memory."
         if _has_streaming else ""
     )
     modules.append(
@@ -994,10 +992,6 @@ def build_task_block(fn_name: str, summary: dict,
     _OUTPUT_WRITE_SINKS = frozenset({
         "memcpy", "memmove", "memset", "bcopy",
         "strcpy", "strncpy", "strcat", "strncat",
-        "compress", "compress2", "uncompress",
-        "deflate", "inflate", "deflateEnd", "inflateEnd",
-        "BZ2_bzCompress", "BZ2_bzDecompress",
-        "LZ4_compress_default", "LZ4_decompress_safe",
     })
     _FORMAT_ONLY_SINKS = frozenset({
         "printf", "fprintf", "sprintf", "snprintf",
