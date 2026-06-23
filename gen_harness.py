@@ -850,6 +850,8 @@ def build_task_block(fn_name: str, summary: dict,
             f"any of the detected literals — do NOT derive the verb from `Size` or any "
             f"value that is constant across the call sequence"
         )
+    elif is_fd_reader:
+        pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
     else:
         modules.append(
             f"- Pass `Data` and `Size` into `{fn_name}` — "
