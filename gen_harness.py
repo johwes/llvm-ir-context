@@ -609,21 +609,26 @@ def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
             f"Validation failed: the IR slicer found no call to `{target_fn}` "
             f"inside `LLVMFuzzerTestOneInput`. Ensure the harness actually calls "
             f"the target function with arguments derived from `Data` and `Size`."
-        )
+        ), None
 
     summary = summarize_slice(g, fn_name="LLVMFuzzerTestOneInput")
     if "function_argument" in summary.get("input_channels", []):
-        return None  # fuzz input reaches the target — harness passes
+        n = summary.get("n_sinks", 0)
+        return None, (
+            f"OK — Data/Size reach `{target_fn}` "
+            f"({n} node(s) in slice, guard={summary.get('guard_type','?')})"
+        )  # fuzz input reaches the target — harness passes
 
+    channels = summary.get("input_channels", [])
     return (
         f"Validation failed: your harness is a blank shooter. "
         f"I traced the data flow backward from the call to `{target_fn}` and "
         f"neither `Data` nor `Size` from `LLVMFuzzerTestOneInput` reach its "
-        f"arguments — you are passing constants or locally-computed values that "
-        f"the fuzzer cannot influence. "
+        f"arguments (input_channels={channels}) — you are passing constants or "
+        f"locally-computed values that the fuzzer cannot influence. "
         f"Pass `Data` (or a slice of it) and/or a length derived from `Size` "
         f"directly into `{target_fn}`."
-    )
+    ), None
 
 
 # ---------------------------------------------------------------------------
@@ -964,9 +969,9 @@ the public API function that calls `{vuln_fn}`.
                 continue
 
         print("\n── blank-shooter check ──────────────────────────────")
-        bs_msg = _check_blank_shooter(harness_ll, caller_fn)
-        if bs_msg is None:
-            print("OK — fuzz input reaches target function")
+        bs_msg, bs_ok = _check_blank_shooter(harness_ll, caller_fn)
+        if bs_ok is not None:
+            print(bs_ok)
             break
         print(f"BLANK SHOOTER: {bs_msg}")
         if attempt == MAX_RETRIES:
@@ -1099,9 +1104,9 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 continue
 
         print("\n── blank-shooter check ──────────────────────────────")
-        bs_msg = _check_blank_shooter(harness_ll, fn_name)
-        if bs_msg is None:
-            print("OK — fuzz input reaches target function")
+        bs_msg, bs_ok = _check_blank_shooter(harness_ll, fn_name)
+        if bs_ok is not None:
+            print(bs_ok)
             break
         print(f"BLANK SHOOTER: {bs_msg}")
         if attempt == MAX_RETRIES:
