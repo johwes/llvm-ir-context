@@ -905,36 +905,39 @@ def build_task_block(fn_name: str, summary: dict,
     if summary.get("double_free") or summary.get("use_after_free"):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
         df_callees = sorted(summary.get("df_callees") or summary.get("uaf_callees") or [])
-        if df_callees:
-            callee_list = ", ".join(f"`{c}`" for c in df_callees)
-            callee_any  = df_callees[0] if len(df_callees) == 1 else f"one of {callee_list}"
-            if is_fd_reader:
-                modules.append(
-                    f"- A {bug} is detected in {callee_list}, reached via `{fn_name}`. "
-                    f"`{fn_name}` is a stream processor: the {bug} fires when the right "
-                    f"command sequence arrives through the file descriptor, not by calling "
-                    f"`{fn_name}` twice. Encode both commands in a single Data stream:\n"
-                    f"  1. SETUP command: write bytes that cause `{fn_name}` to invoke "
-                    f"{callee_any} and create/acquire a resource (fixed identifier).\n"
-                    f"  2. TRIGGER command: immediately follow with bytes that cause "
-                    f"`{fn_name}` to invoke {callee_any} again with the same identifier "
-                    f"to trigger the {bug}.\n"
-                    f"  Both commands go into the same socketpair write — do NOT call "
-                    f"`{fn_name}` a second time."
-                )
-            else:
-                modules.append(
-                    f"- A {bug} is detected in {callee_list}, which `{fn_name}` calls. "
-                    f"To trigger it, route `{fn_name}` into {callee_any} twice with the "
-                    f"same resource identifier. Structure the harness as two fixed phases:\n"
-                    f"  1. SETUP: craft input so `{fn_name}` invokes {callee_any} to "
-                    f"create or acquire a resource. This must always succeed before continuing.\n"
-                    f"  2. TRIGGER: craft input so `{fn_name}` invokes {callee_any} again "
-                    f"with the same resource identifier to trigger the {bug}. Randomize other "
-                    f"arguments from fuzz input to vary the execution path.\n"
-                    f"  Do NOT randomize the resource identifier — the {bug} only fires when "
-                    f"both calls operate on the same resource."
-                )
+        callee_list = ", ".join(f"`{c}`" for c in df_callees) if df_callees else ""
+        callee_any  = (df_callees[0] if len(df_callees) == 1
+                       else (f"one of {callee_list}" if df_callees else "the vulnerable callee"))
+        if is_fd_reader:
+            # Stream processor: both SETUP and TRIGGER commands must go into
+            # a single socketpair write — calling the function twice resets state.
+            callee_ctx = f" in {callee_list}" if callee_list else ""
+            modules.append(
+                f"- A {bug} is detected{callee_ctx}, reached via `{fn_name}`. "
+                f"`{fn_name}` is a stream processor: the {bug} fires when the right "
+                f"command sequence arrives through the file descriptor, not by calling "
+                f"`{fn_name}` twice. Encode both commands in a single Data stream:\n"
+                f"  1. SETUP command: write bytes that cause `{fn_name}` to invoke "
+                f"{callee_any} and create/acquire a resource (fixed identifier).\n"
+                f"  2. TRIGGER command: immediately follow with bytes that cause "
+                f"`{fn_name}` to invoke {callee_any} again with the same identifier "
+                f"to trigger the {bug}.\n"
+                f"  Both commands go into the same socketpair write — do NOT call "
+                f"`{fn_name}` a second time."
+            )
+        elif df_callees:
+            modules.append(
+                f"- A {bug} is detected in {callee_list}, which `{fn_name}` calls. "
+                f"To trigger it, route `{fn_name}` into {callee_any} twice with the "
+                f"same resource identifier. Structure the harness as two fixed phases:\n"
+                f"  1. SETUP: craft input so `{fn_name}` invokes {callee_any} to "
+                f"create or acquire a resource. This must always succeed before continuing.\n"
+                f"  2. TRIGGER: craft input so `{fn_name}` invokes {callee_any} again "
+                f"with the same resource identifier to trigger the {bug}. Randomize other "
+                f"arguments from fuzz input to vary the execution path.\n"
+                f"  Do NOT randomize the resource identifier — the {bug} only fires when "
+                f"both calls operate on the same resource."
+            )
         else:
             modules.append(
                 f"- A {bug} is detected in a callee. This bug requires a specific "
