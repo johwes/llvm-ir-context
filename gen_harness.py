@@ -496,7 +496,7 @@ def extract_c(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def _build_include_preamble(summary: dict, header_path: str = "") -> str:
+def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False) -> str:
     """Return the canonical #include preamble for a harness.
 
     Deterministic — derived from slicer-detected sinks and the project header.
@@ -534,7 +534,7 @@ def _build_include_preamble(summary: dict, header_path: str = "") -> str:
     # fd-reader functions (fgets, recv, read) signal that the harness needs
     # socketpair infrastructure — inject the required POSIX headers.
     _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
-    if sink_fn_names & _FD_READER_SINKS:
+    if is_fd_reader or (sink_fn_names & _FD_READER_SINKS):
         system_headers.update({"<sys/socket.h>", "<sys/un.h>", "<unistd.h>"})
 
     # Stable order: stdint/stddef first, then alphabetical, then project header
@@ -1055,6 +1055,15 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     print(f"Target: {fn_name}  ({ll_path})")
     print('='*60)
 
+    # Reject functions with internal linkage — they cannot be called from an
+    # external harness .c file regardless of what headers are present.
+    ir_sig_early = get_ir_signature(ll_path, fn_name)
+    if ir_sig_early and "define internal" in ir_sig_early:
+        print(f"  SKIP: {fn_name} has internal linkage (define internal) — "
+              f"not callable from a separate harness TU. "
+              f"Use --function with the public caller instead.")
+        return False
+
     # Detect interprocedural case: fn_name not in header but has a public caller.
     # When detected, delegate to the interprocedural prompt builder.
     if header and not fn_in_header(fn_name, header):
@@ -1092,6 +1101,9 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             summary_json, fn_name, ll_path, ir_dir,
             src_text=src_block,
         )
+    _FD_READER_SINKS_GEN = frozenset({"fgets", "recv", "recvfrom", "read"})
+    _gen_sink_fns = {s.get("fn") for s in summary_json.get("sinks", [])}
+    is_fd_reader = bool(_gen_sink_fns & _FD_READER_SINKS_GEN)
     task_block   = build_task_block(fn_name, summary_json, target_header=header)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
@@ -1118,7 +1130,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        preamble = _build_include_preamble(summary_json, header_path=header_path)
+        preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader)
         code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
