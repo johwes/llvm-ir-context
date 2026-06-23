@@ -447,24 +447,26 @@ def ask_qwen(messages: list[dict]) -> str:
     key = os.environ.get("LLM_API_KEY") or os.environ.get("QWEN_API_KEY", "")
     if not key:
         sys.exit("Set LLM_API_KEY (or QWEN_API_KEY) env var first.")
+    timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
     for attempt in range(1, 4):
         try:
             r = requests.post(
                 ENDPOINT,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={"model": MODEL, "messages": messages},
-                timeout=120,
+                timeout=timeout,
             )
             if not r.ok:
                 sys.exit(f"API error {r.status_code}: {r.text[:500]}")
             return r.json()["choices"][0]["message"]["content"]
-        except requests.exceptions.ConnectionError as exc:
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
             if attempt == 3:
                 sys.exit(f"LLM endpoint unreachable after 3 attempts: {exc}")
             wait = 5 * attempt
-            print(f"  [network] connection error (attempt {attempt}/3), retrying in {wait}s…",
-                  file=sys.stderr)
-            import time; time.sleep(wait)
+            print(f"  [network] connection/timeout error (attempt {attempt}/3), "
+                  f"retrying in {wait}s…", file=sys.stderr)
+            time.sleep(wait)
 
 
 def extract_c(text: str) -> str:
@@ -506,6 +508,12 @@ def _build_include_preamble(summary: dict, header_path: str = "") -> str:
         hdr = _SINK_HEADERS.get(fn)
         if hdr:
             system_headers.add(hdr)
+
+    # fd-reader functions (fgets, recv, read) signal that the harness needs
+    # socketpair infrastructure — inject the required POSIX headers.
+    _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
+    if sink_fn_names & _FD_READER_SINKS:
+        system_headers.update({"<sys/socket.h>", "<sys/un.h>", "<unistd.h>"})
 
     # Stable order: stdint/stddef first, then alphabetical, then project header
     ordered = ["<stdint.h>", "<stddef.h>"]
@@ -764,6 +772,31 @@ def build_task_block(fn_name: str, summary: dict,
             "- This function uses a streaming call model: call it in a loop until "
             "the return value indicates completion or error; refill any output buffer "
             "each iteration"
+        )
+
+    # --- M-09: fd-reader — pipe fuzz input via socketpair ---
+    # Fires when the target reads data through a file descriptor (fgets/recv/read)
+    # rather than accepting a buffer argument directly.
+    _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
+    _task_sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
+    if _task_sink_fns & _FD_READER_SINKS:
+        modules.append(
+            f"- This function reads data through a file descriptor, not from a buffer "
+            f"argument. The fuzzer cannot feed `Data` into it directly.\n"
+            f"  Use a UNIX socket pair to pipe fuzz input in:\n"
+            f"  ```c\n"
+            f"  int sv[2];\n"
+            f"  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return 0;\n"
+            f"  write(sv[1], Data, Size);\n"
+            f"  close(sv[1]);   /* EOF: fgets/recv returns when write end is closed */\n"
+            f"  {fn_name}(sv[0]);\n"
+            f"  close(sv[0]);\n"
+            f"  ```\n"
+            f"  Pass `sv[0]` (read end) to the target. Close `sv[1]` (write end) "
+            f"BEFORE calling the target so that `fgets`/`recv` returns NULL/0 at EOF "
+            f"and the target's read loop terminates naturally.\n"
+            f"  Use `socketpair` (bidirectional) rather than `pipe` when the target "
+            f"opens the fd twice (e.g. `fdopen(fd, \"r\")` + `fdopen(dup(fd), \"w\")`)."
         )
 
     # --- M-08: Output buffer sizing ---
