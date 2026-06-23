@@ -926,7 +926,9 @@ def build_task_block(fn_name: str, summary: dict,
                 f"Use ONE socketpair and ONE call. Pack the SETUP and TRIGGER into a single stream:\n"
                 f"  1. Write a fixed SETUP command that creates/acquires a resource with a "
                 f"known identifier. Derive the exact command syntax from the injected source "
-                f"code — do NOT guess the format. Use a short fixed key.\n"
+                f"code — do NOT guess the format. Use a short fixed key. "
+                f"The command string MUST end with '\\n' so the target's fgets/readline returns. "
+                f"Use strlen(setup) not sizeof(setup) when calling write().\n"
                 f"  2. Call `write(sv[1], Data, Size)` immediately after the setup write — "
                 f"two separate write() calls work fine, no malloc/memcpy needed.\n"
                 f"  3. Close the write end, call `{fn_name}(sv[0])` ONCE — the read loop "
@@ -1017,7 +1019,7 @@ def build_task_block(fn_name: str, summary: dict,
             f"promoted to external linkage in the merged IR. Declare them `extern` in "
             f"the harness with types matching the source header."
             + gvar_detail +
-            f" CRITICAL: reset ALL such globals to zero at the TOP of "
+            f" Do NOT use `static` local variables — `static` inside a function creates a new "f"independent variable, not a reference to the file-scope global. "f" CRITICAL: reset ALL such globals to zero at the TOP of "
             f"`LLVMFuzzerTestOneInput` on EVERY invocation — libFuzzer runs the harness "
             f"hundreds of thousands of times in a single process and global state bleeds "
             f"between runs. Without a reset, state from run N corrupts run N+1, crashes "
@@ -1393,17 +1395,22 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 continue
 
         print("\n── blank-shooter check ──────────────────────────────")
-        bs_msg, bs_ok = _check_blank_shooter(harness_ll, fn_name)
-        if bs_ok is not None:
-            print(bs_ok)
-            break
-        bs_msg = _bs_retry_msg(bs_msg, fn_name, is_fd_reader)
-        print(f"BLANK SHOOTER: {bs_msg}")
-        if attempt == MAX_RETRIES:
-            print(f"VALIDATION: WARN — {fn_name} is a blank shooter; generated anyway")
-            break
-        messages.append({"role": "assistant", "content": _assistant_content(reply)})
-        messages.append({"role": "user", "content": bs_msg})
+        if is_fd_reader:
+            # Data flows via socket buffer — slicer cannot trace through kernel,
+            # so the check always false-positives for correct socketpair harnesses.
+            print("SKIP — fd-reader: Data flows via socket buffer, slicer cannot trace through kernel")
+        else:
+            bs_msg, bs_ok = _check_blank_shooter(harness_ll, fn_name)
+            if bs_ok is not None:
+                print(bs_ok)
+                break
+            bs_msg = _bs_retry_msg(bs_msg, fn_name, is_fd_reader)
+            print(f"BLANK SHOOTER: {bs_msg}")
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: WARN — {fn_name} is a blank shooter; generated anyway")
+                break
+            messages.append({"role": "assistant", "content": _assistant_content(reply)})
+            messages.append({"role": "user", "content": bs_msg})
 
     # For internal-linkage functions: promote linkage in target IR and
     # merge with harness IR via llvm-link so the static symbol resolves.
