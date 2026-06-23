@@ -610,6 +610,50 @@ def build_task_block(fn_name: str, summary: dict) -> str:
 
     modules = []
 
+    # --- M-00: Required headers (fired by detected sink functions) ---
+    # Maps sink function names to the headers that declare them.
+    # Only emitted when at least one matching sink is present — not a blanket rule.
+    _SINK_HEADERS: dict[str, str] = {
+        # <string.h>
+        "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
+        "memcmp": "<string.h>", "bcopy": "<string.h>",
+        "strcpy": "<string.h>", "strncpy": "<string.h>",
+        "strcat": "<string.h>", "strncat": "<string.h>",
+        "strlen": "<string.h>", "strcmp": "<string.h>", "strncmp": "<string.h>",
+        # <stdlib.h>
+        "malloc": "<stdlib.h>", "calloc": "<stdlib.h>",
+        "realloc": "<stdlib.h>", "free": "<stdlib.h>",
+        "xmalloc": "<stdlib.h>", "xrealloc": "<stdlib.h>",
+        "atoi": "<stdlib.h>", "atol": "<stdlib.h>", "atoll": "<stdlib.h>",
+        "strtol": "<stdlib.h>", "strtoul": "<stdlib.h>",
+        "strtoll": "<stdlib.h>", "strtoull": "<stdlib.h>",
+        # <stdio.h>
+        "printf": "<stdio.h>", "fprintf": "<stdio.h>",
+        "sprintf": "<stdio.h>", "snprintf": "<stdio.h>",
+        "vsprintf": "<stdio.h>", "vsnprintf": "<stdio.h>",
+        "scanf": "<stdio.h>", "sscanf": "<stdio.h>", "fscanf": "<stdio.h>",
+        "gets": "<stdio.h>", "fgets": "<stdio.h>",
+        # <unistd.h>
+        "read": "<unistd.h>", "pread": "<unistd.h>",
+        # <sys/socket.h>
+        "recv": "<sys/socket.h>", "recvfrom": "<sys/socket.h>",
+    }
+    sink_fn_names = {s.get("fn", "") for s in summary.get("sinks", [])}
+    required_headers: dict[str, set[str]] = {}  # header → set of fns that need it
+    for fn in sink_fn_names:
+        hdr = _SINK_HEADERS.get(fn)
+        if hdr:
+            required_headers.setdefault(hdr, set()).add(fn)
+    if required_headers:
+        header_list = ", ".join(
+            f"`{h}` (for {', '.join(sorted(fns))})"
+            for h, fns in sorted(required_headers.items())
+        )
+        modules.append(
+            f"- Include the following headers — the detected sinks require them: "
+            f"{header_list}"
+        )
+
     # --- M-01: Base requirements (always present) ---
     modules.append(
         f"- Use the exact function signature from the IR / API reference above\n"
