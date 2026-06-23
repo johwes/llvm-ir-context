@@ -56,60 +56,13 @@ minor cleanup in existing modules
 
 ### 2. Call-graph reachability query
 
-**Motivation:** Given a known-dangerous function (e.g. `dangerous_c_function`
-introduced in the RFE discussion), answer: "what are all the call paths from
-the public API surface down to this function?" This is the forward complement
-to the existing backward slice: scoring finds *what* is dangerous, reachability
-finds *from where it can be triggered* and *what harness entry point to use*.
-
-**What it is:** Transitive BFS/DFS backward through the cross-file call graph,
-starting from the target function, terminating at functions with no callers or
-at functions present in the public header.
-
-**Infrastructure:** `score_deterministic.py` already builds `_caller_map`
-internally for score propagation. This item surfaces that map as a queryable
-structure and adds the traversal. The heavy lifting is already done.
-
-**Output:** For each path from a root entry point to the target:
-```
-dispatch → handle_del → scar_store_free   [depth 2, entry in header: YES]
-session_login → scar_store_free           [depth 1, entry in header: YES]
-```
-
-**New CLI flag:** `ir-score --reachability-query dangerous_c_function --ir-dir /tmp/ir/`
-
-**Files:** `llvm_ir_context/score_deterministic.py` (expose `_caller_map`,
-add traversal), `llvm_ir_context/api.py` (add `get_call_paths()` entry point)
+*Implemented. See Completed table.*
 
 ---
 
 ### 3. Interprocedural score propagation — calibration
 
-**Implemented (basic form):** When a callee scores ≥ 0.50, its score × 0.75
-is propagated to known callers. This lifts `dispatch` from rank 18 (28%) to
-rank 8 (61.9%) — correctly surfacing it for harness generation.
-
-**Open question:** The weights (0.75, 0.50) were tuned against scarnet. A more
-principled approach propagates **categorical signals** rather than score fractions:
-- callee has `double_free=True` → caller gets double_free floor (0.92)
-- callee has `use_after_free=True` → caller gets UAF floor (0.88)
-- callee has unguarded call sink + `function_argument` → caller gets fixed
-  interprocedural floor (e.g. 0.70)
-
-This makes propagation defensible on any codebase without knowing the answer
-key. The current continuous approach is correct in direction but scarnet-tuned
-in magnitude.
-
-**Note:** In a priority-queue loop (`--skip-if-unchanged`), exact propagation
-weights matter less — dispatch will eventually be picked when higher-ranked
-functions are exhausted. Propagation primarily ensures dispatch isn't buried
-so deep it takes dozens of iterations to reach.
-
-**Shares infrastructure with P1.2** — the same `_caller_map` used for
-reachability queries drives categorical propagation. Implement together or
-immediately after.
-
-**File:** `llvm_ir_context/score_deterministic.py`, `preprocess_slice_pdg.py`
+*Implemented. See Completed table.*
 
 ---
 
@@ -288,6 +241,8 @@ See `ideas.md § Patch re-validation via slicer`.
 | Bug fix: `_build_include_preamble` received header file content instead of path, producing garbage `#include` line; renamed to `header_path`, threaded `args.header` through `generate_one` and `_generate_interprocedural` | `gen_harness.py` |
 | Bug fix: system prompt `#include` rule contradicted M-00; replaced with "do not write any `#include` lines — they are injected automatically" | `gen_harness.py` |
 | Validation: generic prompt modules confirmed on scarnet top-k 7 — 5/7 crashes (scar_log SEGV, scar_alloc_copy alloc-too-big, dispatch heap-OOB, parse_cmd heap-OOB, session_frag heap-OOB); parse_cmd newly found vs prior 4/7 baseline | validated |
+| **P1.2** call-graph reachability: `get_call_paths(target, caller_map)` BFS traversal; `--reachability-query FN_NAME` CLI flag; `get_call_paths()` in `api.py`; validated on scarnet: `main -> handle_client -> dispatch -> handle_del [depth 3]` | `score_deterministic.py`, `api.py` |
+| **P1.3** categorical interprocedural propagation: replaced scarnet-tuned 0.75x/0.50 constants with signal-based floors (df->0.92, uaf->0.88, call->0.70, fallback x0.75); details show driving signal e.g. `[+prop:handle_del(df->0.92)]` | `score_deterministic.py` |
 | `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` env vars: switch model without code change | `gen_harness.py` |
 | zlib validation (deepseek-r1-distill-qwen-14b): inflate+deflate both `Done 50000 runs` clean; model follows multi-constraint prompts reliably | validated |
 | `_extract_header_for_fn`: drop multi-line comment blocks outside struct bodies (99KB→12KB for inflate) | `gen_harness.py` |
