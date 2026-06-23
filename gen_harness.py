@@ -204,15 +204,17 @@ def find_source_for_ll(ll_path: str, src_dir: str) -> str:
         re.sub(r'^[^_]+_', '', stem),  # handler (strip any prefix)
     ]
     src_dir_path = Path(src_dir)
+    search_dirs = [
+        src_dir_path,
+        src_dir_path / "src",
+        src_dir_path.parent,   # e.g. main.c lives in repo root, not src/
+    ]
     for cand in candidates:
         for ext in (".c", ".cpp", ".cc"):
-            p = src_dir_path / (cand + ext)
-            if p.exists():
-                return str(p)
-            # also try src/ subdirectory
-            p2 = src_dir_path / "src" / (cand + ext)
-            if p2.exists():
-                return str(p2)
+            for d in search_dirs:
+                p = d / (cand + ext)
+                if p.exists():
+                    return str(p)
     return ""
 
 
