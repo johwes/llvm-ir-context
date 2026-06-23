@@ -785,6 +785,10 @@ def build_task_block(fn_name: str, summary: dict,
             by_param[idx].append(sg)
     routing_params = {idx for idx, gs in by_param.items() if len(gs) >= 2}
 
+    _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
+    _task_sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
+    is_fd_reader = bool(_task_sink_fns & _FD_READER_SINKS)
+
     modules = []
 
     # --- M-00: Includes are injected programmatically at write time ---
@@ -861,18 +865,33 @@ def build_task_block(fn_name: str, summary: dict,
         if df_callees:
             callee_list = ", ".join(f"`{c}`" for c in df_callees)
             callee_any  = df_callees[0] if len(df_callees) == 1 else f"one of {callee_list}"
-            modules.append(
-                f"- A {bug} is detected in {callee_list}, which `{fn_name}` calls. "
-                f"To trigger it, route `{fn_name}` into {callee_any} twice with the "
-                f"same resource identifier. Structure the harness as two fixed phases:\n"
-                f"  1. SETUP: craft input so `{fn_name}` invokes {callee_any} to "
-                f"create or acquire a resource. This must always succeed before continuing.\n"
-                f"  2. TRIGGER: craft input so `{fn_name}` invokes {callee_any} again "
-                f"with the same resource identifier to trigger the {bug}. Randomize other "
-                f"arguments from fuzz input to vary the execution path.\n"
-                f"  Do NOT randomize the resource identifier — the {bug} only fires when "
-                f"both calls operate on the same resource."
-            )
+            if is_fd_reader:
+                modules.append(
+                    f"- A {bug} is detected in {callee_list}, reached via `{fn_name}`. "
+                    f"`{fn_name}` is a stream processor: the {bug} fires when the right "
+                    f"command sequence arrives through the file descriptor, not by calling "
+                    f"`{fn_name}` twice. Encode both commands in a single Data stream:\n"
+                    f"  1. SETUP command: write bytes that cause `{fn_name}` to invoke "
+                    f"{callee_any} and create/acquire a resource (fixed identifier).\n"
+                    f"  2. TRIGGER command: immediately follow with bytes that cause "
+                    f"`{fn_name}` to invoke {callee_any} again with the same identifier "
+                    f"to trigger the {bug}.\n"
+                    f"  Both commands go into the same socketpair write — do NOT call "
+                    f"`{fn_name}` a second time."
+                )
+            else:
+                modules.append(
+                    f"- A {bug} is detected in {callee_list}, which `{fn_name}` calls. "
+                    f"To trigger it, route `{fn_name}` into {callee_any} twice with the "
+                    f"same resource identifier. Structure the harness as two fixed phases:\n"
+                    f"  1. SETUP: craft input so `{fn_name}` invokes {callee_any} to "
+                    f"create or acquire a resource. This must always succeed before continuing.\n"
+                    f"  2. TRIGGER: craft input so `{fn_name}` invokes {callee_any} again "
+                    f"with the same resource identifier to trigger the {bug}. Randomize other "
+                    f"arguments from fuzz input to vary the execution path.\n"
+                    f"  Do NOT randomize the resource identifier — the {bug} only fires when "
+                    f"both calls operate on the same resource."
+                )
         else:
             modules.append(
                 f"- A {bug} is detected in a callee. This bug requires a specific "
@@ -898,9 +917,7 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-09: fd-reader — pipe fuzz input via socketpair ---
     # Fires when the target reads data through a file descriptor (fgets/recv/read)
     # rather than accepting a buffer argument directly.
-    _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
-    _task_sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
-    if _task_sink_fns & _FD_READER_SINKS:
+    if is_fd_reader:
         modules.append(
             f"- This function reads data through a file descriptor, not from a buffer "
             f"argument. The fuzzer cannot feed `Data` into it directly.\n"
