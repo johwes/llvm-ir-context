@@ -118,32 +118,39 @@ def resolve_public_caller(ll_path: str, fn_name: str,
     """Find the best public caller of fn_name.
 
     Uses caller_names from the slice JSON. Searches all .ll files in ir_dir
-    for a function that (a) is in the header and (b) appears in caller_names.
+    for a caller with external linkage (not `define internal`).
+    Prefers callers declared in the header; falls back to any externally-linked
+    caller (e.g. main()) when no header-declared caller exists.
     Returns (caller_ll_path, caller_fn_name) or None.
     """
-    if not header_text:
-        return None
     summary = get_context_json(ll_path, fn_name)
     caller_names = summary.get("caller_names", [])
     if not caller_names:
         return None
 
-    public_callers = [c for c in caller_names if fn_in_header(c, header_text)]
-    if not public_callers:
-        return None
-
-    # Find which .ll file defines each public caller
     search_dir = Path(ir_dir) if ir_dir else Path(ll_path).parent
+    header_matches: list[tuple[str, str]] = []
+    any_matches: list[tuple[str, str]] = []
     for ll in search_dir.glob("*.ll"):
         try:
             text = ll.read_text(errors="replace")
         except OSError:
             continue
-        for caller in public_callers:
-            if re.search(rf'^define\b[^@]*@{re.escape(caller)}\b', text, re.MULTILINE):
-                return (str(ll), caller)
-    return None
-
+        for caller in caller_names:
+            m = re.search(
+                r"^(define\b[^@]*)@" + re.escape(caller) + r"\s*\(",
+                text, re.MULTILINE,
+            )
+            if not m:
+                continue
+            if "internal" in m.group(1):
+                continue
+            entry = (str(ll), caller)
+            if header_text and fn_in_header(caller, header_text):
+                header_matches.append(entry)
+            else:
+                any_matches.append(entry)
+    return (header_matches or any_matches or [None])[0]
 
 def extract_fn_source(src_text: str, fn_name: str) -> str:
     """Extract the body of fn_name from C source text using brace matching.
@@ -1077,11 +1084,13 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 header_path=header_path,
             )
 
-    # If function has internal linkage and no public caller was found, skip.
+    # If function has internal linkage and no public caller was found, fall
+    # through to direct harness generation. The harness is compiled together
+    # with the source file that defines the static function, so the symbol
+    # resolves at link time. Emit a warning so the user knows.
     if is_internal:
-        print(f"  SKIP: {fn_name} has internal linkage (define internal) and no "
-              f"public caller found — cannot generate harness.")
-        return False
+        print(f"  NOTE: {fn_name} has internal linkage — harness must be compiled "
+              f"together with its defining source file so the symbol resolves.")
 
     # Standard 1:1 path
     ctx    = get_context(ll_path, fn_name)
