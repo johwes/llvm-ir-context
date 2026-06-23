@@ -1055,18 +1055,13 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     print(f"Target: {fn_name}  ({ll_path})")
     print('='*60)
 
-    # Reject functions with internal linkage — they cannot be called from an
-    # external harness .c file regardless of what headers are present.
-    ir_sig_early = get_ir_signature(ll_path, fn_name)
-    if ir_sig_early and "define internal" in ir_sig_early:
-        print(f"  SKIP: {fn_name} has internal linkage (define internal) — "
-              f"not callable from a separate harness TU. "
-              f"Use --function with the public caller instead.")
-        return False
-
     # Detect interprocedural case: fn_name not in header but has a public caller.
     # When detected, delegate to the interprocedural prompt builder.
-    if header and not fn_in_header(fn_name, header):
+    # Note: also handles internal-linkage functions — P-05 finds a public caller
+    # that reaches the target so the harness calls the caller instead.
+    ir_sig_early = get_ir_signature(ll_path, fn_name)
+    is_internal = ir_sig_early and "define internal" in ir_sig_early
+    if header and (not fn_in_header(fn_name, header) or is_internal):
         search_dir = ir_dir or str(Path(ll_path).parent)
         caller = resolve_public_caller(ll_path, fn_name, header, search_dir)
         if caller:
@@ -1081,6 +1076,12 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 save_prompt=save_prompt,
                 header_path=header_path,
             )
+
+    # If function has internal linkage and no public caller was found, skip.
+    if is_internal:
+        print(f"  SKIP: {fn_name} has internal linkage (define internal) and no "
+              f"public caller found — cannot generate harness.")
+        return False
 
     # Standard 1:1 path
     ctx    = get_context(ll_path, fn_name)
