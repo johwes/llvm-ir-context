@@ -856,18 +856,33 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-05: Double-free / UAF — stateful precondition ---
     if summary.get("double_free") or summary.get("use_after_free"):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
-        modules.append(
-            f"- A {bug} is detected in a callee. This bug requires a specific "
-            f"call sequence: one call creates or acquires a resource, and a later "
-            f"call frees or mishandles it. Structure the harness as two fixed phases:\n"
-            f"  1. SETUP: make a call that creates the resource using a fixed identifier. "
-            f"This call must always succeed before continuing.\n"
-            f"  2. TRIGGER: make a second call that targets the same identifier/resource "
-            f"to trigger the {bug}. Randomize the second call's other arguments from fuzz "
-            f"input to vary the execution path.\n"
-            f"  Do NOT randomize the resource identifier across calls — the {bug} only "
-            f"fires when both calls operate on the same resource."
-        )
+        df_callee = summary.get("df_callee") or summary.get("uaf_callee") or ""
+        if df_callee:
+            modules.append(
+                f"- A {bug} is detected in `{df_callee}`, which `{fn_name}` calls. "
+                f"To trigger it, route `{fn_name}` into `{df_callee}` twice with the "
+                f"same resource identifier. Structure the harness as two fixed phases:\n"
+                f"  1. SETUP: craft input so `{fn_name}` invokes `{df_callee}` to "
+                f"create or acquire a resource. This must always succeed before continuing.\n"
+                f"  2. TRIGGER: craft input so `{fn_name}` invokes `{df_callee}` again "
+                f"with the same resource identifier to trigger the {bug}. Randomize other "
+                f"arguments from fuzz input to vary the execution path.\n"
+                f"  Do NOT randomize the resource identifier — the {bug} only fires when "
+                f"both calls operate on the same resource."
+            )
+        else:
+            modules.append(
+                f"- A {bug} is detected in a callee. This bug requires a specific "
+                f"call sequence: one call creates or acquires a resource, and a later "
+                f"call frees or mishandles it. Structure the harness as two fixed phases:\n"
+                f"  1. SETUP: make a call that creates the resource using a fixed identifier. "
+                f"This call must always succeed before continuing.\n"
+                f"  2. TRIGGER: make a second call that targets the same identifier/resource "
+                f"to trigger the {bug}. Randomize the second call's other arguments from fuzz "
+                f"input to vary the execution path.\n"
+                f"  Do NOT randomize the resource identifier across calls — the {bug} only "
+                f"fires when both calls operate on the same resource."
+            )
 
     # --- M-06: Streaming / incremental call pattern ---
     if "streaming" in hint or "call in a loop" in hint:
@@ -1384,8 +1399,10 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
             callee_summary = get_context_json(sibling_ll, callee)
             if callee_summary.get("double_free") and not enriched.get("double_free"):
                 enriched["double_free"] = True
+                enriched["df_callee"] = callee
             if callee_summary.get("use_after_free") and not enriched.get("use_after_free"):
                 enriched["use_after_free"] = True
+                enriched["uaf_callee"] = callee
             if enriched.get("double_free") and enriched.get("use_after_free"):
                 return enriched
     return enriched
