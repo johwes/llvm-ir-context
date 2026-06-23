@@ -927,8 +927,8 @@ def build_task_block(fn_name: str, summary: dict,
                 f"  1. Write a fixed SETUP command that creates/acquires a resource with a "
                 f"known identifier. Derive the exact command syntax from the injected source "
                 f"code — do NOT guess the format. Use a short fixed key.\n"
-                f"  2. Immediately write `Data`/`Size` bytes after the setup command in the "
-                f"same write sequence — the fuzzer explores what follows the setup.\n"
+                f"  2. Call `write(sv[1], Data, Size)` immediately after the setup write — "
+                f"two separate write() calls work fine, no malloc/memcpy needed.\n"
                 f"  3. Close the write end, call `{fn_name}(sv[0])` ONCE — the read loop "
                 f"processes both the setup command and the fuzz bytes before returning at EOF.\n"
                 f"  Do NOT call `{fn_name}` twice — the {bug} is triggered within a single "
@@ -997,11 +997,27 @@ def build_task_block(fn_name: str, summary: dict,
     # merged IR so globals it normally initializes start at zero/null.
     # Uses global_vars_read from the slicer so the model gets concrete names.
     if is_internal:
+        global_vars = summary.get("global_vars_read", [])
+        if global_vars:
+            gvar_list = ", ".join(f"`{g}`" for g in global_vars)
+            gvar_detail = (
+                f" The IR slicer identified these file-scope globals in the slice: "
+                f"{gvar_list}. Declare ONLY these names as `extern` — do NOT invent "
+                f"names or add a prefix (e.g. `g_`). Copy the exact names and types "
+                f"from the source header."
+            )
+        else:
+            gvar_detail = (
+                " Find file-scope global variable names by reading the injected source "
+                "above — use the EXACT names as declared in the source, do NOT invent "
+                "names or add prefixes."
+            )
         modules.append(
             f"- `{fn_name}` is a static function whose file-scope globals have been "
             f"promoted to external linkage in the merged IR. Declare them `extern` in "
-            f"the harness with types matching the source header. "
-            f"CRITICAL: reset ALL such globals to zero at the TOP of "
+            f"the harness with types matching the source header."
+            + gvar_detail +
+            f" CRITICAL: reset ALL such globals to zero at the TOP of "
             f"`LLVMFuzzerTestOneInput` on EVERY invocation — libFuzzer runs the harness "
             f"hundreds of thousands of times in a single process and global state bleeds "
             f"between runs. Without a reset, state from run N corrupts run N+1, crashes "
