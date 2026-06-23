@@ -350,7 +350,9 @@ done
 
 ```bash
 cd ~/SCAR
-python -m scar /tmp/no-ikos.sarif ~/scarnet/ --triage-rounds 3
+scar /tmp/no-ikos.sarif ~/scarnet/ \
+  --triage-rounds 3 \
+  --output ~/SCAR/scar-results.json
 ```
 
 Expected: 4/4 patches accepted, all `VALID` confidence 1.0.

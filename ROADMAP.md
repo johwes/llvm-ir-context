@@ -244,8 +244,6 @@ See `ideas.md § Patch re-validation via slicer`.
 
 | Item | Where |
 |---|---|
-| Item | Where |
-|---|---|
 | **P1.0** API cleanup: `api.py` (`get_vulnerability_context`, `rank_directory`), `__main__.py` (`python -m llvm_ir_context`), `score_ir_dir()` extracted from `main()`, `caller_map` exposed | `llvm_ir_context/api.py`, `llvm_ir_context/__main__.py`, `score_deterministic.py` |
 | mem2reg false negative fix (synthetic store→load bridge) | `preprocess_slice_pdg.py` |
 | zcfree false positive fix (`has_substantive_call_sink`) | `score_deterministic.py` |

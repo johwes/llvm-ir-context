@@ -264,7 +264,7 @@ writes where null-check is insufficient — so guarded div sinks score very low.
 
 ```
 ============================================================
-Function: fill_window  |  GNN Vulnerability Context
+Function: fill_window  |  Vulnerability Context
 Sinks           : memcpy ×3 — copies n bytes from src to dest — no overlap or bounds check
 Input channels  : external_call_return
 Guard status    : 8 guard(s) (eq, ne, uge, ult) [bounds-check + null-check] / 82 sink(s) = 10.3 sinks/guard (very sparse)
@@ -381,7 +381,11 @@ required teardown. Three deterministic sources (no prose docs required):
 
 1. **Header file** — struct definitions and function prototypes are more
    precise than prose. Inject `scarnet.h` or `zlib.h` alongside the slice
-   block. Planned: `--include-header` flag on `slice_context.py`.
+   block. `gen_harness.py` implements `_extract_header_for_fn()`: given a
+   header file and a target function name, it extracts the relevant prototype,
+   transitive typedefs, struct bodies, and integer `#define` constants —
+   trimming multi-line comment blocks and unrelated declarations to keep the
+   injected context compact.
 
 2. **Call sites** — for internal helpers, grep who calls the function and with
    what arguments. That is a usage example, extractable from the IR.
@@ -392,15 +396,28 @@ required teardown. Three deterministic sources (no prose docs required):
 
 ---
 
-## Relationship to the GNN
+## History: why not a GNN
 
-The GNN and the deterministic rule answer the same question (Philosophy 2) via
-different mechanisms. The GNN learned structural patterns from Devign training
-data; the rule encodes those patterns explicitly. On scarnet both reach 9/13.
-The GNN's previous apparent 11/13 advantage came from Devign topology
-fingerprinting accidentally scoring two structurally undetectable functions
-(handle_set, session_consume_frag) — not from genuine detection.
+An earlier experiment (`johwes/llvm-ir-vuln-gnn`) trained a graph neural
+network on Devign data to predict vulnerability scores from LLVM IR graphs.
+That approach was abandoned for three reasons:
 
-The deterministic rule is preferred for production use: no checkpoint required,
-no training data dependency, fully explainable output, and the tier-based
-scoring is tunable without retraining.
+1. **Apparent accuracy was illusory.** The GNN's apparent 11/13 advantage on
+   scarnet came from Devign topology fingerprinting — the model recognised
+   structural patterns that coincidentally matched two functions
+   (`handle_set`, `session_consume_frag`) for reasons unrelated to genuine
+   vulnerability detection. On unseen targets the signal disappeared.
+
+2. **Opacity.** A GNN score carries no explanation. "This function scores 0.83"
+   tells the LLM nothing actionable. The deterministic tier system produces a
+   score and a rationale: "call sink + no guard + function_argument → 0.90,
+   fuzz n relative to dest buffer size."
+
+3. **Operational cost.** Checkpoints must be versioned, re-trained when sink
+   definitions change, and distributed with the package. The deterministic rule
+   has no checkpoint, no training data dependency, and is tunable by editing
+   a score table.
+
+The GNN repo is preserved as a research artifact but is not part of this
+pipeline. All references to `--gnn-checkpoint` or GNN scoring in documentation
+are stale.
