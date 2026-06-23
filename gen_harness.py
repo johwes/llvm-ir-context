@@ -529,6 +529,46 @@ def _check_self_harm(harness_ll: Path) -> tuple[str, str | None]:
     return verdict, retry_msg
 
 
+def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
+    """Check whether fuzz input (Data/Size) reaches the call to target_fn.
+
+    Slices backward from the call to target_fn inside LLVMFuzzerTestOneInput,
+    treating target_fn as a custom sink. Returns a retry message if the slice
+    has no function_argument input channel (i.e. Data/Size never reach the
+    call), or None when the harness passes.
+    """
+    from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
+    from llvm_ir_context.slice_context import summarize_slice
+
+    ir_text = harness_ll.read_text(errors="replace")
+    g = ir_to_graph_slice_pdg(
+        ir_text,
+        fn_name="LLVMFuzzerTestOneInput",
+        extra_sinks=frozenset({target_fn}),
+    )
+    if g is None:
+        # No slice found at all — the call to target_fn may not exist in IR.
+        return (
+            f"Validation failed: the IR slicer found no call to `{target_fn}` "
+            f"inside `LLVMFuzzerTestOneInput`. Ensure the harness actually calls "
+            f"the target function with arguments derived from `Data` and `Size`."
+        )
+
+    summary = summarize_slice(g, fn_name="LLVMFuzzerTestOneInput")
+    if "function_argument" in summary.get("input_channels", []):
+        return None  # fuzz input reaches the target — harness passes
+
+    return (
+        f"Validation failed: your harness is a blank shooter. "
+        f"I traced the data flow backward from the call to `{target_fn}` and "
+        f"neither `Data` nor `Size` from `LLVMFuzzerTestOneInput` reach its "
+        f"arguments — you are passing constants or locally-computed values that "
+        f"the fuzzer cannot influence. "
+        f"Pass `Data` (or a slice of it) and/or a length derived from `Size` "
+        f"directly into `{target_fn}`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompt saving
 # ---------------------------------------------------------------------------
@@ -846,13 +886,25 @@ the public API function that calls `{vuln_fn}`.
         print("\n── self-harm check ──────────────────────────────────")
         verdict, retry_msg = _check_self_harm(harness_ll)
         print(f"Self-harm verdict: {verdict}")
-        if retry_msg is None:
+        if retry_msg is not None:
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} has self-harm; generated anyway")
+            else:
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": retry_msg})
+                continue
+
+        print("\n── blank-shooter check ──────────────────────────────")
+        bs_msg = _check_blank_shooter(harness_ll, caller_fn)
+        if bs_msg is None:
+            print("OK — fuzz input reaches target function")
             break
+        print(f"BLANK SHOOTER: {bs_msg}")
         if attempt == MAX_RETRIES:
-            print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} has self-harm; generated anyway")
+            print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} is a blank shooter; generated anyway")
             break
         messages.append({"role": "assistant", "content": reply})
-        messages.append({"role": "user", "content": retry_msg})
+        messages.append({"role": "user", "content": bs_msg})
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")
@@ -966,13 +1018,25 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print("\n── self-harm check ──────────────────────────────────")
         verdict, retry_msg = _check_self_harm(harness_ll)
         print(f"Self-harm verdict: {verdict}")
-        if retry_msg is None:
+        if retry_msg is not None:
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: WARN — {fn_name} has self-harm; generated anyway")
+            else:
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": retry_msg})
+                continue
+
+        print("\n── blank-shooter check ──────────────────────────────")
+        bs_msg = _check_blank_shooter(harness_ll, fn_name)
+        if bs_msg is None:
+            print("OK — fuzz input reaches target function")
             break
+        print(f"BLANK SHOOTER: {bs_msg}")
         if attempt == MAX_RETRIES:
-            print(f"VALIDATION: WARN — {fn_name} has self-harm; generated anyway")
+            print(f"VALIDATION: WARN — {fn_name} is a blank shooter; generated anyway")
             break
         messages.append({"role": "assistant", "content": reply})
-        messages.append({"role": "user", "content": retry_msg})
+        messages.append({"role": "user", "content": bs_msg})
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")

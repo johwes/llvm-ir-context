@@ -441,7 +441,8 @@ _DIV_OPCODES  = frozenset({5, 6, 7, 8})    # udiv, sdiv, urem, srem
 
 
 def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
-                       instr_to_block, block_preds, block_last_instr):
+                       instr_to_block, block_preds, block_last_instr,
+                       extra_sinks: frozenset | None = None):
     """
     PDG backward slice: DFG backward BFS + control dependence (block terminators).
 
@@ -465,7 +466,10 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
             rev_dfg[d].append(s)
 
     # Sink type 1: dangerous call sites
-    dangerous_mocks = {nid for nid, nm in mock_names.items() if _is_dangerous(nm)}
+    def _is_sink(name: str) -> bool:
+        return _is_dangerous(name) or (extra_sinks is not None and name in extra_sinks)
+
+    dangerous_mocks = {nid for nid, nm in mock_names.items() if _is_sink(nm)}
     sink_ids:    set[int]       = set()
     sink_to_fn: dict[int, str] = {}   # old_node_id → dangerous function name
     for mid in dangerous_mocks:
@@ -605,7 +609,8 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
 # ---------------------------------------------------------------------------
 
 def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
-                          extra_modules=None):
+                          extra_modules=None,
+                          extra_sinks: frozenset | None = None):
     """
     Build instruction-level graph then extract PDG backward slice.
 
@@ -814,7 +819,8 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
                   if edges_type else np.zeros(0, dtype=np.int64))
 
     g = _extract_slice_pdg(x, edge_index, edge_type, mock_names,
-                            instr_to_block, block_preds, block_last_instr)
+                            instr_to_block, block_preds, block_last_instr,
+                            extra_sinks=extra_sinks)
     if g is None:
         g = {"x": x, "edge_index": edge_index, "edge_type": edge_type,
              "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
