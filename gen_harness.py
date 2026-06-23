@@ -647,7 +647,7 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
     text = ll_path.read_text(errors="replace")
     # Strip 'internal' from the target function definition
     text = re.sub(
-        r'^(define\s+)internal(\s+[^@]*@' + re.escape(fn_name) + r'\s*\(',
+        r'^(define\s+)internal(\s+[^@]*@' + re.escape(fn_name) + r'\s*\()',
         r'\1\2',
         text, flags=re.MULTILINE,
     )
