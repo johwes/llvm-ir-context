@@ -137,6 +137,8 @@ def resolve_public_caller(ll_path: str, fn_name: str,
         except OSError:
             continue
         for caller in caller_names:
+            if caller == "main":
+                continue  # calling main() from a harness re-enters the server loop
             m = re.search(
                 r"^(define\b[^@]*)@" + re.escape(caller) + r"\s*\(",
                 text, re.MULTILINE,
