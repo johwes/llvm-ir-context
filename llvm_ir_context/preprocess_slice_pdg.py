@@ -598,9 +598,26 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
                        if _canonical_name(nm) in INPUT_SOURCES
                        and nid in old_to_new}
 
+    # Global variables accessed in the slice (not sinks, not input sources).
+    # These are file-scope state the function reads — relevant for harness init
+    # when the function has internal linkage and @main is suppressed.
+    _sink_names  = {_canonical_name(nm) for nm in sink_fn_names.values()}
+    _input_names = set(INPUT_SOURCES)
+    global_vars_read = sorted({
+        _canonical_name(nm)
+        for nid, nm in mock_names.items()
+        if nid in old_to_new
+        and _canonical_name(nm) not in _sink_names
+        and _canonical_name(nm) not in _input_names
+        and not _is_sink(_canonical_name(nm))
+        and not nm.startswith(".str")   # string literal constants, not state
+        and not nm.startswith(".L")     # compiler-generated labels
+    })
+
     return {"x": new_x, "edge_index": new_edge_index, "edge_type": new_edge_type,
             "sink_fn_names": sink_fn_names, "source_fn_names": source_fn_names,
             "div_sink_names": div_sink_names,
+            "global_vars_read": global_vars_read,
             "_sliced": True, "_n_sinks": len(sink_ids)}
 
 
@@ -824,6 +841,7 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
     if g is None:
         g = {"x": x, "edge_index": edge_index, "edge_type": edge_type,
              "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
+             "global_vars_read": [],
              "_sliced": False, "_n_sinks": 0}
 
     # strcmp-against-literal gates: detect hardcoded credential checks that block

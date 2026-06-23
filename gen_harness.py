@@ -629,12 +629,10 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
         r'\1\2',
         text, flags=re.MULTILINE,
     )
-    # Rename target @main so it does not clash with libFuzzer's main
-    text = re.sub(
-        r'^(define[^@]*)@main',
-        r'\1@__scar_disabled_main',
-        text, flags=re.MULTILINE,
-    )
+    # Rename every reference to @main (definition + call sites) to avoid
+    # collision with libFuzzer's main. Use \\b word boundary to avoid matching
+    # @main_loop, @main_config, or other @main-prefixed symbols.
+    text = re.sub(r'@main\b', '@__scar_disabled_main', text)
     out = ll_path.with_name(ll_path.stem + "_promoted.ll")
     out.write_text(text)
     return out
@@ -907,14 +905,26 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-10: Global init state warning for internal-linkage functions ---
     # Fires when the target is define internal: main() is suppressed in the
     # merged IR so globals it normally initializes start at zero/null.
+    # Uses global_vars_read from the slicer so the model gets concrete names.
     if is_internal:
+        global_vars = summary.get("global_vars_read", [])
+        if global_vars:
+            gvar_list = ", ".join(f"`{g}`" for g in global_vars)
+            global_note = (
+                f" The IR slicer detected these global variables in the slice: "
+                f"{gvar_list}. Declare them `extern` with types matching the "
+                f"source, and set them to zero-equivalent defaults before calling."
+            )
+        else:
+            global_note = (
+                " Check the source above for file-scope globals it reads and "
+                "zero-initialize them before the call."
+            )
         modules.append(
             f"- `{fn_name}` is a static function normally called after global "
-            f"state is set up by `main`. In this harness `main` is suppressed. "
-            f"Before calling `{fn_name}`, zero-initialize or fuzz-initialize any "
-            f"global variables it reads (check the source above). If globals are "
-            f"declared in the same file, declare them `extern` and set them to "
-            f"safe defaults at the top of `LLVMFuzzerTestOneInput`."
+            f"state is set up by `main`. In this harness `main` is suppressed "
+            f"and all globals start at zero (BSS-initialized)."
+            + global_note
         )
 
     # --- M-08: Output buffer sizing ---
