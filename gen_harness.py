@@ -909,21 +909,24 @@ def build_task_block(fn_name: str, summary: dict,
         callee_any  = (df_callees[0] if len(df_callees) == 1
                        else (f"one of {callee_list}" if df_callees else "the vulnerable callee"))
         if is_fd_reader:
-            # Stream processor: both SETUP and TRIGGER commands must go into
-            # a single socketpair write — calling the function twice resets state.
+            # Stream processor: each call to the function reads ONE command via
+            # fgets/recv, so SETUP and TRIGGER must be separate calls with separate
+            # socketpairs. Global store state persists between calls.
             callee_ctx = f" in {callee_list}" if callee_list else ""
             modules.append(
                 f"- A {bug} is detected{callee_ctx}, reached via `{fn_name}`. "
-                f"`{fn_name}` is a stream processor: the {bug} fires when the right "
-                f"command sequence arrives through the file descriptor, not by calling "
-                f"`{fn_name}` twice. Encode both commands in a single Data stream:\n"
-                f"  1. SETUP command: write bytes that cause `{fn_name}` to invoke "
-                f"{callee_any} and create/acquire a resource (fixed identifier).\n"
-                f"  2. TRIGGER command: immediately follow with bytes that cause "
-                f"`{fn_name}` to invoke {callee_any} again with the same identifier "
-                f"to trigger the {bug}.\n"
-                f"  Both commands go into the same socketpair write — do NOT call "
-                f"`{fn_name}` a second time."
+                f"`{fn_name}` reads ONE command per call (via fgets/recv). "
+                f"Global state (the key-value store) persists between calls. "
+                f"Structure the harness as TWO separate socketpair setups and TWO calls:\n"
+                f"  1. SETUP call: create a new socketpair, write a fixed command that "
+                f"causes {callee_any} to create/acquire a resource with a known "
+                f"identifier (e.g. \"SET fuzzkey\\n\"). Close the write end, call "
+                f"`{fn_name}(sv[0])`, close the read end.\n"
+                f"  2. TRIGGER call: create a second socketpair, write fuzz-derived bytes "
+                f"(from Data/Size) targeting the same identifier to trigger the {bug}. "
+                f"Close the write end, call `{fn_name}(sv[0])` again, close the read end.\n"
+                f"  Do NOT encode both commands in a single write — only the first line "
+                f"is consumed per call. Do NOT reuse the same sv[] array for both calls."
             )
         elif df_callees:
             modules.append(
@@ -1006,6 +1009,9 @@ def build_task_block(fn_name: str, summary: dict,
             f"state is set up by `main`. In this harness `main` is suppressed "
             f"and all globals start at zero (BSS-initialized)."
             + global_note
+            + " IMPORTANT: do NOT declare local variables with the same names as "
+              "file-scope globals — that shadows the real global and has no effect. "
+              "Use `extern` declarations only, never local re-declarations."
         )
 
     # --- M-08: Output buffer sizing ---
@@ -1396,8 +1402,9 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll)
         if merged:
             print(f"OK → {merged}")
-            print(f"\nTo fuzz (IR-linked — no source files needed):")
-            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} -o fuzzer_{fn_name}")
+            print(f"\nTo fuzz (IR-linked — add remaining source files, exclude the file containing {fn_name}):")
+            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} <other_src/*.c> -o fuzzer_{fn_name}")
+            print(f"  (e.g., src/*.c minus the file that defines {fn_name})")
             print(f"  ./fuzzer_{fn_name}")
         else:
             print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
