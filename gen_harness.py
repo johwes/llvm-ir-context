@@ -501,9 +501,24 @@ def ask_qwen(messages: list[dict]) -> str:
             time.sleep(wait)
 
 
+def _assistant_content(reply: str) -> str:
+    """Extract just the code block from a reply for use in multi-turn context.
+
+    Appending the full chain-of-thought reply on retry quickly overflows the
+    model's context window. Using only the extracted code keeps the conversation
+    bounded and removes deepseek-r1 reasoning prose from the assistant turn.
+    Falls back to the stripped full reply if no code fence is present.
+    """
+    return extract_c(reply)
+
+
 def extract_c(text: str) -> str:
-    m = re.search(r"```(?:c|cpp)?\n(.*?)```", text, re.DOTALL)
-    return m.group(1).strip() if m else text.strip()
+    # Strip deepseek-r1 chain-of-thought reasoning blocks before searching for code.
+    # The model wraps internal reasoning in <think>...</think>; if that leaks into
+    # the reply the prose would be treated as C code, causing a compile error.
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    m = re.search(r"```(?:c|cpp)?\n(.*?)```", cleaned, re.DOTALL)
+    return m.group(1).strip() if m else cleaned
 
 
 # IR type → C type mapping for forward-declaration generation
@@ -1156,7 +1171,7 @@ the public API function that calls `{vuln_fn}`.
                 print(f"VALIDATION: FAIL — {vuln_fn} via {caller_fn} skipped "
                       f"after {MAX_RETRIES} compile errors")
                 return False
-            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "assistant", "content": _assistant_content(reply)})
             messages.append({
                 "role": "user",
                 "content": (
@@ -1176,7 +1191,7 @@ the public API function that calls `{vuln_fn}`.
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} has self-harm; generated anyway")
             else:
-                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "assistant", "content": _assistant_content(reply)})
                 messages.append({"role": "user", "content": retry_msg})
                 continue
 
@@ -1189,7 +1204,7 @@ the public API function that calls `{vuln_fn}`.
         if attempt == MAX_RETRIES:
             print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} is a blank shooter; generated anyway")
             break
-        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": _assistant_content(reply)})
         messages.append({"role": "user", "content": bs_msg})
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
@@ -1321,7 +1336,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} compile errors")
                 return False
-            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "assistant", "content": _assistant_content(reply)})
             messages.append({
                 "role": "user",
                 "content": (
@@ -1341,7 +1356,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: WARN — {fn_name} has self-harm; generated anyway")
             else:
-                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "assistant", "content": _assistant_content(reply)})
                 messages.append({"role": "user", "content": retry_msg})
                 continue
 
@@ -1355,7 +1370,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         if attempt == MAX_RETRIES:
             print(f"VALIDATION: WARN — {fn_name} is a blank shooter; generated anyway")
             break
-        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": _assistant_content(reply)})
         messages.append({"role": "user", "content": bs_msg})
 
     # For internal-linkage functions: promote linkage in target IR and
