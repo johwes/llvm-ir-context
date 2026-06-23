@@ -723,13 +723,21 @@ def build_task_block(fn_name: str, summary: dict,
     )
 
     # --- M-04: State setup and teardown (always) ---
+    _STREAMING_SINKS = frozenset({"deflate", "inflate", "deflateEnd", "inflateEnd",
+                                   "BZ2_bzCompress", "BZ2_bzDecompress",
+                                   "LZ4_compress_default", "LZ4_decompress_safe"})
+    _has_streaming = bool({s.get("fn") for s in summary.get("sinks", [])} & _STREAMING_SINKS)
+    teardown_note = (
+        " Do NOT use `deflateReset`/`inflateReset` as a substitute for "
+        "`deflateEnd`/`inflateEnd` — reset keeps internal state alive and leaks memory."
+        if _has_streaming else ""
+    )
     modules.append(
         "- Initialize any required state before the call; clean it up after. "
-        "Teardown (e.g. `deflateEnd`, `inflateEnd`, `free`) MUST be called on "
-        "every exit path including early returns — use `goto cleanup` or ensure "
-        "every `return 0` is preceded by the teardown calls. "
-        "Do NOT use `deflateReset` as a substitute for `deflateEnd` — reset "
-        "keeps internal state alive and leaks memory."
+        "Teardown functions (freeing heap buffers, closing contexts or handles) "
+        "MUST be called on every exit path including early returns — use "
+        "`goto cleanup` or ensure every `return 0` is preceded by the teardown calls."
+        + teardown_note
     )
 
     # --- M-05: Double-free / UAF — stateful precondition ---
