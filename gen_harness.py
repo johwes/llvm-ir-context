@@ -518,7 +518,13 @@ def extract_c(text: str) -> str:
     # the reply the prose would be treated as C code, causing a compile error.
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     m = re.search(r"```(?:c|cpp)?\n(.*?)```", cleaned, re.DOTALL)
-    return m.group(1).strip() if m else cleaned
+    if m:
+        return m.group(1).strip()
+    # No code fence found — return a minimal stub that produces a short, bounded
+    # compile error on the next retry rather than dumping prose into the compiler.
+    # This keeps the retry context window from overflowing on reasoning models that
+    # panic and emit their chain-of-thought as plain text instead of a code block.
+    return "/* ERROR: model reply contained no code block — retry */\nvoid _no_code_block(void);"
 
 
 # IR type → C type mapping for forward-declaration generation
