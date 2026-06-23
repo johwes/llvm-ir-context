@@ -435,25 +435,42 @@ def score_ir_dir(
             if caller not in caller_map[fn_name]:
                 caller_map[fn_name].append(caller)
 
-    # Interprocedural score propagation.
-    _PROPAGATION_WEIGHT    = 0.75
-    _PROPAGATION_THRESHOLD = 0.50
-    propagated_into: dict[str, list[tuple[str, float]]] = {}
+    # Interprocedural score propagation -- categorical signal-based floors.
+    # Priority: double_free (0.92) > use_after_free (0.88) >
+    #           unguarded call sink + function_argument (0.70) >
+    #           fractional fallback (callee_score x 0.75, threshold 0.50).
+    def _propagation_floor(summary: dict, callee_score: float):
+        if summary.get("double_free"):
+            return 0.92, "df->0.92"
+        if summary.get("use_after_free"):
+            return 0.88, "uaf->0.88"
+        sinks    = summary.get("sinks", [])
+        channels = summary.get("input_channels", [])
+        has_call_sink = any(s.get("type") == "dangerous_call" for s in sinks)
+        if (has_call_sink and "function_argument" in channels
+                and summary.get("guard_type", "none") == "none"):
+            return 0.70, "call->0.70"
+        if callee_score >= 0.50:
+            return callee_score * 0.75, f"{callee_score * 0.75:.0%}"
+        return None
+
+    propagated_into: dict[str, list] = {}
     for fn_name, summary in summaries.items():
         callee_score = rule_scores.get(fn_name, 0.0)
-        if callee_score < _PROPAGATION_THRESHOLD:
+        prop = _propagation_floor(summary, callee_score)
+        if prop is None:
             continue
+        floor, label = prop
         for caller in set(summary.get("caller_names", [])):
             if caller not in rule_scores:
                 continue
-            boost = callee_score * _PROPAGATION_WEIGHT
-            propagated_into.setdefault(caller, []).append((fn_name, boost))
+            propagated_into.setdefault(caller, []).append((floor, label, fn_name))
     for caller, sources in propagated_into.items():
-        best_boost = max(b for _, b in sources)
-        if best_boost > rule_scores[caller]:
-            rule_scores[caller] = best_boost
-        src_str = "+".join(f"{fn}({b:.0%})" for fn, b in
-                           sorted(sources, key=lambda x: -x[1]))
+        best_floor, best_label, _ = max(sources, key=lambda x: x[0])
+        if best_floor > rule_scores[caller]:
+            rule_scores[caller] = best_floor
+        src_str = "+".join(f"{fn}({lbl})" for _, lbl, fn in
+                           sorted(sources, key=lambda x: -x[0]))
         details[caller] = details.get(caller, "") + f"  [+prop:{src_str}]"
 
     # GEP-only filter.
@@ -484,6 +501,49 @@ def score_ir_dir(
 
 
 # ---------------------------------------------------------------------------
+# Call-graph reachability (P1.2)
+# ---------------------------------------------------------------------------
+
+def get_call_paths(
+    target_fn: str,
+    caller_map: dict,
+    header_fns: set | None = None,
+    max_depth: int = 10,
+) -> list:
+    """BFS backward from target_fn through caller_map.
+
+    Returns all paths [entry_point, ..., target_fn] where entry_point has
+    no callers in caller_map or is present in header_fns.
+    """
+    if target_fn not in caller_map:
+        return []
+
+    # Each queue entry: (current_node, path_so_far)
+    from collections import deque
+    queue = deque([(target_fn, [target_fn])])
+    paths = []
+    visited_paths: set = set()
+
+    while queue:
+        node, path = queue.popleft()
+        if len(path) > max_depth:
+            continue
+        callers = caller_map.get(node, [])
+        is_entry = (not callers) or (header_fns and node in header_fns)
+        if is_entry and len(path) > 1:
+            key = tuple(path)
+            if key not in visited_paths:
+                visited_paths.add(key)
+                paths.append(list(reversed(path)))
+            continue
+        for caller in callers:
+            if caller not in path:  # avoid cycles
+                queue.append((caller, path + [caller]))
+
+    return sorted(paths, key=len)
+
+
+# ---------------------------------------------------------------------------
 # Main (thin CLI wrapper around score_ir_dir)
 # ---------------------------------------------------------------------------
 
@@ -506,6 +566,9 @@ def main() -> None:
                          "Reduces false positives in codebases with heavily-indexed "
                          "data structures (e.g. compression libraries).")
     ap.add_argument("--verbose",    action="store_true")
+    ap.add_argument("--reachability-query", type=str, default=None,
+                    metavar="FN_NAME",
+                    help="Print all call paths from public API to the named function")
     args = ap.parse_args()
 
     tmpdir = None
@@ -553,6 +616,18 @@ def main() -> None:
     else:
         print(f"  No-slice: {', '.join(no_slice_rule) or 'none'}")
         print(f"{'='*65}")
+
+    if args.reachability_query:
+        target = args.reachability_query
+        caller_map = result["caller_map"]
+        paths = get_call_paths(target, caller_map)
+        print(f"\n== Reachability: paths to `{target}` ==")
+        if not paths:
+            print(f"  No call paths found (is `{target}` in the IR?)")
+        for path in paths:
+            depth = len(path) - 1
+            in_ak = " *" if answer_key and path[0] in answer_key else ""
+            print(f"  {" -> ".join(path)}  [depth {depth}]{in_ak}")
 
     if tmpdir and tmpdir.exists():
         shutil.rmtree(tmpdir, ignore_errors=True)

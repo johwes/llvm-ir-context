@@ -81,3 +81,32 @@ def rank_directory(
         )
     except Exception as exc:
         return {"error": str(exc)}
+
+def get_call_paths(
+    target_fn: str,
+    ir_dir: str,
+    *,
+    no_gep_only: bool = False,
+) -> dict:
+    """Return all call paths from public API functions down to target_fn.
+
+    Returns {"paths": [[str, ...], ...], "caller_map": {callee: [caller, ...]}}
+    where each path is [entry_point, ..., target_fn].
+    On any failure returns {"error": <message>}.
+
+    Example::
+
+        from llvm_ir_context.api import get_call_paths
+        r = get_call_paths("handle_del", "/tmp/scarnet-ir/")
+        for path in r["paths"]:
+            print(" -> ".join(path))
+    """
+    try:
+        from pathlib import Path as _Path
+        from llvm_ir_context.score_deterministic import score_ir_dir, get_call_paths as _gcp
+        result = score_ir_dir(_Path(ir_dir), no_gep_only=no_gep_only)
+        caller_map = result["caller_map"]
+        paths = _gcp(target_fn, caller_map)
+        return {"paths": paths, "caller_map": caller_map}
+    except Exception as exc:
+        return {"error": str(exc)}
