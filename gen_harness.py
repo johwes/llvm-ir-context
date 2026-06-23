@@ -925,6 +925,10 @@ def build_task_block(fn_name: str, summary: dict,
                 f"  2. TRIGGER call: create a second socketpair, write fuzz-derived bytes "
                 f"(from Data/Size) targeting the same identifier to trigger the {bug}. "
                 f"Close the write end, call `{fn_name}(sv[0])` again, close the read end.\n"
+                f"  CRITICAL: do NOT reset or zero-initialize global state between the "
+                f"SETUP and TRIGGER calls — the {bug} depends on SETUP state persisting "
+                f"into TRIGGER. Any memset/reset between the two calls makes the {bug} "
+                f"unreachable.\n"
                 f"  Do NOT encode both commands in a single write — only the first line "
                 f"is consumed per call. Do NOT reuse the same sv[] array for both calls."
             )
@@ -997,12 +1001,14 @@ def build_task_block(fn_name: str, summary: dict,
             global_note = (
                 f" The IR slicer detected these global variables in the slice: "
                 f"{gvar_list}. Declare them `extern` with types matching the "
-                f"source, and set them to zero-equivalent defaults before calling."
+                f"source, and zero-initialize them ONCE before the first call (SETUP). "
+                f"Do NOT re-initialize them between SETUP and TRIGGER calls."
             )
         else:
             global_note = (
                 " Check the source above for file-scope globals it reads and "
-                "zero-initialize them before the call."
+                "zero-initialize them ONCE before the first (SETUP) call only. "
+                "Do NOT re-initialize them between SETUP and TRIGGER calls."
             )
         modules.append(
             f"- `{fn_name}` is a static function normally called after global "
