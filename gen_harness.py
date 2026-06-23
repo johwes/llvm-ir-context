@@ -455,12 +455,32 @@ def ask_qwen(messages: list[dict]) -> str:
             r = requests.post(
                 ENDPOINT,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": MODEL, "messages": messages},
+                json={"model": MODEL, "messages": messages, "stream": True},
                 timeout=timeout,
+                stream=True,
             )
             if not r.ok:
                 sys.exit(f"API error {r.status_code}: {r.text[:500]}")
-            return r.json()["choices"][0]["message"]["content"]
+            # Consume the SSE stream and reconstruct the full content.
+            # Streaming keeps the connection alive during long reasoning phases
+            # (deepseek-r1 chain-of-thought) that would otherwise hit the timeout.
+            import json as _json
+            chunks = []
+            for raw in r.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line.strip() == "[DONE]":
+                    break
+                try:
+                    delta = _json.loads(line)["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        chunks.append(delta)
+                except Exception:
+                    pass
+            return "".join(chunks)
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as exc:
             if attempt == 3:
