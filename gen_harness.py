@@ -443,15 +443,24 @@ def ask_qwen(messages: list[dict]) -> str:
     key = os.environ.get("LLM_API_KEY") or os.environ.get("QWEN_API_KEY", "")
     if not key:
         sys.exit("Set LLM_API_KEY (or QWEN_API_KEY) env var first.")
-    r = requests.post(
-        ENDPOINT,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": MODEL, "messages": messages},
-        timeout=120,
-    )
-    if not r.ok:
-        sys.exit(f"API error {r.status_code}: {r.text[:500]}")
-    return r.json()["choices"][0]["message"]["content"]
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                ENDPOINT,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": MODEL, "messages": messages},
+                timeout=120,
+            )
+            if not r.ok:
+                sys.exit(f"API error {r.status_code}: {r.text[:500]}")
+            return r.json()["choices"][0]["message"]["content"]
+        except requests.exceptions.ConnectionError as exc:
+            if attempt == 3:
+                sys.exit(f"LLM endpoint unreachable after 3 attempts: {exc}")
+            wait = 5 * attempt
+            print(f"  [network] connection error (attempt {attempt}/3), retrying in {wait}s…",
+                  file=sys.stderr)
+            import time; time.sleep(wait)
 
 
 def extract_c(text: str) -> str:
