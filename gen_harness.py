@@ -505,7 +505,43 @@ def extract_c(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False) -> str:
+# IR type → C type mapping for forward-declaration generation
+_IR_TYPE_TO_C = {
+    "i8": "char", "i16": "short", "i32": "int", "i64": "long long",
+    "i8*": "char *", "i8**": "char **",
+    "float": "float", "double": "double",
+    "void": "void",
+}
+
+def _ir_sig_to_c_decl(ir_sig: str, fn_name: str) -> str:
+    """Convert an IR function signature to a C forward declaration.
+
+    e.g. "define internal void @handle_client(i32 noundef %0)"
+      -> "static void handle_client(int);"
+    Returns empty string if parsing fails.
+    """
+    m = re.match(r"define\s+\S+\s+(\S+)\s+@" + re.escape(fn_name) + r"\((.*)\)", ir_sig)
+    if not m:
+        return ""
+    ret_ir, params_ir = m.group(1), m.group(2)
+    ret_c = _IR_TYPE_TO_C.get(ret_ir, ret_ir)
+
+    param_parts = []
+    for param in params_ir.split(","):
+        param = param.strip()
+        if not param or param == "...":
+            param_parts.append(param or "...")
+            continue
+        # e.g. "i32 noundef %0"  ->  take first token as type
+        toks = param.split()
+        c_type = _IR_TYPE_TO_C.get(toks[0], toks[0]) if toks else "int"
+        param_parts.append(c_type)
+
+    params_c = ", ".join(param_parts) if param_parts else "void"
+    return f"static {ret_c} {fn_name}({params_c});"
+
+
+def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False, internal_fn_decl: str = "") -> str:
     """Return the canonical #include preamble for a harness.
 
     Deterministic — derived from slicer-detected sinks and the project header.
@@ -555,6 +591,8 @@ def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: 
     if header_path:
         import os as _os
         lines.append(f'#include "{_os.path.basename(header_path)}"')
+    if internal_fn_decl:
+        lines.append(internal_fn_decl)
     return "\n".join(lines)
 
 
@@ -1115,7 +1153,22 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         )
     _FD_READER_SINKS_GEN = frozenset({"fgets", "recv", "recvfrom", "read"})
     _gen_sink_fns = {s.get("fn") for s in summary_json.get("sinks", [])}
-    is_fd_reader = bool(_gen_sink_fns & _FD_READER_SINKS_GEN)
+    # Also treat fd-reader as true when the target is internal and reads via fgets/recv —
+    # the M-09 socketpair pattern is needed regardless of whether slicer captured it.
+    is_fd_reader = bool(_gen_sink_fns & _FD_READER_SINKS_GEN) or (
+        is_internal and "fgets" in ctx
+    )
+    # For internal-linkage functions build a forward decl so the harness IR
+    # compiles without the defining TU present. The harness is linked with
+    # the full src/ tree so the symbol resolves at final link time.
+    internal_fn_decl = ""
+    if is_internal and ir_sig:
+        # ir_sig is e.g. "define internal void @handle_client(i32 noundef %0)"
+        # Produce: "static void handle_client(int fd);"  using the C source sig
+        # if available, otherwise a best-effort cast from IR types.
+        c_decl = _ir_sig_to_c_decl(ir_sig, fn_name)
+        if c_decl:
+            internal_fn_decl = c_decl
     task_block   = build_task_block(fn_name, summary_json, target_header=header)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
@@ -1142,7 +1195,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader)
+        preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader, internal_fn_decl=internal_fn_decl)
         code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
