@@ -50,19 +50,7 @@ minor cleanup in existing modules
 
 ### 1. Harness IR validation (blank-shooter check)
 
-Compile harness + target to combined IR via `llvm-link`, run slicer with
-`fn_name="LLVMFuzzerTestOneInput"`. Check `"function_argument" in
-summary["input_channels"]` — if false, `Data`/`Size` never reach the sink.
-Feed failure back to the LLM with a specific error before wasting fuzzer CPU.
-
-Currently the self-harm check (step 4 in `gen_harness.py`) catches harness
-bugs but not blank-shooters. This adds the missing complementary check.
-
-See `ideas.md § Harness IR validation` for full implementation sketch.
-
-**Depends on:** P1.0 (calls slicer programmatically on combined IR)
-
-**File:** `gen_harness.py` (new `validate_harness()` function)
+*Implemented. See Completed table.*
 
 ---
 
@@ -293,7 +281,10 @@ See `ideas.md § Patch re-validation via slicer`.
 | `apply_patch.py`: strips markdown fences, `--all` flag, pure-insertion anchor fix, auto-applies all SCAR patches from `scar-results.json` | `apply_patch.py` |
 | `crash_to_findings.py`: auto-detects `llvm-symbolizer-20`, injects `ASAN_SYMBOLIZER_PATH` when re-running fuzzer binary | `crash_to_findings.py` |
 | End-to-end scarnet walkthrough: 4/4 bugs found+patched+verified on clean repo (scar_log, scar_alloc_copy, dispatch→handle_del, session_frag) | `slice-context-guide.md` |
-| **M-08** output buffer sizing module: fires on any sinks; code template with 4MB cap (`OUT_CAP_MAX`), never from fuzz bytes; `_trim_header()` trims large headers to ~6KB focused on target function | `gen_harness.py` |
+| **M-08** output buffer sizing module: fires on buffer-write sinks only (not printf/format-string); code template with 4MB cap (`OUT_CAP_MAX`), never from fuzz bytes; `_trim_header()` trims large headers to ~6KB focused on target function | `gen_harness.py` |
+| **P1.1** blank-shooter check: slice `LLVMFuzzerTestOneInput` using target fn as extra sink; fail if `function_argument` not in `input_channels`; retry with specific message; OK line shows node count + guard type | `gen_harness.py` |
+| Bug fix: `_build_include_preamble` received header file content instead of path, producing garbage `#include` line; renamed to `header_path`, threaded `args.header` through `generate_one` and `_generate_interprocedural` | `gen_harness.py` |
+| Bug fix: system prompt `#include` rule contradicted M-00; replaced with "do not write any `#include` lines — they are injected automatically" | `gen_harness.py` |
 | **M-04** teardown hardened: require `deflateEnd`/`inflateEnd`/`free` on all exit paths; prohibit `deflateReset` misuse; recommend `goto cleanup` pattern | `gen_harness.py` |
 | `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` env vars: switch model without code change | `gen_harness.py` |
 | zlib validation (deepseek-r1-distill-qwen-14b): inflate+deflate both `Done 50000 runs` clean; model follows multi-constraint prompts reliably | validated |

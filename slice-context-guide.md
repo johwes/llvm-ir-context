@@ -292,6 +292,28 @@ python gen_harness.py \
 Expected: 7 harnesses generated (`scar_log`, `session_login`,
 `scar_alloc_copy`, `scar_atoi`, `dispatch`, `parse_cmd`, `session_frag`).
 
+Each harness goes through two automatic checks after compilation:
+
+**Self-harm check** — slices `LLVMFuzzerTestOneInput` itself for dangerous
+sinks. A high score means the harness has a memory bug in the test scaffolding
+(not the target), which would produce ASAN crashes that mask real bugs. Score
+≥ 0.85 triggers a retry with a specific error message.
+
+**Blank-shooter check** — slices backward from the call to the target function
+inside `LLVMFuzzerTestOneInput`, treating the target as a custom sink. Fails
+if `Data`/`Size` never reach that call — i.e. the harness calls the target
+with hardcoded or locally-computed values the fuzzer cannot influence. The OK
+line shows the slice node count and guard type so you can verify the check ran:
+
+```
+── blank-shooter check ──────────────────────────────
+OK — Data/Size reach `scar_log` (5 node(s) in slice, guard=null_check)
+```
+
+`guard=null_check` here means the slicer saw the `if (msg == NULL) return 0`
+after `malloc` — a guard on allocation failure, not on the vulnerability. This
+is expected and correct.
+
 ### 4. Compile harnesses
 
 ```bash
