@@ -491,13 +491,42 @@ def self_harm_verdict(score: float) -> str:
     return f"OK ({score:.0%}) — expected harness noise"
 
 
-def parse_top_score(output: str) -> float | None:
-    for line in output.splitlines():
-        if "LLVMFuzzerTestOneInput" in line:
-            m = re.search(r"([\d.]+)%", line)
-            if m:
-                return float(m.group(1)) / 100
-    return None
+
+def _check_self_harm(harness_ll: Path) -> tuple[str, str | None]:
+    """Run self-harm check on a compiled harness .ll file.
+
+    Returns (verdict_line, retry_message).
+    retry_message is None when the harness is clean; non-None when
+    score >= SELF_HARM_WARN and the LLM should be asked to fix it.
+    """
+    from llvm_ir_context.api import get_vulnerability_context
+
+    ir_text = harness_ll.read_text(errors="replace")
+    result  = get_vulnerability_context(ir_text, "LLVMFuzzerTestOneInput")
+
+    if "error" in result:
+        return f"Self-harm check skipped: {result['error']}", None
+
+    score      = result.get("score", 0.0)
+    verdict    = self_harm_verdict(score)
+    sink_types = result.get("sink_types") or []
+    guard_type = result.get("guard_type", "none")
+
+    if score < SELF_HARM_WARN:
+        return verdict, None
+
+    # Build a specific retry message naming the unguarded sinks
+    unguarded = [s for s in sink_types if guard_type in ("none", "null_check")]
+    sink_desc = ", ".join(f"`{s}`" for s in unguarded) if unguarded else "memory operations"
+    retry_msg = (
+        f"Your harness compiled, but the IR slicer detected a memory safety bug "
+        f"inside the harness itself (self-harm score {score:.0%}).\n\n"
+        f"The harness contains unguarded {sink_desc} in the test code — "
+        f"this will cause ASAN crashes that mask real bugs in the target function.\n\n"
+        f"Fix: ensure any buffer indexed or written using fuzz data is guarded "
+        f"by an explicit `Size` check beforehand. Output corrected C code only."
+    )
+    return verdict, retry_msg
 
 
 # ---------------------------------------------------------------------------
@@ -795,34 +824,35 @@ the public API function that calls `{vuln_fn}`.
 
         print("\n── compiling harness to IR ──────────────────────────")
         harness_ll, stderr = compile_to_ir(out_c, include_dirs)
-        if harness_ll:
-            print(f"OK → {harness_ll}")
+        if not harness_ll:
+            print("COMPILE ERROR:\n" + stderr)
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: FAIL — {vuln_fn} via {caller_fn} skipped "
+                      f"after {MAX_RETRIES} compile errors")
+                return False
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "The harness failed to compile. Fix the C code and output "
+                    "corrected C only (no explanation).\n\n"
+                    f"Compiler error:\n```\n{stderr.strip()}\n```"
+                ),
+            })
+            continue
+
+        print(f"OK → {harness_ll}")
+
+        print("\n── self-harm check ──────────────────────────────────")
+        verdict, retry_msg = _check_self_harm(harness_ll)
+        print(f"Self-harm verdict: {verdict}")
+        if retry_msg is None:
             break
-
-        print("COMPILE ERROR:\n" + stderr)
         if attempt == MAX_RETRIES:
-            print(f"VALIDATION: FAIL — {vuln_fn} via {caller_fn} skipped "
-                  f"after {MAX_RETRIES} compile errors")
-            return False
-
+            print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} has self-harm; generated anyway")
+            break
         messages.append({"role": "assistant", "content": reply})
-        messages.append({
-            "role": "user",
-            "content": (
-                "The harness failed to compile. Fix the C code and output "
-                "corrected C only (no explanation).\n\n"
-                f"Compiler error:\n```\n{stderr.strip()}\n```"
-            ),
-        })
-
-    print("\n── ir-score on harness (self-harm check) ────────────")
-    r = subprocess.run(["ir-score", "--ir-dir", str(harness_ll)],
-                       capture_output=True, text=True)
-    print(r.stdout or "(no sinks — harness is trivially clean)")
-
-    score = parse_top_score(r.stdout)
-    if score is not None:
-        print(f"Self-harm verdict: {self_harm_verdict(score)}")
+        messages.append({"role": "user", "content": retry_msg})
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")
@@ -915,34 +945,34 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 
         print("\n── compiling harness to IR ──────────────────────────")
         harness_ll, stderr = compile_to_ir(out_c, include_dirs)
-        if harness_ll:
-            print(f"OK → {harness_ll}")
+        if not harness_ll:
+            print("COMPILE ERROR:\n" + stderr)
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} compile errors")
+                return False
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "The harness failed to compile. Fix the C code and output "
+                    "corrected C only (no explanation).\n\n"
+                    f"Compiler error:\n```\n{stderr.strip()}\n```"
+                ),
+            })
+            continue
+
+        print(f"OK → {harness_ll}")
+
+        print("\n── self-harm check ──────────────────────────────────")
+        verdict, retry_msg = _check_self_harm(harness_ll)
+        print(f"Self-harm verdict: {verdict}")
+        if retry_msg is None:
             break
-
-        print("COMPILE ERROR:\n" + stderr)
         if attempt == MAX_RETRIES:
-            print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} compile errors")
-            return False
-
+            print(f"VALIDATION: WARN — {fn_name} has self-harm; generated anyway")
+            break
         messages.append({"role": "assistant", "content": reply})
-        messages.append({
-            "role": "user",
-            "content": (
-                "The harness failed to compile. Fix the C code and output "
-                "corrected C only (no explanation).\n\n"
-                f"Compiler error:\n```\n{stderr.strip()}\n```"
-            ),
-        })
-
-    # Self-harm check
-    print("\n── ir-score on harness (self-harm check) ────────────")
-    r = subprocess.run(["ir-score", "--ir-dir", str(harness_ll)],
-                       capture_output=True, text=True)
-    print(r.stdout or "(no sinks — harness is trivially clean)")
-
-    score = parse_top_score(r.stdout)
-    if score is not None:
-        print(f"Self-harm verdict: {self_harm_verdict(score)}")
+        messages.append({"role": "user", "content": retry_msg})
 
     inc = f" -I {include_dirs[0]}" if include_dirs else ""
     print(f"\nTo fuzz:")
