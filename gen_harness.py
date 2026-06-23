@@ -71,9 +71,11 @@ buffer", do not add any size cap or MAX_SIZE guard.
 point is to reach the dangerous sizes the slicer identified.
 - Use the exact function signature from the IR or API reference. Do not invent \
 parameters.
-- If an "API reference" header is provided, always `#include` it — never redefine \
-structs, typedefs, or enums that are declared in it. Redefining types that don't \
-match the compiled target causes silent layout mismatches and missed bugs.
+- Never redefine structs, typedefs, or enums that appear in the API reference — \
+redefining types that don't match the compiled target causes silent layout mismatches \
+and missed bugs.
+- Do not write any `#include` lines — they are injected automatically before the \
+harness is compiled.
 - If the target function returns a pointer, always `free()` it after the call \
 (unless the API documents that ownership is not transferred). Leaked allocations \
 hide crashes and produce misleading ASAN output.
@@ -468,11 +470,12 @@ def extract_c(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
-def _build_include_preamble(summary: dict, target_header: str = "") -> str:
+def _build_include_preamble(summary: dict, header_path: str = "") -> str:
     """Return the canonical #include preamble for a harness.
 
     Deterministic — derived from slicer-detected sinks and the project header.
     Called at write time so the model's own include choices are discarded.
+    header_path must be a filesystem path (not file content).
     """
     _SINK_HEADERS: dict[str, str] = {
         "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
@@ -508,9 +511,9 @@ def _build_include_preamble(summary: dict, target_header: str = "") -> str:
         ordered.append(hdr)
 
     lines = [f"#include {h}" for h in ordered]
-    if target_header:
+    if header_path:
         import os as _os
-        lines.append(f'#include "{_os.path.basename(target_header)}"')
+        lines.append(f'#include "{_os.path.basename(header_path)}"')
     return "\n".join(lines)
 
 
@@ -751,27 +754,31 @@ def build_task_block(fn_name: str, summary: dict,
         )
 
     # --- M-08: Output buffer sizing ---
-    # Fires when a buffer-write sink is present.  The arg_count >= 3 guard is
-    # intentionally removed: streaming APIs like deflate(z_stream*, int) have
-    # only 2 arguments but the output buffer is inside the struct — the model
-    # still needs the sizing instruction.
+    # Fires only when a buffer-write or streaming sink is present.
+    # Not for printf/format-string sinks or division/GEP-only functions.
     # Two failure modes observed in the wild:
     #   1. malloc(Size) — output of a transform can be larger than input
     #   2. avail_out = *(uint32_t*)(Data) — reads output size from fuzz bytes
     _OUTPUT_WRITE_SINKS = frozenset({
         "memcpy", "memmove", "memset", "bcopy",
+        "strcpy", "strncpy", "strcat", "strncat",
         "compress", "compress2", "uncompress",
         "deflate", "inflate", "deflateEnd", "inflateEnd",
         "BZ2_bzCompress", "BZ2_bzDecompress",
         "LZ4_compress_default", "LZ4_decompress_safe",
     })
+    _FORMAT_ONLY_SINKS = frozenset({
+        "printf", "fprintf", "sprintf", "snprintf",
+        "vsprintf", "vsnprintf", "scanf", "sscanf", "fscanf",
+        "syslog", "err", "warn",
+    })
     sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
-    # Fire when any sinks are present — not just named buffer-write calls.
-    # Streaming APIs like deflate/inflate write through z_stream struct fields
-    # (GEP sinks), not via a named memcpy, so the named-sink check silently
-    # skips them. The instruction is harmless for functions without output
-    # buffers; the cost of skipping it is a harness OOM.
-    if summary.get("n_sinks", 0) > 0:
+    # GEP-only sinks (no fn name) count as buffer-write potential for streaming APIs.
+    # But if every named sink is a format-string function, skip M-08.
+    has_buffer_write_sink = bool(sink_fns & _OUTPUT_WRITE_SINKS)
+    has_unnamed_sink = any(s.get("fn") is None for s in summary.get("sinks", []))
+    only_format_sinks = bool(sink_fns) and not (sink_fns - _FORMAT_ONLY_SINKS)
+    if (has_buffer_write_sink or has_unnamed_sink) and not only_format_sinks:
         modules.append(
             "- The function writes into a caller-supplied output buffer.\n"
             "  Size the output buffer from a compile-time expression, NEVER from\n"
@@ -838,7 +845,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                caller_ll: str, caller_fn: str,
                                header: str, include_dirs: list[str],
                                output_dir: Path, src_dir: str,
-                               save_prompt: bool = False) -> bool:
+                               save_prompt: bool = False,
+                               header_path: str = "") -> bool:
     """Build a two-section prompt: vulnerable callee context + caller entry point.
 
     The model sees where the bug is (vuln_fn) and where the harness must
@@ -917,7 +925,7 @@ the public API function that calls `{vuln_fn}`.
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        preamble = _build_include_preamble(merged_summary, target_header=header)
+        preamble = _build_include_preamble(merged_summary, header_path=header_path)
         code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
@@ -982,7 +990,8 @@ the public API function that calls `{vuln_fn}`.
 def generate_one(ll_path: str, fn_name: str, header: str,
                  include_dirs: list[str], output_dir: Path,
                  src_dir: str = "", ir_dir: str = "",
-                 save_prompt: bool = False) -> bool:
+                 save_prompt: bool = False,
+                 header_path: str = "") -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
@@ -1004,6 +1013,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 header=header, include_dirs=include_dirs,
                 output_dir=output_dir, src_dir=src_dir,
                 save_prompt=save_prompt,
+                header_path=header_path,
             )
 
     # Standard 1:1 path
@@ -1051,7 +1061,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        preamble = _build_include_preamble(summary_json, target_header=header)
+        preamble = _build_include_preamble(summary_json, header_path=header_path)
         code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
@@ -1208,11 +1218,14 @@ def main():
     output_dir   = Path(args.output_dir)
     src_dir      = args.src_dir
 
+    header_path  = args.header or ""
+
     if args.ll:
         generate_one(args.ll, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir,
                      ir_dir=str(Path(args.ll).parent),
-                     save_prompt=args.save_prompt)
+                     save_prompt=args.save_prompt,
+                     header_path=header_path)
         return
 
     # ir-dir mode
@@ -1222,7 +1235,8 @@ def main():
         if not ll_path:
             ap.error(f"--function {args.function!r} not found in any .ll file under {args.ir_dir}")
         generate_one(ll_path, args.function, header, include_dirs, output_dir,
-                     src_dir=src_dir, ir_dir=args.ir_dir, save_prompt=args.save_prompt)
+                     src_dir=src_dir, ir_dir=args.ir_dir, save_prompt=args.save_prompt,
+                     header_path=header_path)
         return
 
     print(f"── ranking functions in {args.ir_dir} ──────────────")
@@ -1239,6 +1253,7 @@ def main():
                 continue
         ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir,
                           src_dir=src_dir, ir_dir=args.ir_dir,
+                          header_path=header_path,
                           save_prompt=args.save_prompt)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
