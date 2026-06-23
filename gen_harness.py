@@ -745,11 +745,9 @@ def build_task_block(fn_name: str, summary: dict,
         bug = "double-free" if summary.get("double_free") else "use-after-free"
         modules.append(
             f"- A {bug} is detected in a callee. This bug requires a specific "
-            f"call sequence: one call creates a resource (e.g. stores a key, allocates "
-            f"a buffer, opens a handle), and a later call frees or mishandles it. "
-            f"Structure the harness as two fixed phases:\n"
-            f"  1. SETUP: make a hardcoded call that creates the resource using a fixed "
-            f"identifier (e.g. a constant key string derived from fuzz bytes, not random). "
+            f"call sequence: one call creates or acquires a resource, and a later "
+            f"call frees or mishandles it. Structure the harness as two fixed phases:\n"
+            f"  1. SETUP: make a call that creates the resource using a fixed identifier. "
             f"This call must always succeed before continuing.\n"
             f"  2. TRIGGER: make a second call that targets the same identifier/resource "
             f"to trigger the {bug}. Randomize the second call's other arguments from fuzz "
@@ -793,22 +791,11 @@ def build_task_block(fn_name: str, summary: dict,
     only_format_sinks = bool(sink_fns) and not (sink_fns - _FORMAT_ONLY_SINKS)
     if (has_buffer_write_sink or has_unnamed_sink) and not only_format_sinks:
         modules.append(
-            "- The function writes into a caller-supplied output buffer.\n"
-            "  Size the output buffer from a compile-time expression, NEVER from\n"
-            "  fuzz bytes. Use this pattern exactly:\n"
-            "  ```c\n"
-            "  #define OUT_CAP_MAX (4 * 1024 * 1024)  /* 4 MB hard cap */\n"
-            "  size_t out_cap = Size * 4 + 64;         /* output can exceed input */\n"
-            "  if (out_cap > OUT_CAP_MAX) out_cap = OUT_CAP_MAX;\n"
-            "  uint8_t *out_buf = malloc(out_cap);\n"
-            "  if (!out_buf) return 0;\n"
-            "  /* if using a z_stream / stream struct: */\n"
-            "  strm.next_out  = out_buf;\n"
-            "  strm.avail_out = (uInt)out_cap;  /* the cap, never (uint32_t)Size or Data-derived */\n"
-            "  ```\n"
-            "  `malloc(Size)` is wrong — output can be larger than input.\n"
-            "  Reading any length from `Data` as `avail_out` or malloc size is wrong.\n"
-            "  `Size * 4` with no cap is wrong — libFuzzer will grow inputs until OOM."
+            "- The function writes into an output buffer. "
+            "Size that buffer from a compile-time constant, NEVER from fuzz bytes — "
+            "`malloc(Size)` is wrong because output can exceed input. "
+            "Apply a hard cap (e.g. 4 MB) so libFuzzer cannot grow inputs until OOM. "
+            "Never derive a buffer length, capacity field, or size argument from `Data`."
         )
 
     # --- M-07: Return 0 (always last) ---
