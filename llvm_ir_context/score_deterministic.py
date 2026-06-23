@@ -364,7 +364,134 @@ def _print_table(label: str, ranked: list[tuple[str, float]],
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Core scoring engine (programmatic, no I/O)
+# ---------------------------------------------------------------------------
+
+def score_ir_dir(
+    ir_path: Path,
+    *,
+    no_gep_only: bool = False,
+    answer_key: set[str] | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Score all functions in ir_path and return structured results.
+
+    Returns dict with keys:
+      ranked       — list of (fn_name, score) sorted descending
+      summaries    — {fn_name: slice_summary_dict}
+      details      — {fn_name: detail_str}
+      fn_files     — {fn_name: Path}
+      caller_map   — {callee: [caller, ...]} cross-file call graph
+      no_slice     — list of fn_names with no extractable slice
+    """
+    import llvmlite.binding as _llvm
+
+    functions  = _collect_functions(ir_path)
+
+    # Parse all modules once for cross-file caller scanning.
+    all_modules = []
+    seen_ir: set[int] = set()
+    for _, fn_ir, _ in functions:
+        ir_id = id(fn_ir)
+        if ir_id not in seen_ir:
+            seen_ir.add(ir_id)
+            try:
+                all_modules.append(_llvm.parse_assembly(fn_ir))
+            except Exception:
+                pass
+
+    rule_scores:  dict[str, float] = {}
+    details:      dict[str, str]   = {}
+    summaries:    dict[str, dict]  = {}
+    fn_files:     dict[str, Path]  = {}
+    no_slice_fns: list[str]        = []
+
+    for fn_name, fn_ir, fn_file in functions:
+        fn_files[fn_name] = fn_file
+        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name, extra_modules=all_modules)
+        if g is None or g.get("x") is None:
+            rule_scores[fn_name] = 0.05
+            details[fn_name]     = f"no slice ({fn_file.name})"
+            no_slice_fns.append(fn_name)
+        else:
+            summary              = summarize_slice(g, fn_name=fn_name)
+            summaries[fn_name]   = summary
+            rule_scores[fn_name] = philosophy2_score(summary)
+            ns    = summary["n_sinks"]
+            hg    = summary["has_guard"]
+            gt    = summary.get("guard_type", "none")
+            ext   = "ext" if summary.get("is_external_input") else ""
+            trunc = "+trunc" if summary.get("has_trunc") else ""
+            szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
+            df    = "+df"      if summary.get("double_free")    else ""
+            uaf   = "+uaf"     if summary.get("use_after_free") else ""
+            cv    = "+caller?" if summary.get("caller_validated") else ""
+            sinks = ",".join(sorted({s.get("fn","?") for s in summary["sinks"]}))
+            details[fn_name] = (
+                f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
+                f"{ext}{trunc}{szext}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
+            )
+            if verbose:
+                print(f"  {fn_name}: {summary['natural_language']}")
+
+    # Build caller_map: callee → [callers] from summaries (for P1.2 reachability).
+    caller_map: dict[str, list[str]] = {}
+    for fn_name, summary in summaries.items():
+        for caller in summary.get("caller_names", []):
+            caller_map.setdefault(fn_name, [])
+            if caller not in caller_map[fn_name]:
+                caller_map[fn_name].append(caller)
+
+    # Interprocedural score propagation.
+    _PROPAGATION_WEIGHT    = 0.75
+    _PROPAGATION_THRESHOLD = 0.50
+    propagated_into: dict[str, list[tuple[str, float]]] = {}
+    for fn_name, summary in summaries.items():
+        callee_score = rule_scores.get(fn_name, 0.0)
+        if callee_score < _PROPAGATION_THRESHOLD:
+            continue
+        for caller in set(summary.get("caller_names", [])):
+            if caller not in rule_scores:
+                continue
+            boost = callee_score * _PROPAGATION_WEIGHT
+            propagated_into.setdefault(caller, []).append((fn_name, boost))
+    for caller, sources in propagated_into.items():
+        best_boost = max(b for _, b in sources)
+        if best_boost > rule_scores[caller]:
+            rule_scores[caller] = best_boost
+        src_str = "+".join(f"{fn}({b:.0%})" for fn, b in
+                           sorted(sources, key=lambda x: -x[1]))
+        details[caller] = details.get(caller, "") + f"  [+prop:{src_str}]"
+
+    # GEP-only filter.
+    if no_gep_only:
+        gep_only_fns = set()
+        for fn_name, summary in summaries.items():
+            sink_types = {s.get("fn") for s in summary["sinks"]}
+            has_bounds = summary.get("bounds_check_count", 0) > 0
+            if sink_types and sink_types <= {"getelementptr"} and not has_bounds:
+                gep_only_fns.add(fn_name)
+        for fn_name in gep_only_fns:
+            rule_scores[fn_name] = 0.05
+            details[fn_name]    += "  [gep-only suppressed]"
+
+    ranked = sorted(rule_scores.items(),
+                    key=lambda x: (x[1], summaries.get(x[0], {}).get("n_sinks", 0)),
+                    reverse=True)
+
+    return {
+        "ranked":     ranked,
+        "summaries":  summaries,
+        "details":    details,
+        "fn_files":   fn_files,
+        "caller_map": caller_map,
+        "no_slice":   no_slice_fns,
+        "answer_key": answer_key or set(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main (thin CLI wrapper around score_ir_dir)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -388,7 +515,6 @@ def main() -> None:
     ap.add_argument("--verbose",    action="store_true")
     args = ap.parse_args()
 
-    # --- setup IR ---
     tmpdir = None
     if args.scarnet:
         for tool in ("git", "clang-20"):
@@ -399,131 +525,37 @@ def main() -> None:
     else:
         ir_path = Path(args.ir_dir)
 
-    functions  = _collect_functions(ir_path)
     answer_key = _load_answer_key(Path(args.answer_key)) if args.answer_key else set()
-    top_k      = args.top_k or (len(answer_key) if answer_key else len(functions))
-    print(f"Functions found: {len(functions)}")
+
+    result  = score_ir_dir(ir_path, no_gep_only=args.no_gep_only,
+                           answer_key=answer_key, verbose=args.verbose)
+    ranked  = result["ranked"]
+    details = result["details"]
+    summaries = result["summaries"]
+    no_slice_rule = result["no_slice"]
+    top_k   = args.top_k or (len(answer_key) if answer_key else len(ranked))
+
+    print(f"Functions found: {len(ranked)}")
     if answer_key:
         print(f"Answer key: {len(answer_key)} known-vulnerable  (top-K = {top_k})")
     else:
-        print(f"No answer key — showing all {len(functions)} functions ranked")
+        print(f"No answer key — showing all {len(ranked)} functions ranked")
 
-    # --- parse all modules once for cross-file caller scanning ---
-    import llvmlite.binding as _llvm
-    all_modules = []
-    seen_ir: set[int] = set()
-    for _, fn_ir, _ in functions:
-        ir_id = id(fn_ir)
-        if ir_id not in seen_ir:
-            seen_ir.add(ir_id)
-            try:
-                all_modules.append(_llvm.parse_assembly(fn_ir))
-            except Exception:
-                pass
+    if result.get("gep_only_suppressed"):
+        print(f"--no-gep-only: suppressing {len(result['gep_only_suppressed'])} GEP-only function(s): "
+              + ", ".join(sorted(result["gep_only_suppressed"])))
 
-    # --- score each function ---
-    rule_scores: dict[str, float] = {}
-    details:     dict[str, str]   = {}
-    summaries:   dict[str, dict]  = {}
-    fn_files:    dict[str, Path]  = {}
-    no_slice_rule = []
+    _print_table("Philosophy 2 rule", ranked, answer_key, top_k, details)
 
-    for fn_name, fn_ir, fn_file in functions:
-        fn_files[fn_name] = fn_file
-        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name, extra_modules=all_modules)
-        if g is None or g.get("x") is None:
-            rule_scores[fn_name] = 0.05
-            details[fn_name]     = f"no slice ({fn_file.name})"
-            no_slice_rule.append(fn_name)
-        else:
-            summary              = summarize_slice(g, fn_name=fn_name)
-            summaries[fn_name]   = summary
-            rule_scores[fn_name] = philosophy2_score(summary)
-            ns    = summary["n_sinks"]
-            hg    = summary["has_guard"]
-            gt    = summary.get("guard_type", "none")
-            ext   = "ext" if summary.get("is_external_input") else ""
-            trunc = "+trunc" if summary.get("has_trunc") else ""
-            szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
-            df    = "+df"      if summary.get("double_free")    else ""
-            uaf   = "+uaf"     if summary.get("use_after_free") else ""
-            cv    = "+caller?" if summary.get("caller_validated") else ""
-            sinks = ",".join(sorted({s.get("fn","?") for s in summary["sinks"]}))
-            details[fn_name] = (
-                f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
-                f"{ext}{trunc}{szext}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
-            )
-            if args.verbose:
-                print(f"  {fn_name}: {summary['natural_language']}")
-
-    # --- P-05 interprocedural score propagation ---
-    # When a high-scoring function is not directly fuzzable (non-public internal
-    # helper), its danger should surface via its public caller. Propagate a
-    # discounted fraction of the callee score to each caller so the caller rises
-    # in the ranking and gets picked by --top-k / gen_harness.py.
-    #
-    # Weight: 0.60 — caller inherits danger but is one step removed; guards and
-    # routing logic in the caller's own body are not reflected by the callee score.
-    # Only propagate from callees scoring >= 0.75 (real vulnerability signal).
-    _PROPAGATION_WEIGHT    = 0.75   # caller inherits 75% of callee's danger score
-    _PROPAGATION_THRESHOLD = 0.50   # propagate from any callee with a real vulnerability signal
-    propagated_into: dict[str, list[tuple[str, float]]] = {}  # caller → [(callee, boost)]
-    for fn_name, summary in summaries.items():
-        callee_score = rule_scores.get(fn_name, 0.0)
-        if callee_score < _PROPAGATION_THRESHOLD:
-            continue
-        for caller in set(summary.get("caller_names", [])):  # dedup: caller_names may repeat
-            if caller not in rule_scores:
-                continue
-            boost = callee_score * _PROPAGATION_WEIGHT
-            propagated_into.setdefault(caller, []).append((fn_name, boost))
-    for caller, sources in propagated_into.items():
-        best_boost = max(b for _, b in sources)
-        if best_boost > rule_scores[caller]:
-            rule_scores[caller] = best_boost
-        # Show all contributing callees in the details column regardless
-        src_str = "+".join(f"{fn}({b:.0%})" for fn, b in
-                           sorted(sources, key=lambda x: -x[1]))
-        details[caller] = details.get(caller, "") + f"  [+prop:{src_str}]"
-
-    # --- --no-gep-only filter ---
-    # Drop functions whose only sinks are GEP (array index) instructions.
-    # These are false positives in codebases with heavily-indexed data structures
-    # where every table access becomes a GEP "sink" — the signal is too coarse.
-    if args.no_gep_only:
-        gep_only_fns = set()
-        for fn_name, summary in summaries.items():
-            sink_types = {s.get("fn") for s in summary["sinks"]}
-            # Only suppress when GEP is the only sink type AND there are no bounds checks.
-            # GEP-only + bounds_check means real array indexing with guard logic (parsing,
-            # protocol code) — suppressing that would hide genuine vulnerabilities.
-            # GEP-only + no guard / null_check = table lookup pattern → safe to suppress.
-            has_bounds = summary.get("bounds_check_count", 0) > 0
-            if sink_types and sink_types <= {"getelementptr"} and not has_bounds:
-                gep_only_fns.add(fn_name)
-        if gep_only_fns:
-            print(f"--no-gep-only: suppressing {len(gep_only_fns)} GEP-only function(s): "
-                  + ", ".join(sorted(gep_only_fns)))
-            for fn_name in gep_only_fns:
-                rule_scores[fn_name] = 0.05
-                details[fn_name]    += "  [gep-only suppressed]"
-
-    # --- build ranked list and print ---
-    rule_ranked = sorted(rule_scores.items(),
-                         key=lambda x: (x[1], summaries.get(x[0], {}).get("n_sinks", 0)),
-                         reverse=True)
-    _print_table("Philosophy 2 rule", rule_ranked, answer_key, top_k, details)
-
-    # --- summary ---
     print(f"\n{'='*65}")
     if answer_key:
         print(f"  {'Method':<30} {'Hits':>6}  {'P@K':>6}  {'R@K':>6}")
         print(f"  {'-'*30} {'------':>6}  {'------':>6}  {'------':>6}")
-        h, p, r = _p_at_k(rule_ranked, answer_key, top_k)
+        h, p, r = _p_at_k(ranked, answer_key, top_k)
         print(f"  {'Philosophy 2 rule':<30} {len(h):>3}/{len(answer_key):<2}  {p:>6.1%}  {r:>6.1%}")
         print(f"{'='*65}")
         print(f"\n  No-slice: {', '.join(no_slice_rule) or 'none'}")
-        rule_misses = sorted(answer_key - {fn for fn, _ in rule_ranked[:top_k]})
+        rule_misses = sorted(answer_key - {fn for fn, _ in ranked[:top_k]})
         print(f"  Misses:   {rule_misses}")
     else:
         print(f"  No-slice: {', '.join(no_slice_rule) or 'none'}")
