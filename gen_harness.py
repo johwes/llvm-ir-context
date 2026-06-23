@@ -995,29 +995,15 @@ def build_task_block(fn_name: str, summary: dict,
     # merged IR so globals it normally initializes start at zero/null.
     # Uses global_vars_read from the slicer so the model gets concrete names.
     if is_internal:
-        global_vars = summary.get("global_vars_read", [])
-        if global_vars:
-            gvar_list = ", ".join(f"`{g}`" for g in global_vars)
-            global_note = (
-                f" The IR slicer detected these global variables in the slice: "
-                f"{gvar_list}. Declare them `extern` with types matching the "
-                f"source, and zero-initialize them ONCE before the first call (SETUP). "
-                f"Do NOT re-initialize them between SETUP and TRIGGER calls."
-            )
-        else:
-            global_note = (
-                " Check the source above for file-scope globals it reads and "
-                "zero-initialize them ONCE before the first (SETUP) call only. "
-                "Do NOT re-initialize them between SETUP and TRIGGER calls."
-            )
         modules.append(
-            f"- `{fn_name}` is a static function normally called after global "
-            f"state is set up by `main`. In this harness `main` is suppressed "
-            f"and all globals start at zero (BSS-initialized)."
-            + global_note
-            + " IMPORTANT: do NOT declare local variables with the same names as "
-              "file-scope globals — that shadows the real global and has no effect. "
-              "Use `extern` declarations only, never local re-declarations."
+            f"- `{fn_name}` is a static function whose file-scope globals have "
+            f"internal linkage — they live inside the merged IR and are NOT "
+            f"accessible from the harness via `extern`. Do NOT declare any "
+            f"file-scope variables from the target module as `extern` in the harness "
+            f"— the linker will fail with undefined reference. Do NOT declare local "
+            f"variables with the same names either — that shadows nothing and has no "
+            f"effect. All such globals start at zero (BSS-initialized) automatically. "
+            f"Just call `{fn_name}` directly; do not attempt to initialize its globals."
         )
 
     # --- M-08: Output buffer sizing ---
