@@ -699,6 +699,29 @@ def _check_self_harm(harness_ll: Path) -> tuple[str, str | None]:
     return verdict, retry_msg
 
 
+def _bs_retry_msg(bs_msg: str, fn_name: str, is_fd_reader: bool) -> str:
+    """Override the blank-shooter retry message for fd-reader targets.
+
+    The slicer cannot trace Data through the kernel socket buffer, so the
+    generic 'pass Data directly' message causes the model to cast Data bytes
+    as a file descriptor integer — which passes the check but breaks fdopen.
+    """
+    if not is_fd_reader:
+        return bs_msg
+    return (
+        f"Validation failed: your harness is a blank shooter — "
+        f"`Data` does not reach `{fn_name}`. "
+        f"`{fn_name}` reads its input through a file descriptor, not a buffer "
+        f"argument. You MUST use the socketpair pattern from the Task block: "
+        f"call `socketpair(AF_UNIX, SOCK_STREAM, 0, sv)`, "
+        f"write `Data` and `Size` to `sv[1]`, close `sv[1]`, "
+        f"then pass `sv[0]` to `{fn_name}`. "
+        f"Do NOT cast or derive the fd argument from `Data` bytes — "
+        f"passing a random integer as a file descriptor will cause `fdopen` "
+        f"to fail immediately and the function will return without executing."
+    )
+
+
 def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
     """Check whether fuzz input (Data/Size) reaches the call to target_fn.
 
@@ -1331,6 +1354,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         if bs_ok is not None:
             print(bs_ok)
             break
+        bs_msg = _bs_retry_msg(bs_msg, fn_name, is_fd_reader)
         print(f"BLANK SHOOTER: {bs_msg}")
         if attempt == MAX_RETRIES:
             print(f"VALIDATION: WARN — {fn_name} is a blank shooter; generated anyway")
