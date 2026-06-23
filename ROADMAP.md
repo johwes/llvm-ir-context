@@ -15,34 +15,41 @@ documented in `ideas.md`.
 
 ## P1 — High value, clear implementation path
 
-### 1. Routing gate (P-02) — dispatch not fuzzed ← ACTIVE
-**Observed:** `dispatch` never appears in `--top-k` output because it has a
-low local score (routing logic only, no dangerous sinks in its own body). The
-dangerous sinks are in its callees (`handle_del` double-free, `handle_stats`
-div-by-zero). The routing gate hint exists for the credential gate (single
-strcmp) but not for the multi-literal dispatcher case.
-
-**What's missing:** When the slicer detects N ≥ 2 strcmp calls on the same
-`fuzz_fn_arg_idx`, it currently emits a credential gate hint (wrong — hardcodes
-one literal). It should instead emit a routing gate hint that names all literals
-and instructs the harness to randomize among them.
-
-**Detection (already in preprocess_slice_pdg.py):** `strcmp_guards` list with
-≥ 2 entries sharing the same `fuzz_fn_arg_idx` → routing gate.
-
-**Hint to emit:**
-```
-command router — verb must be one of: "AUTH", "SET", "GET", "DEL", "STATS",
-"FRAG"; randomize verb from this set on each call
-```
-
-**File:** `llvm_ir_context/slice_context.py` (hint emission logic)
-
-See `patterns.md § P-02` for full spec.
+Items are ordered by dependency: P1.0 unblocks P1.1, P1.3, and P1.7.
+P1.2 and P1.3 share the caller_map infrastructure and should be done together
+or in sequence.
 
 ---
 
-### 2. Harness IR validation (blank-shooter check)
+### 0. API cleanup (`api.py` + `__main__.py`)
+
+**Problem:** The core logic in `preprocess_slice_pdg.py`, `slice_context.py`,
+and `score_deterministic.py` is importable but the CLI modules mix `argparse`
+and `sys.exit` into code paths that also run during library use. Anything that
+needs to call the slicer programmatically (blank-shooter check, patch re-validation,
+call-graph reachability) has to work around this.
+
+**Fix:** Extract a clean programmatic entry point:
+
+- `llvm_ir_context/api.py` — single function `get_vulnerability_context(ir_text, fn_name) -> dict`; never prints, never calls `sys.exit`; all errors returned as `{"error": ...}` in the payload
+- `llvm_ir_context/__main__.py` — thin CLI wrapper around `api.py`; enables `python -m llvm_ir_context`
+- Strip any `sys.exit` from non-CLI code paths in existing modules
+
+**Why first:** P1.1, P1.3, and P1.7 all need to call the slicer
+programmatically from within other scripts. Doing this cleanup first means
+those items are written against a stable internal interface instead of working
+around CLI entanglements.
+
+**Bonus:** Clean `api.py` also makes unit testing straightforward — no
+`sys.argv` mocking needed.
+
+**Files:** new `llvm_ir_context/api.py`, new `llvm_ir_context/__main__.py`,
+minor cleanup in existing modules
+
+---
+
+### 1. Harness IR validation (blank-shooter check)
+
 Compile harness + target to combined IR via `llvm-link`, run slicer with
 `fn_name="LLVMFuzzerTestOneInput"`. Check `"function_argument" in
 summary["input_channels"]` — if false, `Data`/`Size` never reach the sink.
@@ -53,11 +60,42 @@ bugs but not blank-shooters. This adds the missing complementary check.
 
 See `ideas.md § Harness IR validation` for full implementation sketch.
 
+**Depends on:** P1.0 (calls slicer programmatically on combined IR)
+
 **File:** `gen_harness.py` (new `validate_harness()` function)
 
 ---
 
-### 4. Interprocedural score propagation — calibration
+### 2. Call-graph reachability query
+
+**Motivation:** Given a known-dangerous function (e.g. `dangerous_c_function`
+introduced in the RFE discussion), answer: "what are all the call paths from
+the public API surface down to this function?" This is the forward complement
+to the existing backward slice: scoring finds *what* is dangerous, reachability
+finds *from where it can be triggered* and *what harness entry point to use*.
+
+**What it is:** Transitive BFS/DFS backward through the cross-file call graph,
+starting from the target function, terminating at functions with no callers or
+at functions present in the public header.
+
+**Infrastructure:** `score_deterministic.py` already builds `_caller_map`
+internally for score propagation. This item surfaces that map as a queryable
+structure and adds the traversal. The heavy lifting is already done.
+
+**Output:** For each path from a root entry point to the target:
+```
+dispatch → handle_del → scar_store_free   [depth 2, entry in header: YES]
+session_login → scar_store_free           [depth 1, entry in header: YES]
+```
+
+**New CLI flag:** `ir-score --reachability-query dangerous_c_function --ir-dir /tmp/ir/`
+
+**Files:** `llvm_ir_context/score_deterministic.py` (expose `_caller_map`,
+add traversal), `llvm_ir_context/api.py` (add `get_call_paths()` entry point)
+
+---
+
+### 3. Interprocedural score propagation — calibration
 
 **Implemented (basic form):** When a callee scores ≥ 0.50, its score × 0.75
 is propagated to known callers. This lifts `dispatch` from rank 18 (28%) to
@@ -79,12 +117,15 @@ weights matter less — dispatch will eventually be picked when higher-ranked
 functions are exhausted. Propagation primarily ensures dispatch isn't buried
 so deep it takes dozens of iterations to reach.
 
+**Shares infrastructure with P1.2** — the same `_caller_map` used for
+reachability queries drives categorical propagation. Implement together or
+immediately after.
+
 **File:** `llvm_ir_context/score_deterministic.py`, `preprocess_slice_pdg.py`
 
 ---
 
-
-### 6. tree-sitter-c for C source extraction
+### 4. tree-sitter-c for C source extraction
 
 **Problem:** `extract_fn_source` in `gen_harness.py` uses regex + brace
 counting to extract function bodies from `.c` files. This breaks on:
@@ -106,7 +147,7 @@ fine with current regex so this is only visible on unusual C code.
 
 ---
 
-### 7. Structured-input / streaming pattern (P-08) — zlib inflate validated
+### 5. Structured-input / streaming pattern (P-08) — zlib inflate validated
 
 **Observed (zlib validation run):** `inflate` harness compiled clean, called
 `inflateInit` correctly without any hint (model read the header — generality
@@ -173,6 +214,7 @@ utility, coverage baseline storage in `.llvm-ir-context/coverage/`
 ---
 
 ### 7. Patch re-validation via slicer
+
 After an LLM generates a fix, compile the patched function to IR and diff the
 `summarize_slice` output against the original. Reject if `guard_type` is still
 `none` for the same sink; flag for human review if sink count dropped to zero
@@ -180,6 +222,8 @@ After an LLM generates a fix, compile the patched function to IR and diff the
 
 All machinery exists. Only new piece: a comparison function over two slice
 summaries and wiring into a patch validation CLI.
+
+**Depends on:** P1.0 (calls summarize_slice programmatically without CLI overhead)
 
 See `ideas.md § Patch re-validation via slicer`.
 
@@ -189,14 +233,7 @@ See `ideas.md § Patch re-validation via slicer`.
 
 ## P2 — Research / future
 
-### 6. zlib harness experiment
-Run `gen_harness.py --ir-dir /tmp/zlib-ir/ --no-gep-only --top-k 2 --header
-/usr/include/zlib.h` targeting `inflate` and `inflateBack` (+trunc, unguarded
-memcpy). Validates the trunc hint and `inflateInit` requirement against a
-well-understood library. zlib is in OSS-Fuzz so a new bug is unlikely; the
-goal is pipeline validation.
-
-### 7. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
+### 1. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
 - Lever 1: Juliet pretraining (§27) — cleaner training signal
 - Lever 2: guard direction + taint source as node features
 - Lever 3: RankNet pairwise loss (§28) — aligns training to ranking use case
@@ -207,6 +244,9 @@ goal is pipeline validation.
 
 | Item | Where |
 |---|---|
+| Item | Where |
+|---|---|
+| **P1.0** API cleanup: `api.py` (`get_vulnerability_context`, `rank_directory`), `__main__.py` (`python -m llvm_ir_context`), `score_ir_dir()` extracted from `main()`, `caller_map` exposed | `llvm_ir_context/api.py`, `llvm_ir_context/__main__.py`, `score_deterministic.py` |
 | mem2reg false negative fix (synthetic store→load bridge) | `preprocess_slice_pdg.py` |
 | zcfree false positive fix (`has_substantive_call_sink`) | `score_deterministic.py` |
 | Compile-error retry loop (multi-turn Qwen) | `gen_harness.py` |
@@ -259,3 +299,5 @@ goal is pipeline validation.
 | **M-04** teardown hardened: require `deflateEnd`/`inflateEnd`/`free` on all exit paths; prohibit `deflateReset` misuse; recommend `goto cleanup` pattern | `gen_harness.py` |
 | `LLM_ENDPOINT` / `LLM_MODEL` / `LLM_API_KEY` env vars: switch model without code change | `gen_harness.py` |
 | zlib validation (deepseek-r1-distill-qwen-14b): inflate+deflate both `Done 50000 runs` clean; model follows multi-constraint prompts reliably | validated |
+| `_extract_header_for_fn`: drop multi-line comment blocks outside struct bodies (99KB→12KB for inflate) | `gen_harness.py` |
+| P2: zlib harness experiment (inflate+deflate pipeline validation) | validated |

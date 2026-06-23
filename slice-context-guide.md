@@ -194,7 +194,7 @@ context = format_for_llm(summary, score=score)
 ### Score without the full ranker
 
 ```python
-from score_deterministic import philosophy2_score
+from llvm_ir_context.score_deterministic import philosophy2_score
 
 # summary comes from summarize_slice()
 score = philosophy2_score(summary)
