@@ -647,7 +647,14 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
     text = ll_path.read_text(errors="replace")
     # Strip 'internal' from the target function definition
     text = re.sub(
-        r'^(define\s+)internal(\s+[^@]*@' + re.escape(fn_name) + r'\s*\()',
+        r'^(define\s+)internal(\s+[^@]*@' + re.escape(fn_name) + r'\s*\(',
+        r'\1\2',
+        text, flags=re.MULTILINE,
+    )
+    # Promote internal global variables to external linkage so the harness
+    # can declare them extern and reset them each run for deterministic fuzzing.
+    text = re.sub(
+        r'^(@\w+\s*=\s*)internal(\s+global\b)',
         r'\1\2',
         text, flags=re.MULTILINE,
     )
@@ -658,7 +665,6 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
     out = ll_path.with_name(ll_path.stem + "_promoted.ll")
     out.write_text(text)
     return out
-
 
 def _llvm_link(harness_ll: Path, target_ll: Path, out: Path) -> "tuple[Path | None, str]":
     """Merge harness_ll and target_ll into a single IR module using llvm-link."""
@@ -909,28 +915,24 @@ def build_task_block(fn_name: str, summary: dict,
         callee_any  = (df_callees[0] if len(df_callees) == 1
                        else (f"one of {callee_list}" if df_callees else "the vulnerable callee"))
         if is_fd_reader:
-            # Stream processor: each call to the function reads ONE command via
-            # fgets/recv, so SETUP and TRIGGER must be separate calls with separate
-            # socketpairs. Global store state persists between calls.
+            # Stream processor with internal read loop: the function reads ALL commands
+            # until EOF in a single call. Use one socketpair, prepend a fixed SETUP
+            # command before Data, call the function once.
             callee_ctx = f" in {callee_list}" if callee_list else ""
             modules.append(
                 f"- A {bug} is detected{callee_ctx}, reached via `{fn_name}`. "
-                f"`{fn_name}` reads ONE command per call (via fgets/recv). "
-                f"Global state (the key-value store) persists between calls. "
-                f"Structure the harness as TWO separate socketpair setups and TWO calls:\n"
-                f"  1. SETUP call: create a new socketpair, write a fixed command that "
-                f"causes {callee_any} to create/acquire a resource with a known "
-                f"identifier. IMPORTANT: derive the exact SETUP command syntax from the injected source code above — do NOT guess. Read what the relevant handler expects (number of tokens, format) and construct a syntactically valid command. Use a short, fixed key (e.g. a single letter) so mutations find the matching release command faster. Close the write end, call "
-                f"`{fn_name}(sv[0])`, close the read end.\n"
-                f"  2. TRIGGER call: create a second socketpair, write fuzz-derived bytes "
-                f"(from Data/Size) targeting the same identifier to trigger the {bug}. "
-                f"Close the write end, call `{fn_name}(sv[0])` again, close the read end.\n"
-                f"  CRITICAL: do NOT reset or zero-initialize global state between the "
-                f"SETUP and TRIGGER calls — the {bug} depends on SETUP state persisting "
-                f"into TRIGGER. Any memset/reset between the two calls makes the {bug} "
-                f"unreachable.\n"
-                f"  Do NOT encode both commands in a single write — only the first line "
-                f"is consumed per call. Do NOT reuse the same sv[] array for both calls."
+                f"`{fn_name}` reads commands in a loop from a file descriptor until EOF — "
+                f"a single call processes ALL commands in the stream. "
+                f"Use ONE socketpair and ONE call. Pack the SETUP and TRIGGER into a single stream:\n"
+                f"  1. Write a fixed SETUP command that creates/acquires a resource with a "
+                f"known identifier. Derive the exact command syntax from the injected source "
+                f"code — do NOT guess the format. Use a short fixed key.\n"
+                f"  2. Immediately write `Data`/`Size` bytes after the setup command in the "
+                f"same write sequence — the fuzzer explores what follows the setup.\n"
+                f"  3. Close the write end, call `{fn_name}(sv[0])` ONCE — the read loop "
+                f"processes both the setup command and the fuzz bytes before returning at EOF.\n"
+                f"  Do NOT call `{fn_name}` twice — the {bug} is triggered within a single "
+                f"connection by the command sequence, not across connections."
             )
         elif df_callees:
             modules.append(
@@ -996,14 +998,16 @@ def build_task_block(fn_name: str, summary: dict,
     # Uses global_vars_read from the slicer so the model gets concrete names.
     if is_internal:
         modules.append(
-            f"- `{fn_name}` is a static function whose file-scope globals have "
-            f"internal linkage — they live inside the merged IR and are NOT "
-            f"accessible from the harness via `extern`. Do NOT declare any "
-            f"file-scope variables from the target module as `extern` in the harness "
-            f"— the linker will fail with undefined reference. Do NOT declare local "
-            f"variables with the same names either — that shadows nothing and has no "
-            f"effect. All such globals start at zero (BSS-initialized) automatically. "
-            f"Just call `{fn_name}` directly; do not attempt to initialize its globals."
+            f"- `{fn_name}` is a static function whose file-scope globals have been "
+            f"promoted to external linkage in the merged IR. Declare them `extern` in "
+            f"the harness with types matching the source header. "
+            f"CRITICAL: reset ALL such globals to zero at the TOP of "
+            f"`LLVMFuzzerTestOneInput` on EVERY invocation — libFuzzer runs the harness "
+            f"hundreds of thousands of times in a single process and global state bleeds "
+            f"between runs. Without a reset, state from run N corrupts run N+1, crashes "
+            f"become non-reproducible, and bounded stores fill up and block progress. "
+            f"Use `memset` and explicit zero-assignment for each global before the first "
+            f"socketpair or function call."
         )
 
     # --- M-08: Output buffer sizing ---
