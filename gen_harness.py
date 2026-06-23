@@ -695,7 +695,7 @@ def build_task_block(fn_name: str, summary: dict) -> str:
     modules.append(
         "- If `Data` is used as a string (passed to a function expecting `const char *`), "
         "null-terminate it first: copy into a heap buffer of `Size + 1` bytes and set "
-        "the last byte to `\\0`"
+        "the last byte to `\\0` — include `<stdlib.h>` and `<string.h>` for malloc/memcpy"
     )
 
     # --- M-04: State setup and teardown (always) ---
