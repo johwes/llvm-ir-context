@@ -21,9 +21,9 @@ Three files do all the work:
 
 | File | Role |
 |---|---|
-| `preprocess_slice_pdg.py` | Compile IR → PDG slice graph |
-| `slice_context.py` | Slice graph → structured vulnerability summary |
-| `score_deterministic.py` | Run both over a directory, rank by risk |
+| `llvm_ir_context/preprocess_slice_pdg.py` | Compile IR → PDG slice graph |
+| `llvm_ir_context/slice_context.py` | Slice graph → structured vulnerability summary |
+| `llvm_ir_context/score_deterministic.py` | Run both over a directory, rank by risk |
 
 ## Quick start
 
@@ -32,11 +32,11 @@ Three files do all the work:
 clang-20 -O0 -Xclang -disable-O0-optnone -fno-inline -S -emit-llvm -w src/foo.c -o /tmp/foo.ll
 
 # Score all functions in an IR directory (no answer key needed)
-python score_deterministic.py --ir-dir /tmp/ --no-gep-only
+ir-score --ir-dir /tmp/ --no-gep-only
 
 # Inspect a single file in detail
-python slice_context.py /tmp/foo.ll
-python slice_context.py /tmp/foo.ll --json
+ir-context /tmp/foo.ll
+ir-context /tmp/foo.ll --json
 ```
 
 ## Compiling to IR
@@ -56,7 +56,7 @@ for f in src/*.c; do
         -o "/tmp/ir/$(basename ${f%.c}).ll"
 done
 
-# score_deterministic.py --scarnet does this automatically for johwes/scarnet
+# ir-score --scarnet does this automatically for johwes/scarnet
 ```
 
 `-O0 -fno-inline` — required. `-w` suppresses warnings that would corrupt the
@@ -64,26 +64,21 @@ done
 
 ## Running the ranker
 
-`score_deterministic.py` compiles (or reads) IR, scores every function with
-the Philosophy 2 rule, and prints a ranked table.
+`ir-score` compiles (or reads) IR, scores every function with the Philosophy 2
+rule, and prints a ranked table.
 
 ```bash
 # Unknown codebase — no answer key
-python score_deterministic.py --ir-dir /tmp/ir/
+ir-score --ir-dir /tmp/ir/
 
 # With answer key for recall measurement
-python score_deterministic.py --ir-dir /tmp/ir/ \
-    --answer-key known-vulnerable.txt
+ir-score --ir-dir /tmp/ir/ --answer-key known-vulnerable.txt
 
 # Suppress GEP-only false positives (recommended for compression/codec libs)
-python score_deterministic.py --ir-dir /tmp/ir/ --no-gep-only
-
-# Add GNN checkpoint for MAX ensemble
-python score_deterministic.py --scarnet --answer-key key.txt \
-    --gnn-checkpoint model_slice_pdg_v8.pt
+ir-score --ir-dir /tmp/ir/ --no-gep-only
 
 # Clone and compile scarnet automatically
-python score_deterministic.py --scarnet --answer-key scarnet-answer-key.txt
+ir-score --scarnet --answer-key scarnet-answer-key.txt
 ```
 
 ### Score interpretation
@@ -122,18 +117,18 @@ top. It does not remove GEP sinks from functions that also have call sinks.
 
 ## Inspecting a single function
 
-`slice_context.py` can be run standalone on any `.ll` file. It analyses every
+`ir-context` can be run standalone on any `.ll` file. It analyses every
 non-declaration function in the file.
 
 ```bash
-python slice_context.py /tmp/parse.ll
+ir-context /tmp/parse.ll
 ```
 
 Output:
 
 ```
 ============================================================
-GNN Vulnerability Context
+Function: process_packet  |  Vulnerability Context
 Sinks           : memcpy ×3 — copies n bytes from src to dest — no overlap or bounds check
 Input channels  : function_argument
 Guard status    : NO icmp in slice — sink appears UNGUARDED
@@ -149,7 +144,7 @@ Natural language:
 For JSON output (useful when piping into another tool):
 
 ```bash
-python slice_context.py /tmp/parse.ll --json
+ir-context /tmp/parse.ll --json
 ```
 
 ## Using as a Python library
@@ -435,12 +430,12 @@ The slice context is designed to pre-compute the hard structural analysis step
 so that the LLM only has to do the easy step: write code from a specification.
 
 ```
-score_deterministic.py     →  ranked list of high-risk functions
-slice_context.format_for_llm  →  structured prompt block per function
-LLM (claude-opus-4-8)      →  fuzzing harness targeting the identified sink
+ir-score / rank_directory()        →  ranked list of high-risk functions
+slice_context.format_for_llm()     →  structured prompt block per function
+LLM (deepseek-r1-distill-qwen-14b) →  fuzzing harness targeting the identified sink
 ```
 
-The three files (`preprocess_slice_pdg.py`, `slice_context.py`,
-`score_deterministic.py`) are self-contained and have no dependency on the GNN
-training infrastructure. Copy them into SCAR and call `ir_to_graph_slice_pdg` +
-`summarize_slice` + `format_for_llm` directly from `context_gen.py`.
+The package (`llvm_ir_context`) is self-contained with no dependency on any
+GNN training infrastructure. Install it with `pip install -e .` and call
+`get_vulnerability_context()` or `rank_directory()` from `llvm_ir_context.api`
+directly from any integration script.

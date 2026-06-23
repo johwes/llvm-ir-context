@@ -607,18 +607,18 @@ def format_for_llm(summary: dict, score: float | None = None,
     Format a slice summary as a labelled block for LLM prompt injection.
 
     Example output:
-        === GNN Vulnerability Context ===
+        === Vulnerability Context ===
         Suspicion score : 73.2%  (SUSPICIOUS)
         Sinks           : memcpy (copies n bytes without bounds check)
         Input channels  : function_argument
         Guard status    : no comparison in slice — sink UNGUARDED
         Harness target  : fuzz n relative to dest buffer size; n=0, n=SIZE_MAX
         Slice           : 31 nodes, 1 sink
-        ==================================
+        ==============================
     """
     sep = "=" * width
     fn  = summary.get("fn_name", "unknown")
-    lines = [sep, f"Function: {fn}  |  GNN Vulnerability Context"]
+    lines = [sep, f"Function: {fn}  |  Vulnerability Context"]
 
     if score is not None:
         flag = "SUSPICIOUS" if score >= 0.5 else "low suspicion"

@@ -35,17 +35,10 @@ Multipliers (applied after base, only when base didn't already encode the risk):
 Guard density for the bounds_check/mixed tier uses non-free call-sink count so
 GEP noise doesn't make guarded memcpy functions appear sparse.
 
-MAX ensemble (--gnn-checkpoint):
-  Loads a trained GNN checkpoint and scores each function with it too.
-  Final score = max(rule_score, gnn_score).
-  Prints rule-only, GNN-only, and MAX ranked tables side by side in summary.
-
 Usage:
-    python score_deterministic.py --scarnet --answer-key scarnet-answer-key.txt
-    python score_deterministic.py --ir-dir /tmp/ir/
-    python score_deterministic.py --ir-dir /tmp/ir/ --no-gep-only
-    python score_deterministic.py --scarnet --answer-key ... \\
-        --gnn-checkpoint model_slice_pdg_v8.pt
+    ir-score --scarnet --answer-key scarnet-answer-key.txt
+    ir-score --ir-dir /tmp/ir/
+    ir-score --ir-dir /tmp/ir/ --no-gep-only
 """
 
 import argparse

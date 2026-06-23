@@ -55,6 +55,24 @@ ir-context function.ll --function foo --json
 ## Python API
 
 ```python
+# High-level — single function
+from llvm_ir_context import get_vulnerability_context
+
+ir_text = open("function.ll").read()
+result  = get_vulnerability_context(ir_text, fn_name="process_packet")
+print(result["score"], result["harness_hint"])
+
+# High-level — score a whole directory
+from llvm_ir_context import rank_directory
+
+result = rank_directory("/tmp/ir/", no_gep_only=True)
+for fn, score in result["ranked"][:5]:
+    print(f"{score:.1%}  {fn}")
+```
+
+Low-level API (for custom pipelines):
+
+```python
 from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
 from llvm_ir_context.slice_context import summarize_slice, format_for_llm
 from llvm_ir_context.score_deterministic import philosophy2_score
