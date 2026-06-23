@@ -811,11 +811,14 @@ def save_prompt_file(path: Path, messages: list[dict]) -> None:
 
 def build_task_block(fn_name: str, summary: dict,
                      target_header: str = "",
-                     is_internal: bool = False) -> str:
+                     is_internal: bool = False,
+                     is_fd_reader: bool = False) -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
     Each module is independent and testable in isolation.
+    is_fd_reader must be computed by the caller (generate_one uses a robust
+    fallback that catches fgets via source text when the slicer sink list misses it).
     """
     hint = summary.get("harness_hint", "")
     strcmp_guards = summary.get("strcmp_guards", [])
@@ -828,10 +831,6 @@ def build_task_block(fn_name: str, summary: dict,
         if idx is not None:
             by_param[idx].append(sg)
     routing_params = {idx for idx, gs in by_param.items() if len(gs) >= 2}
-
-    _FD_READER_SINKS = frozenset({"fgets", "recv", "recvfrom", "read"})
-    _task_sink_fns = {s.get("fn") for s in summary.get("sinks", [])}
-    is_fd_reader = bool(_task_sink_fns & _FD_READER_SINKS)
 
     modules = []
 
@@ -1123,7 +1122,12 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                        or get_context_json(vuln_ll, vuln_fn).get("double_free"),
                       "use_after_free": caller_summary.get("use_after_free")
                                         or get_context_json(vuln_ll, vuln_fn).get("use_after_free")}
-    task_block = build_task_block(caller_fn, merged_summary, target_header=header)
+    _ifd_sinks = frozenset({"fgets", "recv", "recvfrom", "read"})
+    caller_is_fd_reader = bool(
+        {s.get("fn") for s in caller_summary.get("sinks", [])} & _ifd_sinks
+    )
+    task_block = build_task_block(caller_fn, merged_summary, target_header=header,
+                                  is_fd_reader=caller_is_fd_reader)
     # Prepend the interprocedural-specific constraint
     interp_note = (
         f"- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly\n"
@@ -1303,7 +1307,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         c_decl = _ir_sig_to_c_decl(ir_sig, fn_name)
         if c_decl:
             internal_fn_decl = c_decl
-    task_block   = build_task_block(fn_name, summary_json, target_header=header, is_internal=is_internal)
+    task_block   = build_task_block(fn_name, summary_json, target_header=header,
+                                    is_internal=is_internal, is_fd_reader=is_fd_reader)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
