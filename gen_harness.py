@@ -619,6 +619,41 @@ def compile_to_ir(src: Path, include_dirs: list[str] | None = None) -> tuple[Pat
     return (out, "") if r.returncode == 0 else (None, r.stderr)
 
 
+def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
+    """Return a modified copy of ll_path with fn_name promoted to external
+    linkage and @main renamed to avoid collision with libFuzzer's main."""
+    text = ll_path.read_text(errors="replace")
+    # Strip 'internal' from the target function definition
+    text = re.sub(
+        r'^(define\s+)internal(\s+[^@]*@' + re.escape(fn_name) + r'\s*\()',
+        r'\1\2',
+        text, flags=re.MULTILINE,
+    )
+    # Rename target @main so it does not clash with libFuzzer's main
+    text = re.sub(
+        r'^(define[^@]*)@main',
+        r'\1@__scar_disabled_main',
+        text, flags=re.MULTILINE,
+    )
+    out = ll_path.with_name(ll_path.stem + "_promoted.ll")
+    out.write_text(text)
+    return out
+
+
+def _llvm_link(harness_ll: Path, target_ll: Path, out: Path) -> "tuple[Path | None, str]":
+    """Merge harness_ll and target_ll into a single IR module using llvm-link."""
+    for linker in ("llvm-link-20", "llvm-link"):
+        if shutil.which(linker):
+            break
+    else:
+        return None, "llvm-link not found (install llvm-20)"
+    r = subprocess.run(
+        [linker, str(harness_ll), str(target_ll), "-S", "-o", str(out)],
+        capture_output=True, text=True,
+    )
+    return (out, "") if r.returncode == 0 else (None, r.stderr)
+
+
 def self_harm_verdict(score: float) -> str:
     if score >= SELF_HARM_WARN:
         return f"WARNING ({score:.0%}) — likely real bug in harness; review before fuzzing"
@@ -732,7 +767,8 @@ def save_prompt_file(path: Path, messages: list[dict]) -> None:
 # content. The slicer output is the condition; the module is the instruction.
 
 def build_task_block(fn_name: str, summary: dict,
-                     target_header: str = "") -> str:
+                     target_header: str = "",
+                     is_internal: bool = False) -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
@@ -866,6 +902,19 @@ def build_task_block(fn_name: str, summary: dict,
             f"and the target's read loop terminates naturally.\n"
             f"  Use `socketpair` (bidirectional) rather than `pipe` when the target "
             f"opens the fd twice (e.g. `fdopen(fd, \"r\")` + `fdopen(dup(fd), \"w\")`)."
+        )
+
+    # --- M-10: Global init state warning for internal-linkage functions ---
+    # Fires when the target is define internal: main() is suppressed in the
+    # merged IR so globals it normally initializes start at zero/null.
+    if is_internal:
+        modules.append(
+            f"- `{fn_name}` is a static function normally called after global "
+            f"state is set up by `main`. In this harness `main` is suppressed. "
+            f"Before calling `{fn_name}`, zero-initialize or fuzz-initialize any "
+            f"global variables it reads (check the source above). If globals are "
+            f"declared in the same file, declare them `extern` and set them to "
+            f"safe defaults at the top of `LLVMFuzzerTestOneInput`."
         )
 
     # --- M-08: Output buffer sizing ---
@@ -1169,7 +1218,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         c_decl = _ir_sig_to_c_decl(ir_sig, fn_name)
         if c_decl:
             internal_fn_decl = c_decl
-    task_block   = build_task_block(fn_name, summary_json, target_header=header)
+    task_block   = build_task_block(fn_name, summary_json, target_header=header, is_internal=is_internal)
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
@@ -1244,10 +1293,29 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": bs_msg})
 
-    inc = f" -I {include_dirs[0]}" if include_dirs else ""
-    print(f"\nTo fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
-    print(f"  ./fuzzer_{fn_name}")
+    # For internal-linkage functions: promote linkage in target IR and
+    # merge with harness IR via llvm-link so the static symbol resolves.
+    if is_internal and harness_ll:
+        print("\n── IR link (internal linkage promotion) ─────────────")
+        promoted_ll = _promote_linkage_in_ir(Path(ll_path), fn_name)
+        merged_ll   = output_dir / f"harness_{fn_name}_merged.ll"
+        merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll)
+        if merged:
+            print(f"OK → {merged}")
+            print(f"\nTo fuzz (IR-linked — no source files needed):")
+            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} -o fuzzer_{fn_name}")
+            print(f"  ./fuzzer_{fn_name}")
+        else:
+            print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
+            inc = f" -I {include_dirs[0]}" if include_dirs else ""
+            print(f"\nTo fuzz (fallback — compile with source):")
+            print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
+            print(f"  ./fuzzer_{fn_name}")
+    else:
+        inc = f" -I {include_dirs[0]}" if include_dirs else ""
+        print(f"\nTo fuzz:")
+        print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
+        print(f"  ./fuzzer_{fn_name}")
     return True
 
 

@@ -172,6 +172,40 @@ See `ideas.md § Patch re-validation via slicer`.
 
 ---
 
+### 8. IR-level linking for internal-linkage functions
+
+**Problem:** `static` C functions cannot be called from a separately-compiled
+harness `.c` file — the C linker enforces visibility, and `llvm-link` respects
+it too (`define internal` symbols are not exported). Current pipeline skips them
+or produces link errors. This leaves attack surface unfuzzed when the only
+path to the bug is through a static function.
+
+**Fix:** Treat the target IR as malleable rather than read-only:
+1. **Linkage promotion** — before linking, rewrite `define internal ... @fn` to
+   `define ... @fn` in the target `.ll` file (regex over IR text, trivial).
+2. **`@main` suppression** — rename the target module's `@main` to
+   `@__scar_disabled_main` so it does not collide with libFuzzer's `main`.
+3. **`llvm-link`** — merge `harness.ll` (compiled from the generated C) with the
+   promoted target `.ll` into a single IR module. Compile the merged module
+   directly to the fuzzer binary — no source files or header paths needed.
+4. **M-10 prompt module** — warns the model that `main` is suppressed and asks
+   it to zero-initialize any global variables the target function reads.
+
+**Alignment with the field:** FuzzGen (USENIX 2020) and OSS-Fuzz-Gen both work
+from LTO bitcode and never try to externalize static symbols at the source level.
+Working at the IR level is the standard approach for automated fuzzer generation.
+
+**Three engineering hurdles (all addressed):**
+- Linkage promotion: regex rewrite in IR text — implemented
+- `@main` collision: rename in promoted IR — implemented
+- Global init state: M-10 module warns model to initialize globals; zero-BSS
+  is valid initial state for many server functions
+
+**File:** `gen_harness.py` (`_promote_linkage_in_ir`, `_llvm_link`,
+IR-link path in `generate_one`, M-10 module in `build_task_block`)
+
+---
+
 ## P2 — Research / future
 
 ### 1. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
