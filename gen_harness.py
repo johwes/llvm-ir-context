@@ -468,6 +468,60 @@ def extract_c(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
+def _build_include_preamble(summary: dict, target_header: str = "") -> str:
+    """Return the canonical #include preamble for a harness.
+
+    Deterministic — derived from slicer-detected sinks and the project header.
+    Called at write time so the model's own include choices are discarded.
+    """
+    _SINK_HEADERS: dict[str, str] = {
+        "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
+        "memcmp": "<string.h>", "bcopy": "<string.h>",
+        "strcpy": "<string.h>", "strncpy": "<string.h>",
+        "strcat": "<string.h>", "strncat": "<string.h>",
+        "strlen": "<string.h>", "strcmp": "<string.h>", "strncmp": "<string.h>",
+        "malloc": "<stdlib.h>", "calloc": "<stdlib.h>",
+        "realloc": "<stdlib.h>", "free": "<stdlib.h>",
+        "xmalloc": "<stdlib.h>", "xrealloc": "<stdlib.h>",
+        "atoi": "<stdlib.h>", "atol": "<stdlib.h>", "atoll": "<stdlib.h>",
+        "strtol": "<stdlib.h>", "strtoul": "<stdlib.h>",
+        "strtoll": "<stdlib.h>", "strtoull": "<stdlib.h>",
+        "printf": "<stdio.h>", "fprintf": "<stdio.h>",
+        "sprintf": "<stdio.h>", "snprintf": "<stdio.h>",
+        "vsprintf": "<stdio.h>", "vsnprintf": "<stdio.h>",
+        "scanf": "<stdio.h>", "sscanf": "<stdio.h>", "fscanf": "<stdio.h>",
+        "gets": "<stdio.h>", "fgets": "<stdio.h>",
+        "read": "<unistd.h>", "pread": "<unistd.h>",
+        "recv": "<sys/socket.h>", "recvfrom": "<sys/socket.h>",
+    }
+    # M-03 always instructs malloc+memcpy for null-termination — always include
+    system_headers: set[str] = {"<stdint.h>", "<stddef.h>", "<stdlib.h>", "<string.h>"}
+    sink_fn_names = {s.get("fn", "") for s in summary.get("sinks", [])}
+    for fn in sink_fn_names:
+        hdr = _SINK_HEADERS.get(fn)
+        if hdr:
+            system_headers.add(hdr)
+
+    # Stable order: stdint/stddef first, then alphabetical, then project header
+    ordered = ["<stdint.h>", "<stddef.h>"]
+    for hdr in sorted(system_headers - {"<stdint.h>", "<stddef.h>"}):
+        ordered.append(hdr)
+
+    lines = [f"#include {h}" for h in ordered]
+    if target_header:
+        import os as _os
+        lines.append(f'#include "{_os.path.basename(target_header)}"')
+    return "\n".join(lines)
+
+
+def _apply_preamble(code: str, preamble: str) -> str:
+    """Strip all #include lines from model output and prepend the canonical preamble."""
+    body_lines = [l for l in code.splitlines()
+                  if not l.strip().startswith("#include")]
+    body = "\n".join(body_lines).strip()
+    return preamble + "\n\n" + body
+
+
 # ---------------------------------------------------------------------------
 # Compilation + validation
 # ---------------------------------------------------------------------------
@@ -611,55 +665,10 @@ def build_task_block(fn_name: str, summary: dict,
 
     modules = []
 
-    # --- M-00: Required headers ---
-    # <stdint.h> and <stddef.h> are always required for the LLVMFuzzerTestOneInput
-    # signature (uint8_t, size_t). Sink-specific headers are added when detected.
-    # The project header (if provided) is always required for the target function.
-    _SINK_HEADERS: dict[str, str] = {
-        # <string.h>
-        "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
-        "memcmp": "<string.h>", "bcopy": "<string.h>",
-        "strcpy": "<string.h>", "strncpy": "<string.h>",
-        "strcat": "<string.h>", "strncat": "<string.h>",
-        "strlen": "<string.h>", "strcmp": "<string.h>", "strncmp": "<string.h>",
-        # <stdlib.h>
-        "malloc": "<stdlib.h>", "calloc": "<stdlib.h>",
-        "realloc": "<stdlib.h>", "free": "<stdlib.h>",
-        "xmalloc": "<stdlib.h>", "xrealloc": "<stdlib.h>",
-        "atoi": "<stdlib.h>", "atol": "<stdlib.h>", "atoll": "<stdlib.h>",
-        "strtol": "<stdlib.h>", "strtoul": "<stdlib.h>",
-        "strtoll": "<stdlib.h>", "strtoull": "<stdlib.h>",
-        # <stdio.h>
-        "printf": "<stdio.h>", "fprintf": "<stdio.h>",
-        "sprintf": "<stdio.h>", "snprintf": "<stdio.h>",
-        "vsprintf": "<stdio.h>", "vsnprintf": "<stdio.h>",
-        "scanf": "<stdio.h>", "sscanf": "<stdio.h>", "fscanf": "<stdio.h>",
-        "gets": "<stdio.h>", "fgets": "<stdio.h>",
-        # <unistd.h>
-        "read": "<unistd.h>", "pread": "<unistd.h>",
-        # <sys/socket.h>
-        "recv": "<sys/socket.h>", "recvfrom": "<sys/socket.h>",
-    }
-    sink_fn_names = {s.get("fn", "") for s in summary.get("sinks", [])}
-    required_headers: dict[str, set[str]] = {}
-    for fn in sink_fn_names:
-        hdr = _SINK_HEADERS.get(fn)
-        if hdr:
-            required_headers.setdefault(hdr, set()).add(fn)
-
-    import os as _os
-    include_lines = ["#include <stdint.h>", "#include <stddef.h>"]
-    for hdr in sorted(required_headers.keys()):
-        include_lines.append(f"#include {hdr}")
-    if target_header:
-        include_lines.append(f'#include "{_os.path.basename(target_header)}"')
-
-    modules.append(
-        f"- The harness MUST open with exactly these includes — copy them verbatim:\n"
-        f"  ```c\n"
-        + "\n".join(f"  {l}" for l in include_lines) +
-        f"\n  ```"
-    )
+    # --- M-00: Includes are injected programmatically at write time ---
+    # _build_include_preamble() strips model-written includes and prepends the
+    # canonical set derived from slicer-detected sinks + project header.
+    modules.append("- Do not write any #include lines — they will be added automatically")
 
     # --- M-01: Base requirements (always present) ---
     modules.append(
@@ -908,7 +917,8 @@ the public API function that calls `{vuln_fn}`.
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        code  = extract_c(reply)
+        preamble = _build_include_preamble(merged_summary, target_header=header)
+        code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
@@ -1041,7 +1051,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        code  = extract_c(reply)
+        preamble = _build_include_preamble(summary_json, target_header=header)
+        code  = _apply_preamble(extract_c(reply), preamble)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
