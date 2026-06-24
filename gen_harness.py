@@ -503,12 +503,13 @@ def ask_qwen(messages: list[dict]) -> str:
 
 
 def _inject_sigpipe_ignore(c_text: str) -> str:
-    """Inject signal(SIGPIPE, SIG_IGN) as first statement of LLVMFuzzerTestOneInput.
-    Idempotent. Required for fd-reader harnesses — if the target writes back on its
-    fd after the write-end is closed, the OS sends SIGPIPE which kills the fuzzer
-    silently (libFuzzer does not catch SIGPIPE as a crash)."""
-    if "signal(SIGPIPE" in c_text:
-        return c_text
+    """Ensure signal(SIGPIPE, SIG_IGN) and #include <signal.h> are present.
+    Idempotent. Handles two cases independently:
+    - Model forgot the include but wrote the call (compile error)
+    - Model forgot both (inject both)
+    Required for fd-reader harnesses — target may write back on fd after
+    write-end is closed, triggering SIGPIPE which kills the fuzzer silently."""
+    # Always ensure signal.h is included — model may write the call without the include
     if "<signal.h>" not in c_text:
         c_text = c_text.replace(
             "#include <unistd.h>",
@@ -517,12 +518,14 @@ def _inject_sigpipe_ignore(c_text: str) -> str:
         )
         if "<signal.h>" not in c_text:
             c_text = "#include <signal.h>\n" + c_text
-    c_text = re.sub(
-        r'(LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{)',
-        r'\1\n    signal(SIGPIPE, SIG_IGN);',
-        c_text,
-        count=1,
-    )
+    # Inject the call only if not already present
+    if "signal(SIGPIPE" not in c_text:
+        c_text = re.sub(
+            r'(LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{)',
+            r'\1\n    signal(SIGPIPE, SIG_IGN);',
+            c_text,
+            count=1,
+        )
     return c_text
 
 def _assistant_content(reply: str) -> str:
