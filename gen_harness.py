@@ -1464,6 +1464,7 @@ the public API function that calls `{vuln_fn}`.
         verdict, retry_msg = _check_self_harm(harness_ll)
         print(f"Self-harm verdict: {verdict}")
         if retry_msg is not None:
+            print(f"Self-harm retry message:\n{retry_msg}")
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: WARN — {vuln_fn} via {caller_fn} has self-harm; generated anyway")
             else:
@@ -1669,6 +1670,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         verdict, retry_msg = _check_self_harm(harness_ll)
         print(f"Self-harm verdict: {verdict}")
         if retry_msg is not None:
+            print(f"Self-harm retry message:\n{retry_msg}")
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: WARN — {fn_name} has self-harm; generated anyway")
             else:
