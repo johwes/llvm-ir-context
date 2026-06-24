@@ -535,8 +535,10 @@ def _extract_global_decls(ll_text: str, names: set) -> list:
     Only returns globals whose names appear in `names`. Uses the original
     (pre-promotion) IR — promotion only changes linkage keywords, not types.
     """
-    if not names:
-        return []
+    # names=None means "extract all module globals" (filter compiler-generated ones).
+    # names=set() (empty) means "no filter specified" and we also extract all.
+    # Only skip when names is an explicit non-empty set that doesn't match.
+    extract_all = not names  # None or empty set → grab everything
     _scalar_map = {
         "i8": "char", "i16": "short", "i32": "int", "i64": "long long",
         "float": "float", "double": "double",
@@ -550,7 +552,13 @@ def _extract_global_decls(ll_text: str, names: set) -> list:
         if not m:
             continue
         gname = m.group(2)
-        if gname not in names:
+        if extract_all:
+            # Skip compiler-generated globals that aren't user-declared variables.
+            # .str / .str.N — string literals; __func__ / __PRETTY_FUNCTION__ — debug strings;
+            # anything starting with '.' — LLVM internal naming convention for constants.
+            if gname.startswith('.') or gname.startswith('__') or gname.startswith('llvm.'):
+                continue
+        elif gname not in names:
             continue
         # Extract just the type token from "TYPE INITIALIZER [, align N]".
         # Arrays look like "[N x TYPE] zeroinitializer" — balance brackets first.
@@ -1460,10 +1468,15 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     # inject correct extern decls and resets without relying on the model.
     if is_internal:
         _ll_text = Path(ll_path).read_text(errors="replace")
-        _slice_globals = set(summary_json.get("global_vars_read", []))
+        _gvr = summary_json.get("global_vars_read")
+        # When the slicer field is absent or None, globals are accessed via callees
+        # (intra-procedural slicer can't see them). Fall back to all module globals,
+        # filtering out compiler-generated names (.str, __func__, llvm.*).
+        _slice_globals = set(_gvr) if _gvr else None
         _global_decls = _extract_global_decls(_ll_text, _slice_globals)
         if _global_decls:
-            print(f"  globals extracted from IR: " +
+            src_label = "slicer" if _gvr else "all module globals (slicer field absent)"
+            print(f"  globals extracted from IR ({src_label}): " +
                   ", ".join(d['name'] for d in _global_decls))
     else:
         _global_decls = []
