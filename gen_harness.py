@@ -528,6 +528,111 @@ def _inject_sigpipe_ignore(c_text: str) -> str:
         )
     return c_text
 
+def _extract_global_decls(ll_text: str, names: set) -> list:
+    """Extract global variable declarations from LLVM IR and convert to C.
+
+    Returns a list of dicts: name, ir_type, c_extern, c_reset.
+    Only returns globals whose names appear in `names`. Uses the original
+    (pre-promotion) IR — promotion only changes linkage keywords, not types.
+    """
+    if not names:
+        return []
+    _scalar_map = {
+        "i8": "char", "i16": "short", "i32": "int", "i64": "long long",
+        "float": "float", "double": "double",
+    }
+    results = []
+    for line in ll_text.splitlines():
+        m = re.match(
+            r'^(@(\w+))\s*=\s*(?:internal\s+)?global\s+(.+)',
+            line.strip(),
+        )
+        if not m:
+            continue
+        gname = m.group(2)
+        if gname not in names:
+            continue
+        # Extract just the type token from "TYPE INITIALIZER [, align N]".
+        # Arrays look like "[N x TYPE] zeroinitializer" — balance brackets first.
+        rest = m.group(3).strip()
+        if rest.startswith('['):
+            close = rest.index(']')
+            ir_type = rest[:close + 1].strip()
+        elif rest.startswith('%'):
+            ir_type = rest.split()[0]
+        else:
+            ir_type = rest.split()[0]
+
+        arr = re.match(r'\[(\d+)\s+x\s+(.+)\]', ir_type)
+        if arr:
+            n, elem = arr.group(1), arr.group(2).strip()
+            c_type = elem[len('%struct.'):] if elem.startswith('%struct.') else _scalar_map.get(elem, elem)
+            results.append(dict(name=gname, ir_type=ir_type,
+                                c_extern=f"extern {c_type} {gname}[{n}];",
+                                c_reset=f"memset({gname}, 0, sizeof({gname}));"))
+            continue
+
+        if ir_type.startswith('%struct.'):
+            c_type = ir_type[len('%struct.'):]
+            results.append(dict(name=gname, ir_type=ir_type,
+                                c_extern=f"extern {c_type} {gname};",
+                                c_reset=f"memset(&{gname}, 0, sizeof({gname}));"))
+            continue
+
+        if ir_type in _scalar_map:
+            c_type = _scalar_map[ir_type]
+            results.append(dict(name=gname, ir_type=ir_type,
+                                c_extern=f"extern {c_type} {gname};",
+                                c_reset=f"{gname} = 0;"))
+            continue
+
+        print(f"WARN: unknown IR type '{ir_type}' for global {gname}, skipping extern injection")
+
+    return results
+
+
+def _inject_global_externs_and_reset(c_text: str, global_decls: list) -> str:
+    """Strip model-written extern lines and inject correct ones from IR types.
+
+    Idempotent: strips before re-injecting so retries don't double-inject.
+    """
+    if not global_decls:
+        return c_text
+
+    # Step 1: strip ALL model-written extern lines
+    c_text = re.sub(r'^\s*extern\s+[^\n]+;\n', '', c_text, flags=re.MULTILINE)
+
+    # Step 2: inject extern declarations after the last #include line
+    extern_block = "\n".join(d["c_extern"] for d in global_decls)
+    lines = c_text.splitlines()
+    last_include_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith('#include'):
+            last_include_idx = i
+    if last_include_idx is not None:
+        lines.insert(last_include_idx + 1, extern_block)
+        c_text = "\n".join(lines)
+    else:
+        c_text = extern_block + "\n" + c_text
+
+    # Step 3: inject reset calls at function entry
+    reset_block = "\n    ".join(d["c_reset"] for d in global_decls)
+    if "signal(SIGPIPE" in c_text:
+        c_text = c_text.replace(
+            "signal(SIGPIPE, SIG_IGN);",
+            "signal(SIGPIPE, SIG_IGN);\n    " + reset_block,
+            1,
+        )
+    else:
+        c_text = re.sub(
+            r'(LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{)',
+            r'\1\n    ' + reset_block.replace('\\', '\\\\'),
+            c_text,
+            count=1,
+        )
+    return c_text
+
+
 def _assistant_content(reply: str) -> str:
     """Extract just the code block from a reply for use in multi-turn context.
 
@@ -1032,33 +1137,14 @@ def build_task_block(fn_name: str, summary: dict,
     # merged IR so globals it normally initializes start at zero/null.
     # Uses global_vars_read from the slicer so the model gets concrete names.
     if is_internal:
-        global_vars = summary.get("global_vars_read", [])
-        if global_vars:
-            gvar_list = ", ".join(f"`{g}`" for g in global_vars)
-            gvar_detail = (
-                f" The IR slicer identified these file-scope globals in the slice: "
-                f"{gvar_list}. Declare ONLY these names as `extern` — do NOT invent "
-                f"names or add a prefix (e.g. `g_`). Copy the exact names and types "
-                f"from the source header."
-            )
-        else:
-            gvar_detail = (
-                " Find file-scope global variable names by reading the injected source "
-                "above — use the EXACT names as declared in the source, do NOT invent "
-                "names or add prefixes."
-            )
         modules.append(
-            f"- `{fn_name}` is a static function whose file-scope globals have been "
-            f"promoted to external linkage in the merged IR. Declare them `extern` in "
-            f"the harness with types matching the source header."
-            + gvar_detail +
-            f" Do NOT use `static` local variables — `static` inside a function creates a new "f"independent variable, not a reference to the file-scope global. "f" CRITICAL: reset ALL such globals to zero at the TOP of "
-            f"`LLVMFuzzerTestOneInput` on EVERY invocation — libFuzzer runs the harness "
-            f"hundreds of thousands of times in a single process and global state bleeds "
-            f"between runs. Without a reset, state from run N corrupts run N+1, crashes "
-            f"become non-reproducible, and bounded stores fill up and block progress. "
-            f"Use `memset` and explicit zero-assignment for each global before the first "
-            f"socketpair or function call."
+            f"- `{fn_name}` is a static function. Its file-scope globals have been "
+            f"promoted to external linkage in the merged IR, and `@main` has been "
+            f"renamed so it does not collide with libFuzzer's `main`. "
+            f"The build pipeline automatically injects the correct `extern` declarations "
+            f"and per-run zero resets for all globals — do NOT write any `extern` "
+            f"declarations or global reset calls in your harness. "
+            f"Do NOT use `static` local variables to shadow file-scope globals."
         )
 
     # --- M-08: Output buffer sizing ---
@@ -1227,6 +1313,8 @@ the public API function that calls `{vuln_fn}`.
         code  = _apply_preamble(extract_c(reply), preamble)
         if is_fd_reader:
             code = _inject_sigpipe_ignore(code)
+        if _global_decls:
+            code = _inject_global_externs_and_reset(code, _global_decls)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
@@ -1367,6 +1455,18 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             internal_fn_decl = c_decl
     task_block   = build_task_block(fn_name, summary_json, target_header=header,
                                     is_internal=is_internal, is_fd_reader=is_fd_reader)
+
+    # Extract global declarations from the original IR so the pipeline can
+    # inject correct extern decls and resets without relying on the model.
+    if is_internal:
+        _ll_text = Path(ll_path).read_text(errors="replace")
+        _slice_globals = set(summary_json.get("global_vars_read", []))
+        _global_decls = _extract_global_decls(_ll_text, _slice_globals)
+        if _global_decls:
+            print(f"  globals extracted from IR: " +
+                  ", ".join(d['name'] for d in _global_decls))
+    else:
+        _global_decls = []
 
     initial_prompt = f"""Write a libFuzzer harness in C for security testing.
 
