@@ -1291,6 +1291,11 @@ def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
             # application logic, and should never be injected as callee source.
             if "LLVMFuzzerTestOneInput" in src_text:
                 continue
+            # Skip the file that defines fn_name — its content is already
+            # injected as the target source block. Only cross-file callees
+            # add new context; same-file callees are redundant and waste budget.
+            if extract_fn_source(src_text, fn_name):
+                continue
             body = extract_fn_source(src_text, callee)
             if not body:
                 continue
