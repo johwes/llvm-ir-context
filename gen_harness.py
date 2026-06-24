@@ -1492,10 +1492,28 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
+        extracted = extract_c(reply)
+        # Sentinel stub means model returned no fenced code block — retry directly.
+        if "/* ERROR: model reply contained no code block" in extracted:
+            print("NO CODE BLOCK — model reply had no fenced code; retrying")
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} empty replies")
+                return False
+            messages.append({"role": "assistant", "content": reply[:500]})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your reply contained no C code block. "
+                    "Output ONLY a fenced C code block (```c ... ```) with the complete harness."
+                ),
+            })
+            continue
         preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader, internal_fn_decl=internal_fn_decl)
-        code  = _apply_preamble(extract_c(reply), preamble)
+        code  = _apply_preamble(extracted, preamble)
         if is_fd_reader:
             code = _inject_sigpipe_ignore(code)
+        if _global_decls:
+            code = _inject_global_externs_and_reset(code, _global_decls)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
