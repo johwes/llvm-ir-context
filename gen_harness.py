@@ -994,6 +994,11 @@ def build_task_block(fn_name: str, summary: dict,
         f"and call them"
     )
 
+    # Hoist df/uaf callee sets so M-02 can suppress itself when M-05 owns sequencing.
+    _df_callees = sorted(summary.get("df_callees") or [])
+    _uaf_callees = sorted(summary.get("uaf_callees") or [])
+    _has_specific_vuln_callees = bool(_df_callees or _uaf_callees)
+
     # --- M-02: Input passing — mutually exclusive modules ---
     if "split-input" in hint:
         # P-03: (ptr, len) split-input pattern
@@ -1002,11 +1007,11 @@ def build_task_block(fn_name: str, summary: dict,
             "derive the source buffer and the length from different regions of Data "
             "so they can diverge; do not call the function with matching (Data, Size)"
         )
-    elif routing_params:
-        # P-02: stateful command router — multi-call sequence required
-        # Structural signal: same argument routes to N different handlers.
-        # Each handler may depend on state established by a prior call.
-        # Generic instruction: make multiple calls in sequence to exercise all paths.
+    elif routing_params and not _has_specific_vuln_callees:
+        # P-02: stateful command router — multi-call sequence required.
+        # Suppressed when M-05 fires with specific callees: M-05 fully owns the
+        # call sequencing in that case and M-02's "randomize verb" instruction
+        # would directly contradict M-05's hardcoded-verb-per-phase rule.
         modules.append(
             f"- The function is a command router: the same argument selects different "
             f"handlers on each call. Make multiple calls in sequence (2–4 calls) — "
@@ -1050,7 +1055,7 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-05: Double-free / UAF — stateful precondition ---
     if summary.get("double_free") or summary.get("use_after_free"):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
-        df_callees = sorted(summary.get("df_callees") or summary.get("uaf_callees") or [])
+        df_callees = _df_callees or _uaf_callees  # already sorted above
         callee_list = ", ".join(f"`{c}`" for c in df_callees) if df_callees else ""
         callee_any  = (df_callees[0] if len(df_callees) == 1
                        else (f"one of {callee_list}" if df_callees else "the vulnerable callee"))
@@ -1087,7 +1092,11 @@ def build_task_block(fn_name: str, summary: dict,
                 f"with the same resource identifier to trigger the {bug}. Randomize other "
                 f"arguments from fuzz input to vary the execution path.\n"
                 f"  Do NOT randomize the resource identifier — the {bug} only fires when "
-                f"both calls operate on the same resource."
+                f"both calls operate on the same resource.\n"
+                f"  The routing argument that selects which handler runs (e.g. the verb "
+                f"or command field) must also be hardcoded for each phase — do NOT derive "
+                f"it from fuzz data. If you copy fuzz bytes into the command struct with "
+                f"memcpy, set the routing field AFTER the memcpy so it is not overwritten."
             )
         else:
             modules.append(
