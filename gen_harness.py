@@ -1231,13 +1231,25 @@ def _extract_direct_callees(ll_path: str, fn_name: str) -> list:
         i += 1
     else:
         return []
+    # Collect all functions defined across all IR files in the same directory.
+    # Callees that are only `declare`d everywhere are external (libc, OS) and
+    # contain no application protocol logic worth injecting.
+    ir_dir_path = Path(ll_path).parent
+    defined_anywhere = set(
+        m2.group(1)
+        for ll_file in ir_dir_path.glob("*.ll")
+        for m2 in re.finditer(
+            r'^define\b[^@]*@(\w+)\s*\(', ll_file.read_text(errors="replace"), re.MULTILINE
+        )
+    )
     seen, callees = set(), []
     for cm in re.finditer(r'\bcall\b[^@\n]*@(\w+)\s*\(', body):
         name = cm.group(1)
         if name in seen:
             continue
         seen.add(name)
-        if name.startswith('llvm.') or name.startswith('__') or name == fn_name:
+        if (name.startswith('llvm.') or name.startswith('__')
+                or name == fn_name or name not in defined_anywhere):
             continue
         callees.append(name)
     return callees
