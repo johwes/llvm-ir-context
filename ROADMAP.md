@@ -281,3 +281,7 @@ IR-link path in `generate_one`, M-10 module in `build_task_block`)
 | zlib validation (deepseek-r1-distill-qwen-14b): inflate+deflate both `Done 50000 runs` clean; model follows multi-constraint prompts reliably | validated |
 | `_extract_header_for_fn`: drop multi-line comment blocks outside struct bodies (99KB→12KB for inflate) | `gen_harness.py` |
 | P2: zlib harness experiment (inflate+deflate pipeline validation) | validated |
+| Extern injection from IR: `_extract_global_decls` + `_inject_global_externs_and_reset` — strips model-written externs, injects correct `extern` decls + `memset`/zero resets from IR type info; M-10 module replaced with "pipeline handles this" | `gen_harness.py` |
+| Bug fixes: missing `break` after fd-reader SKIP; no-code-block sentinel bypassing all checks; `_global_decls` missing from `generate_one` retry loop | `gen_harness.py` |
+| Self-harm retry message printed to stdout (both `generate_one` and `_generate_interprocedural`) | `gen_harness.py` |
+| Callee injection: `priority_callees` on `_callee_source_block`; when `df_callees`/`uaf_callees` non-empty, inject only those (bypass same-file guard); `generate_one` reordered so enrichment runs before callee block — `dispatch` now injects `handle_del` (763 chars) instead of irrelevant session callees (~1097 chars) | `gen_harness.py` |
