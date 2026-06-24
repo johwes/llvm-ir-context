@@ -1266,6 +1266,10 @@ def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
                 src_text = src_file.read_text(errors="replace")
             except OSError:
                 continue
+            # Skip fuzzer scaffold files — they contain harness code, not
+            # application logic, and should never be injected as callee source.
+            if "LLVMFuzzerTestOneInput" in src_text:
+                continue
             body = extract_fn_source(src_text, callee)
             if not body:
                 continue
