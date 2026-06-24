@@ -1256,21 +1256,25 @@ def _extract_direct_callees(ll_path: str, fn_name: str) -> list:
 
 
 def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
+                          priority_callees: set = None,
                           max_callees: int = 3, max_chars: int = 3000) -> str:
     """Return source bodies of direct callees of fn_name found in src_dir.
 
-    Searches all .c files in src_dir for each callee. Bounded to max_callees
-    functions and max_chars total characters to avoid prompt bloat. Callees
-    not found in src_dir (libc, external symbols) are silently skipped.
+    When priority_callees is provided (df_callees/uaf_callees from the slicer),
+    only those callees are injected and the same-file guard is bypassed — they
+    are on the vulnerability path so their source is always relevant regardless
+    of which file they live in. Fallback (priority_callees=None): all cross-file
+    callees, same-file guard active.
     """
     if not src_dir:
         return ""
-    callees = _extract_direct_callees(ll_path, fn_name)
+    if priority_callees:
+        callees = [c for c in _extract_direct_callees(ll_path, fn_name)
+                   if c in priority_callees]
+    else:
+        callees = _extract_direct_callees(ll_path, fn_name)
     if not callees:
         return ""
-    # Sort source files so the file containing fn_name comes last.
-    # Callees found there are already visible in the injected target source;
-    # callees from other files bring new protocol context (e.g. dispatch()).
     all_src_files = list(Path(src_dir).glob("*.c"))
     def _contains_fn(f):
         try:
@@ -1291,11 +1295,11 @@ def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
             # application logic, and should never be injected as callee source.
             if "LLVMFuzzerTestOneInput" in src_text:
                 continue
-            # Skip the file that defines fn_name — its content is already
-            # injected as the target source block. Only cross-file callees
-            # add new context; same-file callees are redundant and waste budget.
-            if extract_fn_source(src_text, fn_name):
-                continue
+            if not priority_callees:
+                # Fallback mode: skip the file defining fn_name — its content
+                # is already injected as the target source block.
+                if extract_fn_source(src_text, fn_name):
+                    continue
             body = extract_fn_source(src_text, callee)
             if not body:
                 continue
@@ -1545,18 +1549,19 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print(f"\nIR signature: {ir_sig}")
 
     src_block    = _source_block(ll_path, fn_name, src_dir)
-    callee_src_block = _callee_source_block(ll_path, fn_name, src_dir)
-    header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
-    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
-    sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
-                    if ir_sig else "")
-
     summary_json = get_context_json(ll_path, fn_name)
     if ir_dir:
         summary_json = _enrich_with_callee_flags(
             summary_json, fn_name, ll_path, ir_dir,
             src_text=src_block,
         )
+    _priority = (summary_json.get("df_callees") or set()) | (summary_json.get("uaf_callees") or set())
+    callee_src_block = _callee_source_block(ll_path, fn_name, src_dir,
+                                             priority_callees=_priority or None)
+    header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
+    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
+    sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
+                    if ir_sig else "")
     _FD_READER_SINKS_GEN = frozenset({"fgets", "recv", "recvfrom", "read"})
     _gen_sink_fns = {s.get("fn") for s in summary_json.get("sinks", [])}
     # Also treat fd-reader as true when the target is internal and reads via fgets/recv —
