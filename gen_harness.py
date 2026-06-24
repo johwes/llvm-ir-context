@@ -1268,16 +1268,16 @@ def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
     callees = _extract_direct_callees(ll_path, fn_name)
     if not callees:
         return ""
-    # Sort source files so the target's own file comes last.
-    # Callees defined in the target file are already visible in the injected
-    # target source; callees from other files bring new protocol information
-    # and should be prioritised for the callee budget.
-    target_src = find_source_for_ll(ll_path, src_dir)
+    # Sort source files so the file containing fn_name comes last.
+    # Callees found there are already visible in the injected target source;
+    # callees from other files bring new protocol context (e.g. dispatch()).
     all_src_files = list(Path(src_dir).glob("*.c"))
-    src_files = sorted(
-        all_src_files,
-        key=lambda f: (str(f) == target_src, f.name),
-    )
+    def _contains_fn(f):
+        try:
+            return bool(extract_fn_source(f.read_text(errors="replace"), fn_name))
+        except OSError:
+            return False
+    src_files = sorted(all_src_files, key=lambda f: (_contains_fn(f), f.name))
     snippets, total_chars, found = [], 0, 0
     for callee in callees:
         if found >= max_callees or total_chars >= max_chars:
