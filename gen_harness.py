@@ -1536,6 +1536,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             # Data flows via socket buffer — slicer cannot trace through kernel,
             # so the check always false-positives for correct socketpair harnesses.
             print("SKIP — fd-reader: Data flows via socket buffer, slicer cannot trace through kernel")
+            break
         else:
             bs_msg, bs_ok = _check_blank_shooter(harness_ll, fn_name)
             if bs_ok is not None:
