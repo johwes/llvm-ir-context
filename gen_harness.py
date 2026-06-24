@@ -1202,6 +1202,88 @@ def build_task_block(fn_name: str, summary: dict,
 # Source extraction helper (shared by 1:1 and interprocedural paths)
 # ---------------------------------------------------------------------------
 
+def _extract_direct_callees(ll_path: str, fn_name: str) -> list:
+    """Return names of functions directly called by fn_name in LLVM IR.
+
+    Parses the IR function body for call instructions. Filters out LLVM
+    intrinsics (llvm.*), compiler builtins (__*), and the target itself.
+    Order is first-occurrence in the IR body.
+    """
+    try:
+        text = Path(ll_path).read_text(errors="replace")
+    except OSError:
+        return []
+    m = re.search(rf'^define\b[^@]*@{re.escape(fn_name)}\s*\(', text, re.MULTILINE)
+    if not m:
+        return []
+    start = text.find('{', m.start())
+    if start == -1:
+        return []
+    depth, i = 0, start
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                body = text[start:i + 1]
+                break
+        i += 1
+    else:
+        return []
+    seen, callees = set(), []
+    for cm in re.finditer(r'\bcall\b[^@\n]*@(\w+)\s*\(', body):
+        name = cm.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name.startswith('llvm.') or name.startswith('__') or name == fn_name:
+            continue
+        callees.append(name)
+    return callees
+
+
+def _callee_source_block(ll_path: str, fn_name: str, src_dir: str,
+                          max_callees: int = 3, max_chars: int = 3000) -> str:
+    """Return source bodies of direct callees of fn_name found in src_dir.
+
+    Searches all .c files in src_dir for each callee. Bounded to max_callees
+    functions and max_chars total characters to avoid prompt bloat. Callees
+    not found in src_dir (libc, external symbols) are silently skipped.
+    """
+    if not src_dir:
+        return ""
+    callees = _extract_direct_callees(ll_path, fn_name)
+    if not callees:
+        return ""
+    src_files = list(Path(src_dir).glob("*.c"))
+    snippets, total_chars, found = [], 0, 0
+    for callee in callees:
+        if found >= max_callees or total_chars >= max_chars:
+            break
+        for src_file in src_files:
+            try:
+                src_text = src_file.read_text(errors="replace")
+            except OSError:
+                continue
+            body = extract_fn_source(src_text, callee)
+            if not body:
+                continue
+            if total_chars + len(body) > max_chars:
+                remaining = max_chars - total_chars
+                if remaining < 80:
+                    break
+                body = body[:remaining] + "\n/* ... truncated ... */"
+            snippets.append(f"// {callee}()\n{body}")
+            total_chars += len(body)
+            found += 1
+            print(f"  Callee source: {callee} ({src_file.name}, {len(body)} chars)")
+            break
+    if not snippets:
+        return ""
+    return "\n## Direct callee source\n```c\n" + "\n\n".join(snippets) + "\n```"
+
+
 def _source_block(ll_path: str, fn_name: str, src_dir: str,
                   label: str = "Target function") -> str:
     """Return a markdown source block for fn_name, or empty string."""
@@ -1432,6 +1514,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print(f"\nIR signature: {ir_sig}")
 
     src_block    = _source_block(ll_path, fn_name, src_dir)
+    callee_src_block = _callee_source_block(ll_path, fn_name, src_dir)
     header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
     header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
@@ -1487,6 +1570,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 {ctx}
 {sig_block}
 {src_block}
+{callee_src_block}
 {header_block}
 {task_block}"""
 
