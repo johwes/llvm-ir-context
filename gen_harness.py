@@ -501,6 +501,30 @@ def ask_qwen(messages: list[dict]) -> str:
             time.sleep(wait)
 
 
+
+def _inject_sigpipe_ignore(c_text: str) -> str:
+    """Inject signal(SIGPIPE, SIG_IGN) as first statement of LLVMFuzzerTestOneInput.
+    Idempotent. Required for fd-reader harnesses — if the target writes back on its
+    fd after the write-end is closed, the OS sends SIGPIPE which kills the fuzzer
+    silently (libFuzzer does not catch SIGPIPE as a crash)."""
+    if "signal(SIGPIPE" in c_text:
+        return c_text
+    if "<signal.h>" not in c_text:
+        c_text = c_text.replace(
+            "#include <unistd.h>",
+            "#include <unistd.h>\n#include <signal.h>",
+            1,
+        )
+        if "<signal.h>" not in c_text:
+            c_text = "#include <signal.h>\n" + c_text
+    c_text = re.sub(
+        r'(LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{)',
+        r'\1\n    signal(SIGPIPE, SIG_IGN);',
+        c_text,
+        count=1,
+    )
+    return c_text
+
 def _assistant_content(reply: str) -> str:
     """Extract just the code block from a reply for use in multi-turn context.
 
@@ -1198,6 +1222,8 @@ the public API function that calls `{vuln_fn}`.
         reply = ask_qwen(messages)
         preamble = _build_include_preamble(merged_summary, header_path=header_path)
         code  = _apply_preamble(extract_c(reply), preamble)
+        if is_fd_reader:
+            code = _inject_sigpipe_ignore(code)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
@@ -1365,6 +1391,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         reply = ask_qwen(messages)
         preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader, internal_fn_decl=internal_fn_decl)
         code  = _apply_preamble(extract_c(reply), preamble)
+        if is_fd_reader:
+            code = _inject_sigpipe_ignore(code)
         out_c.write_text(code)
         print(code)
         print(f"\n→ saved: {out_c}")
