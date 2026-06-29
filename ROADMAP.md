@@ -15,48 +15,83 @@ improvements ordered by impact. P2 are research directions documented in
 
 ## P1 — High value, ordered by priority
 
-Items are ordered by the following logic: P1.0 is a validation gate — results
-there determine which engineering investments are worth making. P1.1 and P1.2
-are independent of each other and can run in parallel. P1.3 has a known fix
-path and is self-contained. P1.4 is a small cleanup. P1.5–P1.7 are
-deprioritised because they are polish, blocked by P1.2, or gated on CI
-integration being valuable (which P1.0 will confirm). P1.8 remains
-independent of all the above.
+Items are ordered by the following logic: P1.0 benchmark is complete — findings
+drove the priority order. P1.1 (wrapper dedup) and P1.3 (sink expansion) are
+independent and can run in parallel. P1.4 (interprocedural guard attribution)
+depends on P1.0 findings (confirmed useful). P1.2 is a small cleanup. P1.6–P1.10
+are deprioritised: polish, blocked by P1.4, or gated on CI integration.
 
 ---
 
 ### 0. Benchmark on a real hardened target
 
-**Problem:** The only ground truth for scoring quality is scarnet — a toy
-server designed to be vulnerable. Precision and false-positive rate on mature,
-hardened C codebases are unknown. Every engineering investment after this point
-is premature without a baseline.
+*Completed. See results below.*
 
-**Fix:** Run `ir-score` on a real project (OpenSSL or curl are good candidates
-— well-documented CVE history, publicly available C source, non-trivial guard
-density). Compare the top-10 ranked functions against published CVEs for a
-pinned version. Measure:
-- **Precision@10:** what fraction of top-10 ranked functions correspond to a
-  known-vulnerable function?
-- **False positive character:** are false positives coming from
-  interprocedural helpers with guards in callers, GEP-only functions, or
-  something else?
+**Target:** OpenSSL 3.0.7 (pinned before 3.0.8 security fixes), 11,248 functions
+across `ssl/` and `crypto/`.
 
-**Why first:** The benchmark will tell you which problem to fix next. If
-precision@10 is already 7/10, the interprocedural guard issue (P1.2) is
-polish. If it's 3/10 due to callee-guarded helpers dominating the ranking,
-P1.2 becomes urgent. If the false positives are a different category entirely,
-the roadmap needs to change.
+**Answer key (6 CVEs in scope):**
+| CVE | Function | Bug type | In-scope? |
+|---|---|---|---|
+| CVE-2022-4450 | `PEM_read_bio_ex` | double-free | Yes |
+| CVE-2023-0215 | `BIO_new_NDEF` | cross-function UAF | Yes — but interprocedural blind spot |
+| CVE-2023-0286 | `GENERAL_NAME_cmp` | type confusion / invalid ptr | No — no dangerous sink |
+| CVE-2023-0216 | `d2i_PKCS7` | invalid pointer deref | No — no dangerous sink |
+| CVE-2023-0401 | `PKCS7_signatureVerify` | null deref | No — out of scope by design |
+| CVE-2022-4203 | `name_constraint_check` | buffer over-read | No — GEP suppressed / name mismatch |
 
-**Effort:** Medium — mostly a measurement exercise, no code changes unless
-the benchmark surfaces a clear systematic failure.
+**Results (post constant-length memcpy fix):**
+- `PEM_read_bio_ex` ranked **2nd** — hit
+- `BIO_new_NDEF` missed — cross-function UAF, typestate is intra-procedural only
+- P@6 = 1/6 (16.7%); on in-scope CVEs only: **1/2 (50%)**
 
-**Output:** A note in this file (or a `benchmark.md`) with the pinned target
-version, ranked output, CVE mapping, and the error analysis.
+**Key findings:**
+1. **Constant-length memcpy false positives** dominated the top 40 before the fix
+   (`fe_copy`, `EVP_CIPHER_CTX_get_*`, `curve448_*_copy` etc. — all 100% scored).
+   Fixed during benchmark run by skipping constant-length sinks. This was the
+   single highest-impact fix the benchmark produced.
+2. **Wrapper/alias cluster** is the dominant remaining noise: ranks 7–23 are 16
+   `PEM_read_*` thin wrappers that all delegate to `PEM_read_bio_ex` (rank 2).
+   One underlying code path, 16 ranking entries. → New P1.1.
+3. **Interprocedural typestate gap**: `BIO_new_NDEF` UAF is cross-function (free
+   in one function, dangling use in caller via `BIO_pop()`). Intra-procedural
+   typestate can't see it. → Confirms P1.3 (function summary approach).
+4. **Out-of-scope CVEs**: 4 of 6 answer-key bugs are null deref, type confusion,
+   or pointer deref without a call-based sink — correctly outside the tool's stated
+   scope. The scoring model is working as designed.
 
 ---
 
-### 1. Sink list expansion — command injection and path traversal
+### 1. Wrapper/alias deduplication
+
+**Problem:** The benchmark revealed that ranks 7–23 are all thin wrapper functions
+that immediately delegate to a single higher-ranked function (`PEM_read_bio_ex` at
+rank 2). All 16 `PEM_read_*` variants share the same underlying sink and the same
+code path — they add no information to the ranking but consume 17 of the top-23
+slots, burying genuinely distinct findings below them.
+
+This is a systematic pattern in any large C codebase with a public API layer:
+the public API functions are thin wrappers over internal implementation functions.
+The implementation function is the real target; the wrappers are noise.
+
+**Detection:** A function is a wrapper candidate when:
+- It has exactly one non-GEP call sink
+- That call sink is itself a ranked function scoring above some threshold
+- Its own body contributes no additional sinks or guards beyond the call
+
+**Fix:** When a function's only sinks are a single call to a higher-ranked function
+already in the output, suppress it from the ranked table (or annotate it as
+`[wrapper of <fn>]` and group it). The implementation function keeps its rank; the
+wrappers are listed as aliases beneath it rather than as separate entries.
+
+**Effort:** Medium — requires one post-ranking pass over the summaries. The call
+graph is already built; this is a filter on top of the existing output.
+
+**Files:** `llvm_ir_context/score_deterministic.py` (`score_ir_dir`, `_print_table`)
+
+---
+
+### 3. Sink list expansion — command injection and path traversal
 
 **Problem:** The current sink set covers memory-safety hazards almost
 exclusively (memcpy/strcpy/malloc family). Two whole CVE categories with the
@@ -93,7 +128,7 @@ plus test cases.
 
 ---
 
-### 2. Interprocedural guard attribution
+### 4. Interprocedural guard attribution
 
 **Problem:** Internal helper functions that have their guards in the caller
 consistently rank high (e.g. `lm_init` in zlib — no `icmp` in its body, but
@@ -130,7 +165,7 @@ feeds, which is a meaningful extension to the cross-file caller scan.
 
 ---
 
-### 3. Structured-input / streaming pattern (P-08) — zlib inflate validated
+### 5. Structured-input / streaming pattern (P-08) — zlib inflate validated
 
 **Observed (zlib validation run):** `inflate` harness compiled clean, called
 `inflateInit` correctly without any hint (model read the header — generality
@@ -162,7 +197,7 @@ See `patterns.md § P-08` for full spec.
 
 ---
 
-### 4. `ir-context` CLI cleanup
+### 6. `ir-context` CLI cleanup
 
 **Problem:** `pyproject.toml` exposes the `ir-context` entry point as
 `slice_context:_demo_cli` — a private function as a named console script.
@@ -181,7 +216,7 @@ the function.
 
 ---
 
-### 5. tree-sitter-c for C source extraction
+### 7. tree-sitter-c for C source extraction
 
 **Problem:** `extract_fn_source` in `gen_harness.py` uses regex + brace
 counting to extract function bodies from `.c` files. This breaks on:
@@ -203,7 +238,7 @@ fine with current regex so this is only visible on unusual C code.
 
 ---
 
-### 6. Patch re-validation via slicer
+### 8. Patch re-validation via slicer
 
 After an LLM generates a fix, compile the patched function to IR and diff the
 `summarize_slice` output against the original. Reject if `guard_type` is still
@@ -224,7 +259,7 @@ See `ideas.md § Patch re-validation via slicer`.
 
 ---
 
-### 7. IR-hash + coverage change detection (CI integration)
+### 9. IR-hash + coverage change detection (CI integration)
 
 **Problem:** `--skip-existing` skips functions that already have a harness,
 permanently. New dangerous code introduced in a refactor is invisible to the
@@ -253,7 +288,7 @@ utility, coverage baseline storage in `.llvm-ir-context/coverage/`
 
 ---
 
-### 8. IR-level linking for internal-linkage functions
+### 10. IR-level linking for internal-linkage functions
 
 **Problem:** `static` C functions cannot be called from a separately-compiled
 harness `.c` file — the C linker enforces visibility, and `llvm-link` respects
