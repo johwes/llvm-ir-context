@@ -158,37 +158,89 @@ def resolve_public_caller(ll_path: str, fn_name: str,
                 any_matches.append(entry)
     return (header_matches or any_matches or [None])[0]
 
+def _line_start(text: str, pos: int) -> int:
+    """Return the column-0 index of the line containing pos."""
+    return text.rfind('\n', 0, pos) + 1
+
+
+def _line_is_at_column_zero(text: str, pos: int) -> bool:
+    """True if the line containing pos starts with a non-whitespace character.
+
+    A function definition signature always starts its first token at column 0.
+    An indented call site has leading spaces or tabs.
+    """
+    ls = _line_start(text, pos)
+    return bool(text[ls:ls + 1]) and text[ls] not in (' ', '\t')
+
+
 def extract_fn_source(src_text: str, fn_name: str) -> str:
     """Extract the body of fn_name from C source text using brace matching.
 
     Finds the function definition line then walks forward tracking brace depth
     until the matching closing brace. Returns the full function text including
     signature, or empty string if not found.
+
+    Returns empty string if the function appears to be macro-generated (no
+    parseable column-0 definition found) — injecting a call site would mislead
+    the LLM.
     """
-    # Match a function definition: return-type fn_name(...) possibly across lines.
-    # We look for fn_name followed by '(' not preceded by another word char
-    # (to avoid matching calls or type names that contain fn_name).
-    pattern = re.compile(
-        rf'(?m)^[^\n#/][^\n]*\b{re.escape(fn_name)}\s*\([^;{{]*\{{'
-    )
-    m = pattern.search(src_text)
-    if not m:
-        # Fallback: find the opening brace on the next line after the signature
-        sig_pat = re.compile(rf'(?m)\b{re.escape(fn_name)}\s*\(')
-        sm = sig_pat.search(src_text)
-        if not sm:
-            return ""
-        # Walk forward from the match to find the first '{'
-        start = src_text.find('{', sm.start())
-        if start == -1:
-            return ""
-        fn_start = src_text.rfind('\n', 0, sm.start()) + 1
-    else:
-        start    = src_text.index('{', m.start())
-        fn_start = m.start()
+    # Find all occurrences of fn_name followed by '(' (i.e. all calls and definitions).
+    # A definition has fn_name( on a line whose first non-empty char is at column 0
+    # (the return type may be on the same line or the line immediately above).
+    # A call site is always indented.
+    pat = re.compile(rf'\b{re.escape(fn_name)}\s*\(')
+    fn_start = None
+    brace_start = None
+    for m in pat.finditer(src_text):
+        if not _line_is_at_column_zero(src_text, m.start()):
+            continue
+        # The line starts at column 0 — candidate definition.
+        # Look for the opening '{' of the function body. Reject if there's a ';'
+        # before the '{' (that would be a prototype/declaration, not a definition).
+        rest = src_text[m.start():]
+        semi = rest.find(';')
+        brace = rest.find('{')
+        if brace == -1:
+            continue
+        if semi != -1 and semi < brace:
+            continue  # prototype
+        # Also reject if there's a blank line between fn_name and '{' — that
+        # suggests fn_name was a macro argument, not a function being defined.
+        between = src_text[m.start():m.start() + brace]
+        if '\n\n' in between:
+            continue
+        # Good — this is a definition.  Find the start of the full signature:
+        # walk back from the line of fn_name to include any return-type lines
+        # at column 0 that precede it without a blank line.
+        ls = _line_start(src_text, m.start())
+        sig_start = ls
+        # Walk back over consecutive non-blank column-0 lines (return types, attributes)
+        while sig_start > 0:
+            prev_end = sig_start - 1          # index of '\n' before this line
+            prev_ls  = _line_start(src_text, prev_end - 1)
+            prev_line = src_text[prev_ls:sig_start].strip()
+            if not prev_line or not _line_is_at_column_zero(src_text, prev_ls):
+                break
+            # Stop if the previous line looks like the end of another function,
+            # a preprocessor directive, or a comment block.
+            if (prev_line == '}'
+                    or prev_line.endswith('}')
+                    or prev_line.endswith(';')
+                    or prev_line.startswith('#')
+                    or prev_line.startswith('//')
+                    or prev_line.startswith('/*')
+                    or prev_line.endswith('*/')):
+                break
+            sig_start = prev_ls
+        fn_start   = sig_start
+        brace_start = m.start() + brace
+        break
+
+    if fn_start is None:
+        return ""
 
     depth = 0
-    i = start
+    i = brace_start
     while i < len(src_text):
         ch = src_text[i]
         if ch == '{':
