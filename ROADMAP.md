@@ -2,8 +2,8 @@
 
 Items are grouped by priority. P0 are confirmed production failures observed
 in the scarnet harness generation run (2026-06-21). P1 are high-value
-improvements with clear implementation paths. P2 are research directions
-documented in `ideas.md`.
+improvements ordered by impact. P2 are research directions documented in
+`ideas.md`.
 
 ---
 
@@ -13,82 +13,124 @@ documented in `ideas.md`.
 
 ---
 
-## P1 — High value, clear implementation path
+## P1 — High value, ordered by priority
 
-Items are ordered by dependency: P1.0 unblocks P1.1, P1.3, and P1.7.
-P1.2 and P1.3 share the caller_map infrastructure and should be done together
-or in sequence.
-
----
-
-### 0. API cleanup (`api.py` + `__main__.py`)
-
-**Problem:** The core logic in `preprocess_slice_pdg.py`, `slice_context.py`,
-and `score_deterministic.py` is importable but the CLI modules mix `argparse`
-and `sys.exit` into code paths that also run during library use. Anything that
-needs to call the slicer programmatically (blank-shooter check, patch re-validation,
-call-graph reachability) has to work around this.
-
-**Fix:** Extract a clean programmatic entry point:
-
-- `llvm_ir_context/api.py` — single function `get_vulnerability_context(ir_text, fn_name) -> dict`; never prints, never calls `sys.exit`; all errors returned as `{"error": ...}` in the payload
-- `llvm_ir_context/__main__.py` — thin CLI wrapper around `api.py`; enables `python -m llvm_ir_context`
-- Strip any `sys.exit` from non-CLI code paths in existing modules
-
-**Why first:** P1.1, P1.3, and P1.7 all need to call the slicer
-programmatically from within other scripts. Doing this cleanup first means
-those items are written against a stable internal interface instead of working
-around CLI entanglements.
-
-**Bonus:** Clean `api.py` also makes unit testing straightforward — no
-`sys.argv` mocking needed.
-
-**Files:** new `llvm_ir_context/api.py`, new `llvm_ir_context/__main__.py`,
-minor cleanup in existing modules
+Items are ordered by the following logic: P1.0 is a validation gate — results
+there determine which engineering investments are worth making. P1.1 and P1.2
+are independent of each other and can run in parallel. P1.3 has a known fix
+path and is self-contained. P1.4 is a small cleanup. P1.5–P1.7 are
+deprioritised because they are polish, blocked by P1.2, or gated on CI
+integration being valuable (which P1.0 will confirm). P1.8 remains
+independent of all the above.
 
 ---
 
-### 1. Harness IR validation (blank-shooter check)
+### 0. Benchmark on a real hardened target
 
-*Implemented. See Completed table.*
+**Problem:** The only ground truth for scoring quality is scarnet — a toy
+server designed to be vulnerable. Precision and false-positive rate on mature,
+hardened C codebases are unknown. Every engineering investment after this point
+is premature without a baseline.
 
----
+**Fix:** Run `ir-score` on a real project (OpenSSL or curl are good candidates
+— well-documented CVE history, publicly available C source, non-trivial guard
+density). Compare the top-10 ranked functions against published CVEs for a
+pinned version. Measure:
+- **Precision@10:** what fraction of top-10 ranked functions correspond to a
+  known-vulnerable function?
+- **False positive character:** are false positives coming from
+  interprocedural helpers with guards in callers, GEP-only functions, or
+  something else?
 
-### 2. Call-graph reachability query
+**Why first:** The benchmark will tell you which problem to fix next. If
+precision@10 is already 7/10, the interprocedural guard issue (P1.2) is
+polish. If it's 3/10 due to callee-guarded helpers dominating the ranking,
+P1.2 becomes urgent. If the false positives are a different category entirely,
+the roadmap needs to change.
 
-*Implemented. See Completed table.*
+**Effort:** Medium — mostly a measurement exercise, no code changes unless
+the benchmark surfaces a clear systematic failure.
 
----
-
-### 3. Interprocedural score propagation — calibration
-
-*Implemented. See Completed table.*
-
----
-
-### 4. tree-sitter-c for C source extraction
-
-**Problem:** `extract_fn_source` in `gen_harness.py` uses regex + brace
-counting to extract function bodies from `.c` files. This breaks on:
-- Macros that expand to `{` or `}`
-- `#ifdef` blocks that alter brace nesting
-- Inline assembly with curly braces
-- Unconventional formatting (K&R style, single-line bodies)
-
-**Fix:** Replace with `tree-sitter-c` (Python bindings via `tree-sitter` +
-`tree-sitter-c` packages). Parse the file, query for
-`(function_definition)` nodes by name, extract the exact source range.
-100% syntactically correct, handles all valid C.
-
-**Effort:** Medium — add `tree-sitter` dependency, rewrite `extract_fn_source`.
-**Impact:** Production correctness for arbitrary codebases; scarnet/zlib work
-fine with current regex so this is only visible on unusual C code.
-
-**File:** `gen_harness.py` (`extract_fn_source`)
+**Output:** A note in this file (or a `benchmark.md`) with the pinned target
+version, ranked output, CVE mapping, and the error analysis.
 
 ---
 
-### 5. Structured-input / streaming pattern (P-08) — zlib inflate validated
+### 1. Sink list expansion — command injection and path traversal
+
+**Problem:** The current sink set covers memory-safety hazards almost
+exclusively (memcpy/strcpy/malloc family). Two whole CVE categories with the
+same backward-slice detection shape are missing:
+
+- **Command injection:** `system()`, `popen()`, `execv()`/`execvp()`/`execve()`
+  — user-controlled string reaches a shell or exec call without sanitisation.
+- **Path traversal:** `open()`, `fopen()`, `unlink()`, `rename()`, `openat()`
+  — user-controlled string reaches a filesystem call without path canonicalisation
+  check.
+
+Both have the same detectable IR shape as existing sinks: function-argument
+source, no sanitisation guard between entry and call, the dangerous function
+name in the callee. The only addition is new entries in the sink registry and
+a new scoring tier.
+
+**Fix:**
+- Add `system`, `popen`, `execv`, `execvp`, `execve`, `execle` to the sink
+  list with a new `command_injection` category.
+- Add `open`, `openat`, `fopen`, `fopen64`, `unlink`, `rename`, `rmdir` to
+  the sink list with a new `path_traversal` category.
+- Add a scoring tier for each (suggested: same base as unguarded call sink,
+  no buffer-write multiplier, no format-only discount).
+- Add harness hints: command injection → "argument reaches shell/exec call;
+  inject shell metacharacters"; path traversal → "argument reaches filesystem
+  call; inject `../` sequences".
+- Add entries to `patterns.md`.
+
+**Effort:** Low–medium — a day of work on the sink registry and scoring,
+plus test cases.
+
+**Files:** `llvm_ir_context/score_deterministic.py` (sink registry),
+`llvm_ir_context/slice_context.py` (hints), `patterns.md`
+
+---
+
+### 2. Interprocedural guard attribution
+
+**Problem:** Internal helper functions that have their guards in the caller
+consistently rank high (e.g. `lm_init` in zlib — no `icmp` in its body, but
+`deflateInit2_` validates `windowBits` before calling it). The current
+`caller_validated` flag is too coarse: it checks whether *any* caller of this
+function contains *any* `icmp`, not whether the `icmp` in the caller guards
+*the specific argument slot* that feeds the sink.
+
+The completed interprocedural score propagation (P1.3) addresses the
+complementary case (caller is clean, callee is dangerous). This item addresses
+the inverse: function looks dangerous, caller actually guards it.
+
+**Fix:** Argument-slot-level guard attribution rather than score propagation.
+When the slicer sees a function where:
+- All input channels are `external_call_return` (no direct `function_argument`), and
+- `caller_validated` is true
+
+...traverse one hop into callers and check whether the specific argument slot
+feeding the sink has an `icmp` guard in the caller's slice. If yes, apply a
+score reduction (suggested 0.70×) and annotate with `[+caller_guarded:argN]`.
+If the guard protects a different argument slot, do not reduce.
+
+This is more precise than the current heuristic and directly addresses the
+dominant false-positive pattern expected on mature codebases.
+
+**Depends on:** P1.0 (benchmark will confirm whether this is the dominant
+false-positive category before investing 2–3 weeks here)
+
+**Effort:** High — requires tracking which argument slot a caller's `icmp`
+feeds, which is a meaningful extension to the cross-file caller scan.
+
+**Files:** `llvm_ir_context/score_deterministic.py` (caller scan),
+`llvm_ir_context/preprocess_slice_pdg.py` (argument slot tracking)
+
+---
+
+### 3. Structured-input / streaming pattern (P-08) — zlib inflate validated
 
 **Observed (zlib validation run):** `inflate` harness compiled clean, called
 `inflateInit` correctly without any hint (model read the header — generality
@@ -120,7 +162,69 @@ See `patterns.md § P-08` for full spec.
 
 ---
 
-### 6. IR-hash + coverage change detection (CI integration)
+### 4. `ir-context` CLI cleanup
+
+**Problem:** `pyproject.toml` exposes the `ir-context` entry point as
+`slice_context:_demo_cli` — a private function as a named console script.
+The `ir-score` CLI went through the P1.0 API cleanup and now has a clean
+`__main__.py` path. `ir-context` was not updated at the same time.
+
+**Fix:** Move `_demo_cli` logic into a proper public function or into
+`__main__.py` following the same pattern as `ir-score`. Update `pyproject.toml`
+to point at the public entry point. Remove the leading underscore or relocate
+the function.
+
+**Effort:** Small — an hour of cleanup.
+
+**Files:** `llvm_ir_context/slice_context.py`, `llvm_ir_context/__main__.py`,
+`pyproject.toml`
+
+---
+
+### 5. tree-sitter-c for C source extraction
+
+**Problem:** `extract_fn_source` in `gen_harness.py` uses regex + brace
+counting to extract function bodies from `.c` files. This breaks on:
+- Macros that expand to `{` or `}`
+- `#ifdef` blocks that alter brace nesting
+- Inline assembly with curly braces
+- Unconventional formatting (K&R style, single-line bodies)
+
+**Fix:** Replace with `tree-sitter-c` (Python bindings via `tree-sitter` +
+`tree-sitter-c` packages). Parse the file, query for
+`(function_definition)` nodes by name, extract the exact source range.
+100% syntactically correct, handles all valid C.
+
+**Effort:** Medium — add `tree-sitter` dependency, rewrite `extract_fn_source`.
+**Impact:** Production correctness for arbitrary codebases; scarnet/zlib work
+fine with current regex so this is only visible on unusual C code.
+
+**File:** `gen_harness.py` (`extract_fn_source`)
+
+---
+
+### 6. Patch re-validation via slicer
+
+After an LLM generates a fix, compile the patched function to IR and diff the
+`summarize_slice` output against the original. Reject if `guard_type` is still
+`none` for the same sink; flag for human review if sink count dropped to zero
+(function may have been deleted rather than fixed).
+
+All machinery exists. Only new piece: a comparison function over two slice
+summaries and wiring into a patch validation CLI.
+
+**Caution:** Until P1.2 (interprocedural guard attribution) is in place, a
+patch that moves a guard one function up will look like a failed patch to the
+re-validator — producing false rejections on legitimate fixes. Either implement
+P1.2 first, or document this blind spot prominently in the CLI output.
+
+**Files:** new `ir-validate-patch` CLI or function in `slice_context.py`
+
+See `ideas.md § Patch re-validation via slicer`.
+
+---
+
+### 7. IR-hash + coverage change detection (CI integration)
 
 **Problem:** `--skip-existing` skips functions that already have a harness,
 permanently. New dangerous code introduced in a refactor is invisible to the
@@ -144,31 +248,8 @@ flag for harness review — new code may be unreachable.
 - Maps naturally to CI: run scoring + hash check on every PR, spend LLM
   tokens only when IR actually changed
 
-**Relationship to OSS-Fuzz-Gen:** Coverage is used here as a change detector,
-not as the primary discovery signal. IR structural scoring remains the driver
-for which functions to fuzz; coverage validates that existing harnesses stay
-effective as code evolves.
-
 **File:** `gen_harness.py` (`--skip-if-unchanged` flag), new `ir_hash.py`
 utility, coverage baseline storage in `.llvm-ir-context/coverage/`
-
----
-
-### 7. Patch re-validation via slicer
-
-After an LLM generates a fix, compile the patched function to IR and diff the
-`summarize_slice` output against the original. Reject if `guard_type` is still
-`none` for the same sink; flag for human review if sink count dropped to zero
-(function may have been deleted rather than fixed).
-
-All machinery exists. Only new piece: a comparison function over two slice
-summaries and wiring into a patch validation CLI.
-
-**Depends on:** P1.0 (calls summarize_slice programmatically without CLI overhead)
-
-See `ideas.md § Patch re-validation via slicer`.
-
-**File:** new `ir-validate-patch` CLI or function in `slice_context.py`
 
 ---
 
@@ -285,3 +366,4 @@ IR-link path in `generate_one`, M-10 module in `build_task_block`)
 | Bug fixes: missing `break` after fd-reader SKIP; no-code-block sentinel bypassing all checks; `_global_decls` missing from `generate_one` retry loop | `gen_harness.py` |
 | Self-harm retry message printed to stdout (both `generate_one` and `_generate_interprocedural`) | `gen_harness.py` |
 | Callee injection: `priority_callees` on `_callee_source_block`; when `df_callees`/`uaf_callees` non-empty, inject only those (bypass same-file guard); `generate_one` reordered so enrichment runs before callee block — `dispatch` now injects `handle_del` (763 chars) instead of irrelevant session callees (~1097 chars) | `gen_harness.py` |
+| M-02/M-05 conflict fix: suppress M-02 when M-05 has specific callees; verb rule added | `gen_harness.py` |

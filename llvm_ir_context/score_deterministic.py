@@ -399,7 +399,10 @@ def score_ir_dir(
     fn_files:     dict[str, Path]  = {}
     no_slice_fns: list[str]        = []
 
-    for fn_name, fn_ir, fn_file in functions:
+    total = len(functions)
+    for i, (fn_name, fn_ir, fn_file) in enumerate(functions, 1):
+        if i == 1 or i % 50 == 0 or i == total:
+            print(f"\r  Scoring {i}/{total} functions...", end="", flush=True)
         fn_files[fn_name] = fn_file
         g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name, extra_modules=all_modules)
         if g is None or g.get("x") is None:
@@ -427,6 +430,7 @@ def score_ir_dir(
             if verbose:
                 print(f"  {fn_name}: {summary['natural_language']}")
 
+    print()  # end progress line
     # Build caller_map: callee → [callers] from summaries (for P1.2 reachability).
     caller_map: dict[str, list[str]] = {}
     for fn_name, summary in summaries.items():
