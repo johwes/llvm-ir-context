@@ -1992,22 +1992,21 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 
     # For internal-linkage functions: promote linkage in target IR and
     # merge with harness IR via llvm-link so the static symbol resolves.
-    if is_internal and harness_ll:
-        print("\n── IR link (internal linkage promotion) ─────────────")
+    if harness_ll and ll_path:
+        print("\n── IR link ──────────────────────────────────────────")
         promoted_ll = _promote_linkage_in_ir(Path(ll_path), fn_name)
         merged_ll   = output_dir / f"harness_{fn_name}_merged.ll"
         merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll)
         if merged:
             print(f"OK → {merged}")
-            print(f"\nTo fuzz (IR-linked — add remaining source files, exclude the file containing {fn_name}):")
-            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} <other_src/*.c> -o fuzzer_{fn_name}")
-            print(f"  (e.g., src/*.c minus the file that defines {fn_name})")
+            print(f"\nTo fuzz:")
+            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} -o fuzzer_{fn_name}")
             print(f"  ./fuzzer_{fn_name}")
         else:
             print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
             inc     = "".join(f" -I {d}" for d in include_dirs)
             lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
-            print(f"\nTo fuzz (fallback — compile with source):")
+            print(f"\nTo fuzz (fallback — needs library):")
             print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} -o fuzzer_{fn_name}")
             print(f"  ./fuzzer_{fn_name}")
     else:
