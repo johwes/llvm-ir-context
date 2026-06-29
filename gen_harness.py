@@ -194,6 +194,11 @@ def extract_fn_source(src_text: str, fn_name: str) -> str:
     for m in pat.finditer(src_text):
         if not _line_is_at_column_zero(src_text, m.start()):
             continue
+        # Skip comment lines — they start at column 0 but are not definitions.
+        ls = _line_start(src_text, m.start())
+        line_prefix = src_text[ls:ls + 2]
+        if line_prefix in ('//', '/*'):
+            continue
         # The line starts at column 0 — candidate definition.
         # Look for the opening '{' of the function body. Reject if there's a ';'
         # before the '{' (that would be a prototype/declaration, not a definition).
