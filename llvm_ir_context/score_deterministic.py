@@ -468,13 +468,54 @@ def score_ir_dir(
                 print(f"\r  Scoring {done}/{total} functions...", end="", flush=True)
 
     print()  # end progress line
-    # Build caller_map: callee → [callers] from summaries (for P1.2 reachability).
+    # Build caller_map: callee → [callers] from summaries (intra-module edges).
     caller_map: dict[str, list[str]] = {}
     for fn_name, summary in summaries.items():
         for caller in summary.get("caller_names", []):
             caller_map.setdefault(fn_name, [])
             if caller not in caller_map[fn_name]:
                 caller_map[fn_name].append(caller)
+
+    # Cross-file call edges via regex scan of all IR texts.
+    # Workers only parsed their own module so caller_names misses cross-file
+    # callers. A single regex pass over all IR is fast and sufficient for the
+    # wrapper dedup and reachability queries.
+    _call_re = re.compile(r'\bcall\b[^@\n]*@([\w.]+)\s*\(')
+    _define_re = re.compile(r'^define\b[^\n]*@([\w.]+)\s*\(', re.MULTILINE)
+    seen_ir_ids: set[int] = set()
+    all_known_fns = set(rule_scores)
+    for _, ir_text, _ in functions:
+        ir_id = id(ir_text)
+        if ir_id in seen_ir_ids:
+            continue
+        seen_ir_ids.add(ir_id)
+        defined_in_module = set(_define_re.findall(ir_text))
+        for caller_fn in defined_in_module:
+            if caller_fn not in all_known_fns:
+                continue
+            # Find all callees referenced inside this function's body.
+            # Slice out just this function's body to avoid false edges from
+            # other functions in the same module.
+            fn_match = re.search(
+                rf'^define\b[^\n]*@{re.escape(caller_fn)}\s*\(',
+                ir_text, re.MULTILINE,
+            )
+            if not fn_match:
+                continue
+            start = fn_match.start()
+            # Find the closing brace of this function (first lone '}' at col 0)
+            end = len(ir_text)
+            for m in re.finditer(r'^\}', ir_text[start:], re.MULTILINE):
+                end = start + m.end()
+                break
+            fn_body = ir_text[start:end]
+            for callee_fn in _call_re.findall(fn_body):
+                if callee_fn == caller_fn:
+                    continue
+                if callee_fn not in all_known_fns:
+                    continue
+                if caller_fn not in caller_map.get(callee_fn, []):
+                    caller_map.setdefault(callee_fn, []).append(caller_fn)
 
     # Interprocedural score propagation -- categorical signal-based floors.
     # Priority: double_free (0.92) > use_after_free (0.88) >
