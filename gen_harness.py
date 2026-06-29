@@ -1392,6 +1392,8 @@ def build_task_block(fn_name: str, summary: dict,
             f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`. "
             f"For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
             f"before passing the BIO to `{fn_name}`. "
+            f"`BIO_write` accepts raw bytes — pass `Data` directly, no null-termination "
+            f"or intermediate copy needed. "
             f"For a FILE*: use `fmemopen(Data, Size, \"r\")`. "
             f"Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
             f"check the function signature and API reference to identify which parameter "

@@ -993,8 +993,14 @@ def _detect_double_free(fn) -> dict:
       use_after_free bool — ptr used after first free
       freed_ptrs     list — SSA display names of freed pointers
     """
-    # freed_ids: canonical ptr_id → SSA display name (from str(op))
-    freed_ids:  dict[int, str] = {}
+    # freed_ids: canonical ptr_id → (SSA display name, block label)
+    # We record which basic block performed the free so we can distinguish
+    # "freed twice on the same path" (double-free) from "freed on two separate
+    # branches" (correct cleanup pattern: if (p) free(p) on each exit path).
+    # Only flag double_free when the same canonical ptr is freed twice in the
+    # same basic block — cross-block repeated frees are ambiguous because the
+    # blocks may be on mutually exclusive control-flow paths.
+    freed_ids:  dict[int, tuple[str, object]] = {}  # cid → (name, block)
     double_free    = False
     use_after_free = False
 
@@ -1060,9 +1066,14 @@ def _detect_double_free(fn) -> dict:
                     if ptr_op is not None:
                         cid = _canonical_ptr_id(ptr_op)
                         if cid in freed_ids:
-                            double_free = True
+                            prev_block = freed_ids[cid][1]
+                            # Only flag as double-free when both frees are in the
+                            # same basic block — cross-block frees may be on
+                            # mutually exclusive control-flow paths (cleanup pattern).
+                            if prev_block is block:
+                                double_free = True
                         else:
-                            freed_ids[cid] = str(ptr_op).split()[-1]  # SSA name for display
+                            freed_ids[cid] = (str(ptr_op).split()[-1], block)
                 else:
                     # Non-free call: check if any argument is a freed pointer
                     if not use_after_free and freed_ids:
@@ -1088,7 +1099,7 @@ def _detect_double_free(fn) -> dict:
     return {
         "double_free":    double_free,
         "use_after_free": use_after_free,
-        "freed_ptrs":     list(freed_ids.values()),
+        "freed_ptrs":     [name for name, _blk in freed_ids.values()],
     }
 
 
