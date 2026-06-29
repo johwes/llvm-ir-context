@@ -1618,7 +1618,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                header: str, include_dirs: list[str],
                                output_dir: Path, src_dir: str,
                                save_prompt: bool = False,
-                               header_path: str = "") -> bool:
+                               header_path: str = "",
+                               libs: list[str] | None = None) -> bool:
     """Build a two-section prompt: vulnerable callee context + caller entry point.
 
     The model sees where the bug is (vuln_fn) and where the harness must
@@ -1758,9 +1759,10 @@ the public API function that calls `{vuln_fn}`.
         messages.append({"role": "assistant", "content": _assistant_content(reply)})
         messages.append({"role": "user", "content": bs_msg})
 
-    inc = "".join(f" -I {d}" for d in include_dirs)
+    inc     = "".join(f" -I {d}" for d in include_dirs)
+    lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
     print(f"\nTo fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> "
+    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} "
           f"-o fuzzer_{vuln_fn}_via_{caller_fn}")
     print(f"  ./fuzzer_{vuln_fn}_via_{caller_fn}")
     return True
@@ -1774,7 +1776,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                  include_dirs: list[str], output_dir: Path,
                  src_dir: str = "", ir_dir: str = "",
                  save_prompt: bool = False,
-                 header_path: str = "") -> bool:
+                 header_path: str = "",
+                 libs: list[str] | None = None) -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
@@ -1801,6 +1804,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 output_dir=output_dir, src_dir=src_dir,
                 save_prompt=save_prompt,
                 header_path=header_path,
+                libs=libs,
             )
 
     # If function has internal linkage and no public caller was found, fall
@@ -2001,14 +2005,16 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             print(f"  ./fuzzer_{fn_name}")
         else:
             print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
-            inc = "".join(f" -I {d}" for d in include_dirs)
+            inc     = "".join(f" -I {d}" for d in include_dirs)
+            lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
             print(f"\nTo fuzz (fallback — compile with source):")
-            print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
+            print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} -o fuzzer_{fn_name}")
             print(f"  ./fuzzer_{fn_name}")
     else:
-        inc = "".join(f" -I {d}" for d in include_dirs)
+        inc     = "".join(f" -I {d}" for d in include_dirs)
+        lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
         print(f"\nTo fuzz:")
-        print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
+        print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} -o fuzzer_{fn_name}")
         print(f"  ./fuzzer_{fn_name}")
     return True
 
@@ -2099,6 +2105,10 @@ def main():
     ap.add_argument("--save-prompt",  action="store_true",
                     help="Write harness_<fn>_prompt.md alongside each harness showing "
                          "the full message sequence sent to the model (system + user turns)")
+    ap.add_argument("--lib",          metavar="PATH", action="append", default=[],
+                    help="Library or object to link into the fuzzer binary "
+                         "(repeatable). Accepts .a/.so paths or -lname flags. "
+                         "Example: --lib /path/to/libssl.a --lib /path/to/libcrypto.a")
     args = ap.parse_args()
 
     if args.ll and not args.function:
@@ -2119,6 +2129,7 @@ def main():
         include_dirs = []
     output_dir   = Path(args.output_dir)
     src_dir      = args.src_dir
+    libs         = args.lib  # list[str], may be empty
 
     header_path  = args.header or ""
 
@@ -2127,7 +2138,8 @@ def main():
                      src_dir=src_dir,
                      ir_dir=str(Path(args.ll).parent),
                      save_prompt=args.save_prompt,
-                     header_path=header_path)
+                     header_path=header_path,
+                     libs=libs)
         return
 
     # ir-dir mode
@@ -2138,7 +2150,7 @@ def main():
             ap.error(f"--function {args.function!r} not found in any .ll file under {args.ir_dir}")
         generate_one(ll_path, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir, ir_dir=args.ir_dir, save_prompt=args.save_prompt,
-                     header_path=header_path)
+                     header_path=header_path, libs=libs)
         return
 
     print(f"── ranking functions in {args.ir_dir} ──────────────")
@@ -2156,7 +2168,8 @@ def main():
         ok = generate_one(ll_path, fn_name, header, include_dirs, output_dir,
                           src_dir=src_dir, ir_dir=args.ir_dir,
                           header_path=header_path,
-                          save_prompt=args.save_prompt)
+                          save_prompt=args.save_prompt,
+                          libs=libs)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
