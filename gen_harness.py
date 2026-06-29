@@ -1656,6 +1656,10 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     ))
     is_fd_reader      = _has_read_sink and _first_param_is_int
     is_context_reader = _has_read_sink and not _first_param_is_int
+    print(f"  DEBUG: sink_fns={_gen_sink_fns} has_read={_has_read_sink} "
+          f"first_int={_first_param_is_int} ctx_reader={is_context_reader} "
+          f"double_free={summary_json.get('double_free')} "
+          f"df_callees={summary_json.get('df_callees')}")
     # For internal-linkage functions build a forward decl so the harness IR
     # compiles without the defining TU present. The harness is linked with
     # the full src/ tree so the symbol resolves at final link time.
