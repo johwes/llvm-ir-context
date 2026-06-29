@@ -640,7 +640,7 @@ def score_ir_dir(
                 if caller in wrapper_of:
                     continue
                 caller_sinks = _sink_fns(caller)
-                if not caller_sinks or caller_sinks <= root_sinks:
+                if caller_sinks and caller_sinks <= root_sinks:
                     wrapper_of[caller] = root
                     details[caller] += f"  [wrapper of {root}]"
                     changed = True
