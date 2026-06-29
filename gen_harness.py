@@ -961,13 +961,16 @@ def save_prompt_file(path: Path, messages: list[dict]) -> None:
 def build_task_block(fn_name: str, summary: dict,
                      target_header: str = "",
                      is_internal: bool = False,
-                     is_fd_reader: bool = False) -> str:
+                     is_fd_reader: bool = False,
+                     is_context_reader: bool = False) -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
     Each module is independent and testable in isolation.
     is_fd_reader must be computed by the caller (generate_one uses a robust
     fallback that catches fgets via source text when the slicer sink list misses it).
+    is_context_reader: function reads through an opaque handle/context (BIO*, FILE*,
+    EVP_MD_CTX*, etc.) rather than taking a raw fd or buffer argument directly.
     """
     hint = summary.get("harness_hint", "")
     strcmp_guards = summary.get("strcmp_guards", [])
@@ -1026,6 +1029,8 @@ def build_task_block(fn_name: str, summary: dict,
         )
     elif is_fd_reader:
         pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
+    elif is_context_reader:
+        pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
     else:
         modules.append(
             f"- Pass `Data` and `Size` into `{fn_name}` — "
@@ -1150,6 +1155,23 @@ def build_task_block(fn_name: str, summary: dict,
             f"and the target's read loop terminates naturally.\n"
             f"  Use `socketpair` (bidirectional) rather than `pipe` when the target "
             f"opens the fd twice (e.g. `fdopen(fd, \"r\")` + `fdopen(dup(fd), \"w\")`)."
+        )
+
+    # --- M-11: Context/handle reader — populate handle with fuzz data before calling ---
+    # Fires when the function reads through an opaque handle (BIO*, FILE*, EVP_MD_CTX*,
+    # etc.) rather than taking a raw fd or buffer argument. The model must create the
+    # handle and write fuzz data into it before calling the target.
+    if is_context_reader:
+        modules.append(
+            f"- `{fn_name}` reads its input through an opaque context or handle object "
+            f"(e.g. BIO*, FILE*, or similar), not a raw buffer or file descriptor argument. "
+            f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`. "
+            f"For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
+            f"before passing the BIO to `{fn_name}`. "
+            f"For a FILE*: use `fmemopen(Data, Size, \"r\")`. "
+            f"Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
+            f"check the function signature and API reference to identify which parameter "
+            f"is the handle and which are output/flag parameters."
         )
 
     # --- M-10: Global init state warning for internal-linkage functions ---
@@ -1500,7 +1522,7 @@ the public API function that calls `{vuln_fn}`.
         messages.append({"role": "assistant", "content": _assistant_content(reply)})
         messages.append({"role": "user", "content": bs_msg})
 
-    inc = f" -I {include_dirs[0]}" if include_dirs else ""
+    inc = "".join(f" -I {d}" for d in include_dirs)
     print(f"\nTo fuzz:")
     print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> "
           f"-o fuzzer_{vuln_fn}_via_{caller_fn}")
@@ -1576,11 +1598,18 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                     if ir_sig else "")
     _FD_READER_SINKS_GEN = frozenset({"fgets", "recv", "recvfrom", "read"})
     _gen_sink_fns = {s.get("fn") for s in summary_json.get("sinks", [])}
-    # Also treat fd-reader as true when the target is internal and reads via fgets/recv —
-    # the M-09 socketpair pattern is needed regardless of whether slicer captured it.
-    is_fd_reader = bool(_gen_sink_fns & _FD_READER_SINKS_GEN) or (
+    _has_read_sink = bool(_gen_sink_fns & _FD_READER_SINKS_GEN) or (
         is_internal and "fgets" in ctx
     )
+    # Distinguish true fd-readers (first param is integer: i32/i64 fd) from
+    # context/handle readers (first param is ptr: BIO*, FILE*, EVP_MD_CTX*, ...).
+    # IR signature: "define ... @fn(i32 noundef %0, ...)" → fd-reader
+    #               "define ... @fn(ptr noundef %0, ...)" → context-reader
+    _first_param_is_int = bool(ir_sig and re.search(
+        r'@' + re.escape(fn_name) + r'\s*\(\s*i(?:8|16|32|64)\b', ir_sig
+    ))
+    is_fd_reader      = _has_read_sink and _first_param_is_int
+    is_context_reader = _has_read_sink and not _first_param_is_int
     # For internal-linkage functions build a forward decl so the harness IR
     # compiles without the defining TU present. The harness is linked with
     # the full src/ tree so the symbol resolves at final link time.
@@ -1593,7 +1622,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         if c_decl:
             internal_fn_decl = c_decl
     task_block   = build_task_block(fn_name, summary_json, target_header=header,
-                                    is_internal=is_internal, is_fd_reader=is_fd_reader)
+                                    is_internal=is_internal, is_fd_reader=is_fd_reader,
+                                    is_context_reader=is_context_reader)
 
     # Extract global declarations from the original IR so the pipeline can
     # inject correct extern decls and resets without relying on the model.
@@ -1729,12 +1759,12 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             print(f"  ./fuzzer_{fn_name}")
         else:
             print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
-            inc = f" -I {include_dirs[0]}" if include_dirs else ""
+            inc = "".join(f" -I {d}" for d in include_dirs)
             print(f"\nTo fuzz (fallback — compile with source):")
             print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
             print(f"  ./fuzzer_{fn_name}")
     else:
-        inc = f" -I {include_dirs[0]}" if include_dirs else ""
+        inc = "".join(f" -I {d}" for d in include_dirs)
         print(f"\nTo fuzz:")
         print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c} <target_lib> -o fuzzer_{fn_name}")
         print(f"  ./fuzzer_{fn_name}")
