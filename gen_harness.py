@@ -920,12 +920,15 @@ def _ir_sig_to_c_decl(ir_sig: str, fn_name: str) -> str:
     return f"static {ret_c} {fn_name}({params_c});"
 
 
-def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False, internal_fn_decl: str = "") -> str:
+def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False, internal_fn_decl: str = "",
+                            include_dirs: list[str] | None = None) -> str:
     """Return the canonical #include preamble for a harness.
 
     Deterministic — derived from slicer-detected sinks and the project header.
     Called at write time so the model's own include choices are discarded.
     header_path must be a filesystem path (not file content).
+    include_dirs: -I paths used to compile; used to compute the correct
+    relative include path (e.g. "openssl/pem.h" rather than just "pem.h").
     """
     _SINK_HEADERS: dict[str, str] = {
         "memcpy": "<string.h>", "memmove": "<string.h>", "memset": "<string.h>",
@@ -969,7 +972,19 @@ def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: 
     lines = [f"#include {h}" for h in ordered]
     if header_path:
         import os as _os
-        lines.append(f'#include "{_os.path.basename(header_path)}"')
+        hdr_abs = _os.path.abspath(header_path)
+        rel_include = None
+        for inc_dir in (include_dirs or []):
+            inc_abs = _os.path.abspath(inc_dir)
+            try:
+                rel = _os.path.relpath(hdr_abs, inc_abs)
+                # Accept only paths that don't escape the include root
+                if not rel.startswith(".."):
+                    rel_include = rel
+                    break
+            except ValueError:
+                pass  # Windows cross-drive — skip
+        lines.append(f'#include "{rel_include or _os.path.basename(header_path)}"')
     if internal_fn_decl:
         lines.append(internal_fn_decl)
     return "\n".join(lines)
@@ -1742,7 +1757,7 @@ the public API function that calls `{vuln_fn}`.
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n── calling {MODEL} (attempt {attempt}/{MAX_RETRIES}) ──────")
         reply = ask_qwen(messages)
-        preamble = _build_include_preamble(merged_summary, header_path=header_path)
+        preamble = _build_include_preamble(merged_summary, header_path=header_path, include_dirs=include_dirs)
         code  = _apply_preamble(extract_c(reply), preamble)
         if is_fd_reader:
             code = _inject_sigpipe_ignore(code)
@@ -1967,7 +1982,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 ),
             })
             continue
-        preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader, internal_fn_decl=internal_fn_decl)
+        preamble = _build_include_preamble(summary_json, header_path=header_path, is_fd_reader=is_fd_reader, internal_fn_decl=internal_fn_decl, include_dirs=include_dirs)
         code  = _apply_preamble(extracted, preamble)
         if is_fd_reader:
             code = _inject_sigpipe_ignore(code)
