@@ -343,19 +343,33 @@ def _p_at_k(ranked: list[tuple[str, float]], answer_key: set[str], k: int):
 
 def _print_table(label: str, ranked: list[tuple[str, float]],
                  answer_key: set[str], top_k: int,
-                 details: dict[str, str] | None = None):
+                 details: dict[str, str] | None = None,
+                 wrapper_of: dict[str, str] | None = None):
+    # Group wrappers: impl_fn → [wrapper_fn, ...]
+    wrappers_for: dict[str, list[str]] = {}
+    if wrapper_of:
+        for w, impl in wrapper_of.items():
+            wrappers_for.setdefault(impl, []).append(w)
+
     print(f"\n=== {label} ===")
     print(f"  {'Rank':>4}  {'Function':<44} {'Score':>6}  {'Vuln?':<5}"
           + ("  Details" if details else ""))
     print(f"  {'----':>4}  {'-'*44} {'------':>6}  {'-----':<5}")
     boundary = False
-    for i, (fn, score) in enumerate(ranked, 1):
-        if i == top_k + 1 and not boundary:
+    rank = 0
+    for fn, score in ranked:
+        if wrapper_of and fn in wrapper_of:
+            continue   # printed beneath its implementation
+        rank += 1
+        if rank == top_k + 1 and not boundary:
             print(f"  {'----':>4}  {'-'*44} {'------':>6}  (below top-{top_k})")
             boundary = True
         vuln = ("YES" if fn in answer_key else "no") if answer_key else ""
         det  = f"  {details[fn]}" if details and fn in details else ""
-        print(f"  {i:>4}  {fn:<44} {score:>5.1%}  {vuln:<5}{det}")
+        print(f"  {rank:>4}  {fn:<44} {score:>5.1%}  {vuln:<5}{det}")
+        for w in sorted(wrappers_for.get(fn, [])):
+            w_vuln = ("YES" if w in answer_key else "no") if answer_key else ""
+            print(f"  {'':>4}    └─ {w:<42} {score:>5.1%}  {w_vuln}")
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +530,45 @@ def score_ir_dir(
                     key=lambda x: (x[1], summaries.get(x[0], {}).get("n_sinks", 0)),
                     reverse=True)
 
+    # Wrapper deduplication: identify thin wrappers whose only contribution is
+    # delegating to a higher-ranked function already in the output.
+    #
+    # A function W is a wrapper of implementation I when:
+    #   1. W calls I (W appears in caller_map[I])
+    #   2. I ranks higher than W (I appears earlier in ranked)
+    #   3. W's sink function set is a subset of I's sink function set —
+    #      W adds no sinks beyond what I already exposes
+    #
+    # Wrappers are annotated in details and tracked in wrapper_of{} so the
+    # CLI can group them beneath their implementation in the output.
+    rank_position = {fn: i for i, (fn, _) in enumerate(ranked)}
+
+    def _sink_fns(fn: str) -> frozenset:
+        return frozenset(
+            s.get("fn", "") for s in summaries.get(fn, {}).get("sinks", [])
+            if s.get("fn") not in ("getelementptr", "alloca")
+        )
+
+    wrapper_of: dict[str, str] = {}   # wrapper_fn → impl_fn
+    for impl_fn, callers in caller_map.items():
+        if impl_fn not in rank_position:
+            continue
+        impl_sinks = _sink_fns(impl_fn)
+        if not impl_sinks:
+            continue
+        impl_rank = rank_position[impl_fn]
+        for caller in callers:
+            if caller not in rank_position:
+                continue
+            if rank_position[caller] <= impl_rank:
+                continue   # caller ranks higher — impl is not the authority
+            if caller in wrapper_of:
+                continue   # already assigned to another impl
+            caller_sinks = _sink_fns(caller)
+            if caller_sinks and caller_sinks <= impl_sinks:
+                wrapper_of[caller] = impl_fn
+                details[caller] += f"  [wrapper of {impl_fn}]"
+
     return {
         "ranked":     ranked,
         "summaries":  summaries,
@@ -524,6 +577,7 @@ def score_ir_dir(
         "caller_map": caller_map,
         "no_slice":   no_slice_fns,
         "answer_key": answer_key or set(),
+        "wrapper_of": wrapper_of,
     }
 
 
@@ -628,7 +682,12 @@ def main() -> None:
         print(f"--no-gep-only: suppressing {len(result['gep_only_suppressed'])} GEP-only function(s): "
               + ", ".join(sorted(result["gep_only_suppressed"])))
 
-    _print_table("Philosophy 2 rule", ranked, answer_key, top_k, details)
+    wrapper_of = result.get("wrapper_of", {})
+    n_wrappers = len(wrapper_of)
+    if n_wrappers:
+        print(f"Wrappers deduplicated: {n_wrappers} thin wrapper(s) grouped beneath their implementation")
+
+    _print_table("Philosophy 2 rule", ranked, answer_key, top_k, details, wrapper_of)
 
     print(f"\n{'='*65}")
     if answer_key:
