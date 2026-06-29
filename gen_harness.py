@@ -158,95 +158,80 @@ def resolve_public_caller(ll_path: str, fn_name: str,
                 any_matches.append(entry)
     return (header_matches or any_matches or [None])[0]
 
-def _line_start(text: str, pos: int) -> int:
-    """Return the column-0 index of the line containing pos."""
-    return text.rfind('\n', 0, pos) + 1
+try:
+    from tree_sitter import Language, Parser as _TSParser
+    import tree_sitter_c as _tsc
+    _C_LANG   = Language(_tsc.language())
+    _TS_PARSER = _TSParser(_C_LANG)
+    _TS_AVAILABLE = True
+except Exception:
+    _TS_AVAILABLE = False
 
 
-def _line_is_at_column_zero(text: str, pos: int) -> bool:
-    """True if the line containing pos starts with a non-whitespace character.
+def _ts_declarator_name(node) -> str:
+    """Return the function name from a function_declarator or pointer_declarator node."""
+    for child in node.children:
+        if child.type == 'identifier':
+            return child.text.decode('utf-8', errors='replace')
+        if child.type in ('function_declarator', 'pointer_declarator',
+                          'parenthesized_declarator'):
+            name = _ts_declarator_name(child)
+            if name:
+                return name
+    return ''
 
-    A function definition signature always starts its first token at column 0.
-    An indented call site has leading spaces or tabs.
-    """
-    ls = _line_start(text, pos)
-    return bool(text[ls:ls + 1]) and text[ls] not in (' ', '\t')
+
+def _ts_find_fn_def(node, fn_name: str):
+    """Walk the tree-sitter AST and return the function_definition node for fn_name."""
+    if node.type == 'function_definition':
+        for child in node.children:
+            if child.type in ('function_declarator', 'pointer_declarator'):
+                if _ts_declarator_name(child) == fn_name:
+                    return node
+    for child in node.children:
+        result = _ts_find_fn_def(child, fn_name)
+        if result:
+            return result
+    return None
 
 
 def extract_fn_source(src_text: str, fn_name: str) -> str:
-    """Extract the body of fn_name from C source text using brace matching.
+    """Extract the body of fn_name from C source text.
 
-    Finds the function definition line then walks forward tracking brace depth
-    until the matching closing brace. Returns the full function text including
-    signature, or empty string if not found.
+    Uses tree-sitter-c when available for exact AST-based extraction.
+    Falls back to regex + brace counting when tree-sitter is not installed.
 
-    Returns empty string if the function appears to be macro-generated (no
-    parseable column-0 definition found) — injecting a call site would mislead
-    the LLM.
+    Returns empty string if no function_definition node is found — correctly
+    handles macro-generated functions (e.g. OpenSSL's IMPLEMENT_PEM_rw) where
+    no parseable definition exists in the source file.
     """
-    # Find all occurrences of fn_name followed by '(' (i.e. all calls and definitions).
-    # A definition has fn_name( on a line whose first non-empty char is at column 0
-    # (the return type may be on the same line or the line immediately above).
-    # A call site is always indented.
+    if _TS_AVAILABLE:
+        src_bytes = src_text.encode('utf-8', errors='replace')
+        tree = _TS_PARSER.parse(src_bytes)
+        node = _ts_find_fn_def(tree.root_node, fn_name)
+        if node is None:
+            return ''
+        return src_bytes[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+
+    # --- Regex fallback (used only when tree-sitter is not installed) ---
     pat = re.compile(rf'\b{re.escape(fn_name)}\s*\(')
-    fn_start = None
-    brace_start = None
+    fn_start = brace_start = None
     for m in pat.finditer(src_text):
-        if not _line_is_at_column_zero(src_text, m.start()):
+        ls = src_text.rfind('\n', 0, m.start()) + 1
+        line_head = src_text[ls:ls + 2]
+        if src_text[ls:ls + 1] in (' ', '\t') or line_head in ('//', '/*'):
             continue
-        # Skip comment lines — they start at column 0 but are not definitions.
-        ls = _line_start(src_text, m.start())
-        line_prefix = src_text[ls:ls + 2]
-        if line_prefix in ('//', '/*'):
-            continue
-        # The line starts at column 0 — candidate definition.
-        # Look for the opening '{' of the function body. Reject if there's a ';'
-        # before the '{' (that would be a prototype/declaration, not a definition).
         rest = src_text[m.start():]
-        semi = rest.find(';')
-        brace = rest.find('{')
-        if brace == -1:
+        semi, brace = rest.find(';'), rest.find('{')
+        if brace == -1 or (semi != -1 and semi < brace) or '\n\n' in rest[:brace]:
             continue
-        if semi != -1 and semi < brace:
-            continue  # prototype
-        # Also reject if there's a blank line between fn_name and '{' — that
-        # suggests fn_name was a macro argument, not a function being defined.
-        between = src_text[m.start():m.start() + brace]
-        if '\n\n' in between:
-            continue
-        # Good — this is a definition.  Find the start of the full signature:
-        # walk back from the line of fn_name to include any return-type lines
-        # at column 0 that precede it without a blank line.
-        ls = _line_start(src_text, m.start())
-        sig_start = ls
-        # Walk back over consecutive non-blank column-0 lines (return types, attributes)
-        while sig_start > 0:
-            prev_end = sig_start - 1          # index of '\n' before this line
-            prev_ls  = _line_start(src_text, prev_end - 1)
-            prev_line = src_text[prev_ls:sig_start].strip()
-            if not prev_line or not _line_is_at_column_zero(src_text, prev_ls):
-                break
-            # Stop if the previous line looks like the end of another function,
-            # a preprocessor directive, or a comment block.
-            if (prev_line == '}'
-                    or prev_line.endswith('}')
-                    or prev_line.endswith(';')
-                    or prev_line.startswith('#')
-                    or prev_line.startswith('//')
-                    or prev_line.startswith('/*')
-                    or prev_line.endswith('*/')):
-                break
-            sig_start = prev_ls
-        fn_start   = sig_start
+        fn_start    = ls
         brace_start = m.start() + brace
         break
-
     if fn_start is None:
-        return ""
-
+        return ''
     depth = 0
-    i = brace_start
-    while i < len(src_text):
+    for i in range(brace_start, len(src_text)):
         ch = src_text[i]
         if ch == '{':
             depth += 1
@@ -254,8 +239,7 @@ def extract_fn_source(src_text: str, fn_name: str) -> str:
             depth -= 1
             if depth == 0:
                 return src_text[fn_start:i + 1]
-        i += 1
-    return ""  # unterminated — should not happen for valid C
+    return ''
 
 
 def find_source_for_ll(ll_path: str, src_dir: str) -> str:
