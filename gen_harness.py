@@ -471,15 +471,17 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
                 in_macro = False
             continue
 
-        # Integer/hex constant macros (flags, error codes) — always keep
-        if re.match(r'\s*#define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?',
+        # Integer/hex constant macros (flags, error codes) — always keep.
+        # Match both "#define FOO 0x1" and "# define FOO 0x1" (OpenSSL style).
+        if re.match(r'\s*#\s*define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?',
                     line):
             keep.append(line)
             continue
 
         # Multi-line #define (function-like or object-like with continuation):
         # skip the header line and set in_macro to skip continuation lines.
-        if stripped.startswith('#define'):
+        # Match both "#define" and "# define" (OpenSSL-style spaced variant).
+        if re.match(r'\s*#\s*define\b', stripped):
             if stripped.endswith('\\'):
                 in_macro = True
             continue
@@ -540,6 +542,49 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
         return trimmed
 
     return trimmed[:char_limit] + "\n/* ... header truncated ... */\n"
+
+
+# Known handle types for context-reader functions and their setup/teardown APIs.
+# Keyed by handle type name (first param C type without pointer/const).
+_HANDLE_API_SNIPPETS: dict[str, str] = {
+    "BIO": """\
+BIO *BIO_new(const BIO_METHOD *type);
+int  BIO_free(BIO *a);
+const BIO_METHOD *BIO_s_mem(void);
+const BIO_METHOD *BIO_s_secmem(void);
+int  BIO_write(BIO *b, const void *data, int dlen);
+int  BIO_read(BIO *b, void *data, int dlen);
+void OPENSSL_free(void *addr);
+void OPENSSL_secure_free(void *ptr);
+""",
+    "FILE": """\
+FILE *fmemopen(void *buf, size_t size, const char *mode);
+""",
+    "EVP_MD_CTX": """\
+EVP_MD_CTX *EVP_MD_CTX_new(void);
+void        EVP_MD_CTX_free(EVP_MD_CTX *ctx);
+""",
+    "EVP_CIPHER_CTX": """\
+EVP_CIPHER_CTX *EVP_CIPHER_CTX_new(void);
+void            EVP_CIPHER_CTX_free(EVP_CIPHER_CTX *ctx);
+""",
+}
+
+
+def _context_reader_api_snippet(c_source_sig: str, ir_sig: str) -> str:
+    """Return additional API signatures for the handle type used by a context-reader.
+
+    Detects the handle type from the C source signature (first parameter type)
+    or falls back to the IR signature for pointer-typed first params.
+    Returns an empty string when the handle type is unknown.
+    """
+    # Extract first parameter type from C source (e.g. "BIO *bp" → "BIO")
+    m = re.search(r'\(\s*(?:const\s+)?([A-Za-z_]\w*)\s*\*', c_source_sig or "")
+    if m:
+        handle_type = m.group(1)
+        if handle_type in _HANDLE_API_SNIPPETS:
+            return _HANDLE_API_SNIPPETS[handle_type]
+    return ""
 
 
 def ranked_functions(ir_dir: str, no_gep_only: bool) -> list[tuple[str, str]]:
@@ -1724,8 +1769,6 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     _priority = (summary_json.get("df_callees") or set()) | (summary_json.get("uaf_callees") or set())
     callee_src_block = _callee_source_block(ll_path, fn_name, src_dir,
                                              priority_callees=_priority or None)
-    header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
-    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     sig_block    = (f"\n## Function signature (from IR)\n```\n{ir_sig}\n```"
                     if ir_sig else "")
     _FD_READER_SINKS_GEN = frozenset({"fgets", "recv", "recvfrom", "read"})
@@ -1742,6 +1785,12 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     ))
     is_fd_reader      = _has_read_sink and _first_param_is_int
     is_context_reader = _has_read_sink and not _first_param_is_int
+    header_trimmed = _extract_header_for_fn(header, fn_name, ir_sig, include_dirs) if header else ""
+    if is_context_reader:
+        snippet = _context_reader_api_snippet(src_block, ir_sig)
+        if snippet and snippet not in header_trimmed:
+            header_trimmed = (header_trimmed.rstrip() + "\n" + snippet) if header_trimmed else snippet
+    header_block = f"\n## API reference\n```c\n{header_trimmed}\n```" if header_trimmed else ""
     # For internal-linkage functions build a forward decl so the harness IR
     # compiles without the defining TU present. The harness is linked with
     # the full src/ tree so the symbol resolves at final link time.
