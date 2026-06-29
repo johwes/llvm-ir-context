@@ -41,7 +41,10 @@ from pathlib import Path
 
 import requests
 
-ENDPOINT         = os.environ.get("LLM_ENDPOINT", "")
+_endpoint_raw    = os.environ.get("LLM_ENDPOINT", "")
+ENDPOINT         = (_endpoint_raw.rstrip("/") + "/chat/completions"
+                    if _endpoint_raw and not _endpoint_raw.rstrip("/").endswith("/chat/completions")
+                    else _endpoint_raw)
 MODEL            = os.environ.get("LLM_MODEL", "")
 MAX_RETRIES      = 3
 SELF_HARM_WARN   = 0.90
