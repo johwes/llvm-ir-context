@@ -288,18 +288,29 @@ def fn_in_header(fn_name: str, header_text: str) -> bool:
     return bool(re.search(rf'\b{re.escape(fn_name)}\s*\(', header_text))
 
 
-def _clang_ast_type_names(header_text: str, fn_name: str,
-                           include_dirs: list[str] | None = None) -> set[str]:
-    """Ask clang to parse the header and return C type names used by fn_name.
+def _clang_ast_info(header_text: str, fn_name: str,
+                    include_dirs: list[str] | None = None,
+                    clang_bin: str = "clang-20",
+                    ) -> "tuple[set[str], list[tuple[int,int]]]":
+    """Parse the header with clang and return (type_names, decl_line_ranges).
 
-    Writes the header to a temp file, runs clang -fsyntax-only -Xclang -ast-dump,
-    streams text output until it finds the FunctionDecl for fn_name, then collects
-    type names from ParmVarDecl and return-type lines.
+    type_names       — C type names used by fn_name (for typedef/struct filtering)
+    decl_line_ranges — [(start_line, end_line), ...] 1-based, inclusive, one entry
+                       per FunctionDecl matching fn_name in this file.
 
-    Returns an empty set on any failure (timeout, parse error, fn not found).
+    Uses the text-mode AST dump (-ast-dump without =json) which is available on
+    all clang versions and doesn't require JSON parsing of a potentially huge tree.
+
+    The text format for a FunctionDecl looks like:
+      |-FunctionDecl 0x... <file.h:42:1, col:52> col:5 PEM_read_bio_ex 'int (...)'
+    The source range <start, end> gives line numbers directly.
+    Child ParmVarDecl lines give additional type names and the end line of the decl.
+
+    Returns (set(), []) on any failure.
     """
     import tempfile
     terms: set[str] = set()
+    ranges: list[tuple[int, int]] = []
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".h", mode="w",
@@ -307,7 +318,7 @@ def _clang_ast_type_names(header_text: str, fn_name: str,
             tmp.write(header_text)
             tmp_path = tmp.name
 
-        cmd = ["clang-20", "-fsyntax-only", "-w",
+        cmd = [clang_bin, "-fsyntax-only", "-w",
                "-Xclang", "-ast-dump", "-x", "c", tmp_path]
         for d in (include_dirs or []):
             cmd += ["-I", d]
@@ -315,35 +326,64 @@ def _clang_ast_type_names(header_text: str, fn_name: str,
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True)
 
-        in_fn = False
-        lines_after = 0
-        type_re = re.compile(r"'([A-Za-z_]\w*(?:\s*\*)*)'")
+        # AST location pattern: <file:LINE:col, LINE:col> or <file:LINE:col, col:N>
+        # We want the start and end line numbers.
+        loc_re   = re.compile(
+            r'<(?:[^:>]+):(\d+):\d+,\s*(?:[^:>]+:)?(\d+):\d+>'
+        )
+        type_re  = re.compile(r"'([A-Za-z_]\w*(?:\s*\*)*)'")
+        fn_re    = re.compile(rf'\bFunctionDecl\b.*\b{re.escape(fn_name)}\b')
+
+        in_fn        = False
+        fn_start     = 0
+        fn_end       = 0
+        fn_indent    = 0
+        lines_after  = 0
 
         for raw in proc.stdout:  # type: ignore[union-attr]
             line = raw.rstrip()
+
             if not in_fn:
-                if "FunctionDecl" in line and re.search(
-                    rf'\b{re.escape(fn_name)}\b', line
-                ):
-                    in_fn = True
+                if "FunctionDecl" in line and fn_re.search(line):
+                    lm = loc_re.search(line)
+                    if lm:
+                        fn_start = int(lm.group(1))
+                        fn_end   = int(lm.group(2))
+                    # Track indentation depth so we stop at the next sibling
+                    fn_indent   = len(raw) - len(raw.lstrip('|-` '))
+                    in_fn       = True
+                    lines_after = 0
                     for m in type_re.finditer(line):
                         terms.add(m.group(1).rstrip(" *").strip())
                 continue
 
+            # Collect type names from child nodes
             for m in type_re.finditer(line):
                 t = m.group(1).rstrip(" *").strip()
                 if t:
                     terms.add(t)
 
+            # Update end line from child ParmVarDecl locations
+            lm = loc_re.search(line)
+            if lm:
+                fn_end = max(fn_end, int(lm.group(2)))
+
             lines_after += 1
-            # Stop when the next sibling (un-indented) node begins
-            if lines_after > 5 and re.match(r"[A-Z]", line.lstrip("-| ")):
+            # Stop at next top-level sibling node (same or lower indent)
+            node_indent = len(raw) - len(raw.lstrip('|-` '))
+            if lines_after > 2 and node_indent <= fn_indent and re.search(
+                r'\b(FunctionDecl|TypedefDecl|RecordDecl|VarDecl|EnumDecl)\b', line
+            ):
                 break
-            if lines_after > 60:
+            if lines_after > 80:
                 break
 
         proc.kill()
         proc.wait()
+
+        if fn_start > 0:
+            ranges.append((fn_start, max(fn_end, fn_start)))
+
     except Exception:
         pass
     finally:
@@ -353,90 +393,52 @@ def _clang_ast_type_names(header_text: str, fn_name: str,
             except Exception:
                 pass
 
-    return terms
+    return terms, ranges
 
 
 def _extract_header_for_fn(header_text: str, fn_name: str,
                             ir_signature: str = "",
                             include_dirs: list[str] | None = None,
                             char_limit: int = 6000) -> str:
-    """Return a compiler-informed trimmed view of the header focused on fn_name.
+    """Return a trimmed header view focused on fn_name using clang AST.
 
-    Builds a term set from two compiler-derived sources:
-      1. IR signature  -- struct names from %struct.NAME patterns (free, no subprocess)
-      2. clang AST     -- C-level typedef/type names from ParmVarDecl nodes
+    Strategy (in order of preference):
+    1. Use clang -ast-dump to find the exact source lines of every FunctionDecl
+       for fn_name, plus the C type names it uses.
+    2. Include typedef/struct definitions for those types (for opaque handles).
+    3. Include integer/hex #define constants (flags, error codes).
+    4. Fall back to IR-derived struct names when clang is unavailable.
+    5. Hard-truncate at char_limit as a last resort.
 
-    Keeps typedef/struct blocks and declaration lines that mention any collected
-    term. Falls back to hard truncation at char_limit if still too large.
-    Gracefully degrades to IR-only terms if clang fails.
+    No custom line-by-line parsing of macro syntax — clang does that correctly.
     """
-    # Pre-pass: strip orphaned macro continuation fragments.
-    # Multi-line #define macros in C headers produce lines like:
-    #   "                                       const char *propq)"
-    #   "                                 const unsigned char *kstr, int klen,   \"
-    # These are continuation lines with no declaration keyword at the start.
-    # They carry no useful information for the LLM and inflate context.
-    # A line is a continuation fragment when ALL of:
-    #   - heavily indented (>8 leading spaces, i.e. not a top-level declaration)
-    #   - no semicolon or opening brace (not a complete statement or block start)
-    #   - ends with \ (explicit continuation) OR looks like a raw param tail
-    #     (ends with ) or , and contains no declaration keyword at start)
-    # Pre-pass: strip orphaned macro continuation fragments.
-    # Strategy: a line is a fragment when it is deeply indented, has no
-    # semicolon or brace, and the previous kept line did NOT open an
-    # unclosed declaration (which would make this a legitimate continuation).
-    # "Unclosed declaration" = a kept line that started a function/typedef
-    # declaration but has no matching ';' or '{' yet.
-    cleaned_lines = []
-    prev_opens_decl = False   # True when the previous kept line is an unclosed decl
-    for line in header_text.splitlines(keepends=True):
-        stripped = line.strip()
-        if not stripped:
-            cleaned_lines.append(line)
-            continue
-        indent = len(line) - len(line.lstrip())
-        is_fragment = (
-            indent > 8
-            and ';' not in stripped
-            and '{' not in stripped
-            and not stripped.startswith('#')
-            and not prev_opens_decl          # previous line is NOT an open decl
-            and (stripped.endswith('\\')
-                 or stripped.endswith(')')
-                 or stripped.endswith(','))
-        )
-        if not is_fragment:
-            cleaned_lines.append(line)
-            # Track whether this kept line opens a declaration that continues
-            # on the next line (no closing ; or { yet).
-            prev_opens_decl = (';' not in stripped and '{' not in stripped
-                                and not stripped.endswith('\\'))
-        else:
-            # Fragment dropped — don't update prev_opens_decl so the next
-            # continuation line (if any) is also correctly classified.
-            pass
-    header_text = "".join(cleaned_lines)
+    header_lines = header_text.splitlines(keepends=True)
 
-    if len(header_text) <= char_limit:
-        return header_text
+    # --- 1. Ask clang for the exact declaration lines and type names ----------
+    clang_bin = shutil.which("clang-20") or shutil.which("clang-18") or \
+                shutil.which("clang-17") or shutil.which("clang-16") or \
+                shutil.which("clang")
+    terms: set[str] = set()
+    decl_lines: set[int] = set()   # 1-based line numbers to include
 
-    # Function name family: deflateInit2_ -> deflate
-    base = fn_name.rstrip("0123456789_")
-    terms: set[str] = {fn_name, base}
+    if clang_bin:
+        terms, ranges = _clang_ast_info(header_text, fn_name,
+                                        include_dirs, clang_bin)
+        for start, end in ranges:
+            for ln in range(start, end + 1):
+                decl_lines.add(ln)
 
-    # IR-derived struct names: %struct.z_stream_s -> z_stream_s + z_stream
+    # --- 2. IR-derived struct names (free, no subprocess) --------------------
     for m in re.finditer(r'%struct\.(\w+)', ir_signature):
         sname = m.group(1)
         terms.add(sname)
-        terms.add(re.sub(r'[_][st]$', '', sname))  # strip _s/_t suffix conventions
+        terms.add(re.sub(r'[_][st]$', '', sname))
 
-    # Compiler-derived C-level type names (best-effort)
-    terms |= _clang_ast_type_names(header_text, fn_name, include_dirs)
+    # Also always include fn_name itself for typedef/struct lookup
+    terms.add(fn_name)
+    terms.add(fn_name.rstrip("0123456789_"))
 
-    # Expand terms transitively: if 'z_stream' is known and a typedef block says
-    # 'typedef struct z_stream_s { ... } z_stream;', also add 'z_stream_s' so
-    # the block-tracking filter below can capture the full struct body.
-    # One pass is sufficient — C typedefs don't recurse in practice.
+    # --- 3. Expand terms transitively through typedef chains -----------------
     _typedef_re = re.compile(r'\btypedef\b[^;]+;', re.DOTALL)
     snapshot = set(terms)
     for _m in _typedef_re.finditer(header_text):
@@ -445,38 +447,62 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
             for ident in re.findall(r'\b([A-Za-z_]\w+)\b', block):
                 terms.add(ident)
 
-    # Filter header lines using the collected terms
-    lines = header_text.splitlines(keepends=True)
+    # --- 4. Build the output -------------------------------------------------
     keep: list[str] = []
-    in_block = False
-    brace_depth = 0
-    in_comment = False
+    in_block      = False
+    brace_depth   = 0
+    in_comment    = False
+    in_macro      = False   # inside a multi-line #define (continuation lines)
+    in_open_paren = False   # inside a multi-line function declaration (unbalanced parens)
+    paren_depth   = 0
 
-    for line in lines:
-        # Always keep integer/hex constant macros — LLM needs Z_OK, Z_NO_FLUSH, etc.
-        if re.match(r'\s*#define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?', line):
+    for i, line in enumerate(header_lines, start=1):
+        stripped = line.strip()
+
+        # Always keep exact declaration lines clang identified
+        if i in decl_lines:
+            keep.append(line)
+            in_macro = False
+            continue
+
+        # Track multi-line #define continuation — skip until no trailing backslash
+        if in_macro:
+            if not stripped.endswith('\\'):
+                in_macro = False
+            continue
+
+        # Integer/hex constant macros (flags, error codes) — always keep
+        if re.match(r'\s*#define\s+\w+\s+\(?\s*[-+]?(0[xX][\da-fA-F]+|\d+)\s*\)?',
+                    line):
             keep.append(line)
             continue
 
-        # Drop standalone multi-line comment blocks outside struct/typedef bodies.
-        # Inside a struct body comments describe fields and should be kept.
+        # Multi-line #define (function-like or object-like with continuation):
+        # skip the header line and set in_macro to skip continuation lines.
+        if stripped.startswith('#define'):
+            if stripped.endswith('\\'):
+                in_macro = True
+            continue
+
+        # Track multi-line block comments — keep only inside struct bodies
         if in_comment:
             if in_block:
                 keep.append(line)
             if '*/' in line:
                 in_comment = False
             continue
-        if line.strip().startswith('/*') and '*/' not in line:
+        if stripped.startswith('/*') and '*/' not in line:
             in_comment = True
             if in_block:
                 keep.append(line)
             continue
 
-        if re.match(r'\s*(typedef|struct|#define|#ifndef|#endif)', line):
+        # Typedef/struct blocks that mention a relevant type name
+        if re.match(r'\s*(typedef|struct)\b', line):
             if any(t in line for t in terms):
                 keep.append(line)
                 if '{' in line:
-                    in_block = True
+                    in_block   = True
                     brace_depth = line.count('{') - line.count('}')
             continue
 
@@ -487,13 +513,26 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
                 in_block = False
             continue
 
-        if any(t in line for t in terms):
+        # Fallback when clang was unavailable: term-match non-macro lines,
+        # but skip orphaned continuation fragments (deeply indented, no ; or {).
+        # Track open-paren depth so multi-line signatures are kept whole.
+        if in_open_paren:
             keep.append(line)
+            paren_depth += line.count('(') - line.count(')')
+            if paren_depth <= 0:
+                in_open_paren = False
+            continue
+        if not decl_lines and any(t in line for t in terms):
+            indent = len(line) - len(line.lstrip())
+            if not (indent > 8 and ';' not in stripped and '{' not in stripped):
+                keep.append(line)
+                paren_depth   = stripped.count('(') - stripped.count(')')
+                in_open_paren = paren_depth > 0
 
     trimmed = "".join(keep)
 
-    # If filtering produced almost nothing (clang AST failed + opaque IR ptr),
-    # fall back to hard truncation — verbose header beats an empty one.
+    # If we got almost nothing (clang unavailable + opaque IR ptr + no terms),
+    # fall back to the full header (then truncate).
     if len(trimmed) < 200:
         trimmed = header_text
 
