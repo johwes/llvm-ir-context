@@ -370,6 +370,53 @@ def _extract_header_for_fn(header_text: str, fn_name: str,
     term. Falls back to hard truncation at char_limit if still too large.
     Gracefully degrades to IR-only terms if clang fails.
     """
+    # Pre-pass: strip orphaned macro continuation fragments.
+    # Multi-line #define macros in C headers produce lines like:
+    #   "                                       const char *propq)"
+    #   "                                 const unsigned char *kstr, int klen,   \"
+    # These are continuation lines with no declaration keyword at the start.
+    # They carry no useful information for the LLM and inflate context.
+    # A line is a continuation fragment when ALL of:
+    #   - heavily indented (>8 leading spaces, i.e. not a top-level declaration)
+    #   - no semicolon or opening brace (not a complete statement or block start)
+    #   - ends with \ (explicit continuation) OR looks like a raw param tail
+    #     (ends with ) or , and contains no declaration keyword at start)
+    # Pre-pass: strip orphaned macro continuation fragments.
+    # Strategy: a line is a fragment when it is deeply indented, has no
+    # semicolon or brace, and the previous kept line did NOT open an
+    # unclosed declaration (which would make this a legitimate continuation).
+    # "Unclosed declaration" = a kept line that started a function/typedef
+    # declaration but has no matching ';' or '{' yet.
+    cleaned_lines = []
+    prev_opens_decl = False   # True when the previous kept line is an unclosed decl
+    for line in header_text.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        is_fragment = (
+            indent > 8
+            and ';' not in stripped
+            and '{' not in stripped
+            and not stripped.startswith('#')
+            and not prev_opens_decl          # previous line is NOT an open decl
+            and (stripped.endswith('\\')
+                 or stripped.endswith(')')
+                 or stripped.endswith(','))
+        )
+        if not is_fragment:
+            cleaned_lines.append(line)
+            # Track whether this kept line opens a declaration that continues
+            # on the next line (no closing ; or { yet).
+            prev_opens_decl = (';' not in stripped and '{' not in stripped
+                                and not stripped.endswith('\\'))
+        else:
+            # Fragment dropped — don't update prev_opens_decl so the next
+            # continuation line (if any) is also correctly classified.
+            pass
+    header_text = "".join(cleaned_lines)
+
     if len(header_text) <= char_limit:
         return header_text
 
