@@ -470,14 +470,50 @@ def _extract_slice_pdg(x, edge_index, edge_type, mock_names,
     def _is_sink(name: str) -> bool:
         return _is_dangerous(name) or (extra_sinks is not None and name in extra_sinks)
 
+    # Sinks where the *length* argument makes the call dangerous only when
+    # non-constant. If the length is a compile-time constant (e.g. sizeof(struct)),
+    # the call is bounded and is not a taint-flow risk.
+    # Argument index of the length parameter (0-based, after the callee mock):
+    #   memcpy/memmove/memset/bcopy: arg2 (dst, src, len)
+    #   strncpy/strncat:             arg2 (dst, src, n)
+    #   snprintf/vsnprintf:          arg1 (buf, size, fmt, ...)
+    #   fgets:                       arg1 (buf, size, stream)
+    #   read/recv/recvfrom/pread:    arg2 (buf, len, ...)
+    _LENGTH_ARG_IDX: dict[str, int] = {
+        "memcpy": 2, "memmove": 2, "memset": 2, "bcopy": 2,
+        "strncpy": 2, "strncat": 2,
+        "snprintf": 1, "vsnprintf": 1,
+        "fgets": 1,
+        "read": 2, "recv": 2, "recvfrom": 2, "pread": 2,
+    }
+
+    # Build ordered DFG predecessor list per call node. llvmlite iterates
+    # instr.operands as [arg0, arg1, ..., argN, callee_fn] — callee is last.
+    # So call_dfg_preds[call_node] = [arg0_id, arg1_id, ..., argN_id, mock_id].
+    # _LENGTH_ARG_IDX values are 0-based argument indices, which map directly
+    # to pred list indices (callee at the end doesn't shift arg positions).
+    call_dfg_preds: dict[int, list[int]] = {}
+    for i in range(E):
+        if int(edge_type[i]) == 1:
+            s, d = int(edge_index[0, i]), int(edge_index[1, i])
+            if int(x[d, 0]) == 63:   # call instruction opcode
+                call_dfg_preds.setdefault(d, []).append(s)
+
     dangerous_mocks = {nid for nid, nm in mock_names.items() if _is_sink(nm)}
     sink_ids:    set[int]       = set()
     sink_to_fn: dict[int, str] = {}   # old_node_id → dangerous function name
     for mid in dangerous_mocks:
+        canon = _canonical_name(mock_names[mid])
+        len_idx = _LENGTH_ARG_IDX.get(canon)
         for consumer in fwd_dfg[mid]:
-            if int(x[consumer, 0]) == 63:
-                sink_ids.add(consumer)
-                sink_to_fn[consumer] = _canonical_name(mock_names[mid])
+            if int(x[consumer, 0]) != 63:
+                continue
+            if len_idx is not None:
+                preds = call_dfg_preds.get(consumer, [])
+                if len(preds) > len_idx and int(x[preds[len_idx], 0]) in _CONSTANT_IDS:
+                    continue   # constant-length call — not a dangerous sink
+            sink_ids.add(consumer)
+            sink_to_fn[consumer] = canon
 
     # Sink type 2: GEP or VLA alloca with non-constant operand
     # alloca(non-const) = variable-length array; same structural pattern as GEP
