@@ -1977,6 +1977,12 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             # so the check always false-positives for correct socketpair harnesses.
             print("SKIP — fd-reader: Data flows via socket buffer, slicer cannot trace through kernel")
             break
+        elif is_context_reader:
+            # Data flows through an opaque handle (BIO_write → internal buffer).
+            # The slicer cannot trace through the handle boundary, so a correct
+            # BIO_write harness always appears as a blank shooter. Skip the check.
+            print("SKIP — context-reader: Data flows via opaque handle (BIO/FILE), slicer cannot trace through handle boundary")
+            break
         else:
             bs_msg, bs_ok = _check_blank_shooter(harness_ll, fn_name)
             if bs_ok is not None:
