@@ -1111,13 +1111,12 @@ def _bs_retry_msg(bs_msg: str, fn_name: str, is_fd_reader: bool) -> str:
     )
 
 
-def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
+def _check_blank_shooter(harness_ll: Path, target_fn: str) -> tuple[str | None, str | None]:
     """Check whether fuzz input (Data/Size) reaches the call to target_fn.
 
-    Slices backward from the call to target_fn inside LLVMFuzzerTestOneInput,
-    treating target_fn as a custom sink. Returns a retry message if the slice
-    has no function_argument input channel (i.e. Data/Size never reach the
-    call), or None when the harness passes.
+    Returns (retry_message, ok_message):
+      - (None, ok_str)   — harness passes; Data/Size reach the target
+      - (retry_str, None) — harness fails; retry_str is sent back to the model
     """
     from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
     from llvm_ir_context.slice_context import summarize_slice
@@ -1129,11 +1128,14 @@ def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
         extra_sinks=frozenset({target_fn}),
     )
     if g is None:
-        # No slice found at all — the call to target_fn may not exist in IR.
+        # Slicer found no call to target_fn in LLVMFuzzerTestOneInput at all.
+        # This is a different failure from blank-shooter: the function is simply
+        # not being called. Give the model precise, actionable feedback.
         return (
-            f"Validation failed: the IR slicer found no call to `{target_fn}` "
-            f"inside `LLVMFuzzerTestOneInput`. Ensure the harness actually calls "
-            f"the target function with arguments derived from `Data` and `Size`."
+            f"Validation failed: your harness does not call `{target_fn}`. "
+            f"The IR slicer found no call to `{target_fn}` inside "
+            f"`LLVMFuzzerTestOneInput`. Make sure the harness calls "
+            f"`{target_fn}` directly."
         ), None
 
     summary = summarize_slice(g, fn_name="LLVMFuzzerTestOneInput")
@@ -1142,17 +1144,17 @@ def _check_blank_shooter(harness_ll: Path, target_fn: str) -> str | None:
         return None, (
             f"OK — Data/Size reach `{target_fn}` "
             f"({n} node(s) in slice, guard={summary.get('guard_type','?')})"
-        )  # fuzz input reaches the target — harness passes
+        )
 
     channels = summary.get("input_channels", [])
     return (
         f"Validation failed: your harness is a blank shooter. "
-        f"I traced the data flow backward from the call to `{target_fn}` and "
-        f"neither `Data` nor `Size` from `LLVMFuzzerTestOneInput` reach its "
-        f"arguments (input_channels={channels}) — you are passing constants or "
-        f"locally-computed values that the fuzzer cannot influence. "
-        f"Pass `Data` (or a slice of it) and/or a length derived from `Size` "
-        f"directly into `{target_fn}`."
+        f"I traced the data flow backward from the call to `{target_fn}` inside "
+        f"`LLVMFuzzerTestOneInput` and neither `Data` nor `Size` reach its "
+        f"arguments (input_channels={channels}). "
+        f"You are passing constants or locally-computed values that the fuzzer "
+        f"cannot influence. Derive at least one argument to `{target_fn}` from "
+        f"`Data` or `Size`."
     ), None
 
 
