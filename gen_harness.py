@@ -1025,13 +1025,11 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
 
 def _llvm_link(harness_ll: Path, target_ll: Path, out: Path,
                ir_dir: str = "") -> "tuple[Path | None, str]":
-    """Merge harness IR with target IR into a single self-contained module.
+    """Merge harness IR with target IR into a single IR module.
 
     When ir_dir is provided, links all .ll files in that directory so that
-    cross-file callee references (e.g. BIO_new defined in a different .ll)
-    resolve. Without ir_dir, links only the single target .ll — sufficient
-    for small projects where the target function and its callees are in one
-    translation unit.
+    cross-file callee references resolve. Without ir_dir, links only the
+    single target .ll.
     """
     for linker in ("llvm-link-20", "llvm-link"):
         if shutil.which(linker):
@@ -1051,6 +1049,21 @@ def _llvm_link(harness_ll: Path, target_ll: Path, out: Path,
         capture_output=True, text=True,
     )
     return (out, "") if r.returncode == 0 else (None, r.stderr)
+
+
+def _compile_fuzzer(merged_ll: Path, out_bin: Path) -> "tuple[Path | None, str]":
+    """Compile a merged IR file into a fuzzer binary.
+
+    Returns (binary_path, "") on success, (None, stderr) on failure.
+    Failure with 'undefined reference' means the IR is missing native/assembly
+    symbols — the target must be built as a library with sanitizers instead.
+    """
+    r = subprocess.run(
+        ["clang-20", "-fsanitize=fuzzer,address", "-g",
+         str(merged_ll), "-o", str(out_bin)],
+        capture_output=True, text=True,
+    )
+    return (out_bin, "") if r.returncode == 0 else (None, r.stderr)
 
 
 def self_harm_verdict(score: float) -> str:
@@ -2018,8 +2031,10 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             messages.append({"role": "assistant", "content": _assistant_content(reply)})
             messages.append({"role": "user", "content": bs_msg})
 
-    # For internal-linkage functions: promote linkage in target IR and
-    # merge with harness IR via llvm-link so the static symbol resolves.
+    # Merge harness IR with target IR via llvm-link and attempt a full compile.
+    # If the target uses native/assembly code (OpenSSL AES-NI, SHA, etc.) the
+    # compile will fail with undefined references — in that case, instruct the
+    # user to build the target as a sanitized library and link against it.
     if harness_ll and ll_path:
         print("\n── IR link ──────────────────────────────────────────")
         promoted_ll = _promote_linkage_in_ir(Path(ll_path), fn_name)
@@ -2027,23 +2042,36 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll,
                                        ir_dir=ir_dir)
         if merged:
-            print(f"OK → {merged}")
-            print(f"\nTo fuzz:")
-            print(f"  clang-20 -fsanitize=fuzzer,address -g {merged} -o fuzzer_{fn_name}")
-            print(f"  ./fuzzer_{fn_name}")
+            print(f"IR link OK → {merged}")
+            fuzzer_bin = output_dir / f"fuzzer_{fn_name}"
+            fuzzer, compile_err = _compile_fuzzer(merged, fuzzer_bin)
+            if fuzzer:
+                print(f"Compiled  → {fuzzer}")
+                print(f"\nTo fuzz:")
+                print(f"  {fuzzer}")
+            else:
+                # Assembly or external symbols not in IR — library link required.
+                undef = [l for l in compile_err.splitlines()
+                         if "undefined reference" in l]
+                print(f"Compile failed (IR-only binary not self-contained).")
+                if undef:
+                    print(f"  Missing symbols: {undef[0].strip()}" +
+                          (f" ... (+{len(undef)-1} more)" if len(undef) > 1 else ""))
+                print(
+                    "\nThe target contains symbols not representable in LLVM IR\n"
+                    "(e.g. hand-written assembly, compiler builtins, or external\n"
+                    "libraries). Build the target library with sanitizers and link\n"
+                    "the harness against it:\n"
+                    f"\n  clang-20 -fsanitize=fuzzer,address -g {out_c} \\\n"
+                    f"    -L<lib_dir> -l<target_lib> -o fuzzer_{fn_name}\n"
+                    f"  ./fuzzer_{fn_name}"
+                )
         else:
-            print(f"WARNING: llvm-link failed — {link_err.strip()[:200]}")
-            inc     = "".join(f" -I {d}" for d in include_dirs)
-            lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
-            print(f"\nTo fuzz (fallback — needs library):")
-            print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} -o fuzzer_{fn_name}")
-            print(f"  ./fuzzer_{fn_name}")
-    else:
-        inc     = "".join(f" -I {d}" for d in include_dirs)
-        lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
-        print(f"\nTo fuzz:")
-        print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} -o fuzzer_{fn_name}")
-        print(f"  ./fuzzer_{fn_name}")
+            print(f"IR link failed — {link_err.strip()[:200]}")
+            print(f"\nCompile the harness against your target library:\n"
+                  f"  clang-20 -fsanitize=fuzzer,address -g {out_c} \\\n"
+                  f"    -L<lib_dir> -l<target_lib> -o fuzzer_{fn_name}\n"
+                  f"  ./fuzzer_{fn_name}")
     return True
 
 
