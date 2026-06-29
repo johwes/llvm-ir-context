@@ -575,13 +575,14 @@ def score_ir_dir(
     # delegating to a higher-ranked function already in the output.
     #
     # A function W is a wrapper of implementation I when:
-    #   1. W calls I (W appears in caller_map[I])
-    #   2. I ranks higher than W (I appears earlier in ranked)
-    #   3. W's sink function set is a subset of I's sink function set —
-    #      W adds no sinks beyond what I already exposes
+    #   1. W is reachable from I via the call graph (caller_map edges)
+    #   2. I ranks higher than W
+    #   3. W's own sink set is a non-empty subset of I's sink set
     #
-    # Wrappers are annotated in details and tracked in wrapper_of{} so the
-    # CLI can group them beneath their implementation in the output.
+    # The BFS from each impl traverses through no-sink intermediaries (adapter
+    # layers, type-specific shims) to reach the true public API wrappers.
+    # Max hop limit prevents runaway traversal of deep call graphs.
+    _MAX_WRAPPER_HOPS = 6
     rank_position = {fn: i for i, (fn, _) in enumerate(ranked)}
 
     def _sink_fns(fn: str) -> frozenset:
@@ -590,17 +591,8 @@ def score_ir_dir(
             if s.get("fn") not in ("getelementptr", "alloca")
         )
 
-    wrapper_of: dict[str, str] = {}   # wrapper_fn → impl_fn (ultimate)
+    wrapper_of: dict[str, str] = {}   # wrapper_fn → impl_fn (root)
 
-    def _ultimate_impl(fn: str) -> str:
-        """Follow wrapper_of chain to the root implementation."""
-        seen = set()
-        while fn in wrapper_of and fn not in seen:
-            seen.add(fn)
-            fn = wrapper_of[fn]
-        return fn
-
-    # First pass: direct sink-subset wrappers.
     for impl_fn, callers in caller_map.items():
         if impl_fn not in rank_position:
             continue
@@ -608,42 +600,33 @@ def score_ir_dir(
         if not impl_sinks:
             continue
         impl_rank = rank_position[impl_fn]
-        for caller in callers:
-            if caller not in rank_position:
-                continue
-            if rank_position[caller] <= impl_rank:
-                continue   # caller ranks higher — impl is not the authority
-            if caller in wrapper_of:
-                continue   # already assigned
-            caller_sinks = _sink_fns(caller)
-            if caller_sinks and caller_sinks <= impl_sinks:
-                wrapper_of[caller] = impl_fn
-                details[caller] += f"  [wrapper of {impl_fn}]"
 
-    # Second pass: callers of known wrappers — transitive closure.
-    # A caller of a wrapper W, which itself has no distinct sinks beyond W's
-    # impl, is grouped under the same ultimate impl (one more hop).
-    changed = True
-    while changed:
-        changed = False
-        for known_wrapper, impl_fn in list(wrapper_of.items()):
-            root = _ultimate_impl(known_wrapper)
-            root_sinks = _sink_fns(root)
-            if not root_sinks:
+        # BFS upward through callers, hopping through no-sink intermediaries.
+        from collections import deque
+        queue: deque[tuple[str, int]] = deque()
+        visited: set[str] = {impl_fn}
+        for c in callers:
+            queue.append((c, 1))
+            visited.add(c)
+
+        while queue:
+            node, depth = queue.popleft()
+            if node not in rank_position or rank_position[node] <= impl_rank:
                 continue
-            root_rank = rank_position[root]
-            for caller in caller_map.get(known_wrapper, []):
-                if caller not in rank_position:
-                    continue
-                if rank_position[caller] <= root_rank:
-                    continue
-                if caller in wrapper_of:
-                    continue
-                caller_sinks = _sink_fns(caller)
-                if caller_sinks and caller_sinks <= root_sinks:
-                    wrapper_of[caller] = root
-                    details[caller] += f"  [wrapper of {root}]"
-                    changed = True
+            node_sinks = _sink_fns(node)
+            if node_sinks:
+                # Has own sinks: classify as wrapper only if sinks ⊆ impl's
+                if node_sinks <= impl_sinks and node not in wrapper_of:
+                    wrapper_of[node] = impl_fn
+                    details[node] += f"  [wrapper of {impl_fn}]"
+                # Either way, don't propagate further through a sink-bearing node
+                continue
+            # No own sinks: pass-through adapter — traverse further if within hop limit
+            if depth < _MAX_WRAPPER_HOPS:
+                for c in caller_map.get(node, []):
+                    if c not in visited:
+                        visited.add(c)
+                        queue.append((c, depth + 1))
 
     return {
         "ranked":     ranked,
