@@ -590,7 +590,17 @@ def score_ir_dir(
             if s.get("fn") not in ("getelementptr", "alloca")
         )
 
-    wrapper_of: dict[str, str] = {}   # wrapper_fn → impl_fn
+    wrapper_of: dict[str, str] = {}   # wrapper_fn → impl_fn (ultimate)
+
+    def _ultimate_impl(fn: str) -> str:
+        """Follow wrapper_of chain to the root implementation."""
+        seen = set()
+        while fn in wrapper_of and fn not in seen:
+            seen.add(fn)
+            fn = wrapper_of[fn]
+        return fn
+
+    # First pass: direct sink-subset wrappers.
     for impl_fn, callers in caller_map.items():
         if impl_fn not in rank_position:
             continue
@@ -604,11 +614,36 @@ def score_ir_dir(
             if rank_position[caller] <= impl_rank:
                 continue   # caller ranks higher — impl is not the authority
             if caller in wrapper_of:
-                continue   # already assigned to another impl
+                continue   # already assigned
             caller_sinks = _sink_fns(caller)
             if caller_sinks and caller_sinks <= impl_sinks:
                 wrapper_of[caller] = impl_fn
                 details[caller] += f"  [wrapper of {impl_fn}]"
+
+    # Second pass: callers of known wrappers — transitive closure.
+    # A caller of a wrapper W, which itself has no distinct sinks beyond W's
+    # impl, is grouped under the same ultimate impl (one more hop).
+    changed = True
+    while changed:
+        changed = False
+        for known_wrapper, impl_fn in list(wrapper_of.items()):
+            root = _ultimate_impl(known_wrapper)
+            root_sinks = _sink_fns(root)
+            if not root_sinks:
+                continue
+            root_rank = rank_position[root]
+            for caller in caller_map.get(known_wrapper, []):
+                if caller not in rank_position:
+                    continue
+                if rank_position[caller] <= root_rank:
+                    continue
+                if caller in wrapper_of:
+                    continue
+                caller_sinks = _sink_fns(caller)
+                if not caller_sinks or caller_sinks <= root_sinks:
+                    wrapper_of[caller] = root
+                    details[caller] += f"  [wrapper of {root}]"
+                    changed = True
 
     return {
         "ranked":     ranked,
