@@ -1044,8 +1044,11 @@ def _llvm_link(harness_ll: Path, target_ll: Path, out: Path,
     else:
         all_ll = [str(target_ll)]
 
+    # --only-needed: pull symbols from extra modules only when referenced,
+    # like an archive. Avoids multiply-defined-symbol errors when the ir_dir
+    # contains multiple TUs that each define the same internal symbol.
     r = subprocess.run(
-        [linker, str(harness_ll)] + all_ll + ["-S", "-o", str(out)],
+        [linker, str(harness_ll)] + all_ll + ["--only-needed", "-S", "-o", str(out)],
         capture_output=True, text=True,
     )
     return (out, "") if r.returncode == 0 else (None, r.stderr)
