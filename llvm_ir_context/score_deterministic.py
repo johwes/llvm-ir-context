@@ -615,11 +615,19 @@ def score_ir_dir(
                 continue
             node_sinks = _sink_fns(node)
             if node_sinks:
-                # Has own sinks: classify as wrapper only if sinks ⊆ impl's
-                if node_sinks <= impl_sinks and node not in wrapper_of:
-                    wrapper_of[node] = impl_fn
-                    details[node] += f"  [wrapper of {impl_fn}]"
-                # Either way, don't propagate further through a sink-bearing node
+                if node_sinks <= impl_sinks:
+                    # Subset of impl's sinks: this is a wrapper layer.
+                    # Mark it and continue propagating upward through it —
+                    # its callers may be further API wrappers in the same chain.
+                    if node not in wrapper_of:
+                        wrapper_of[node] = impl_fn
+                        details[node] += f"  [wrapper of {impl_fn}]"
+                    if depth < _MAX_WRAPPER_HOPS:
+                        for c in caller_map.get(node, []):
+                            if c not in visited:
+                                visited.add(c)
+                                queue.append((c, depth + 1))
+                # Sinks not ⊆ impl's: unrelated function, stop here
                 continue
             # No own sinks: pass-through adapter — traverse further if within hop limit
             if depth < _MAX_WRAPPER_HOPS:
