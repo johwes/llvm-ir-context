@@ -1023,15 +1023,31 @@ def _promote_linkage_in_ir(ll_path: Path, fn_name: str) -> Path:
     out.write_text(text)
     return out
 
-def _llvm_link(harness_ll: Path, target_ll: Path, out: Path) -> "tuple[Path | None, str]":
-    """Merge harness_ll and target_ll into a single IR module using llvm-link."""
+def _llvm_link(harness_ll: Path, target_ll: Path, out: Path,
+               ir_dir: str = "") -> "tuple[Path | None, str]":
+    """Merge harness IR with target IR into a single self-contained module.
+
+    When ir_dir is provided, links all .ll files in that directory so that
+    cross-file callee references (e.g. BIO_new defined in a different .ll)
+    resolve. Without ir_dir, links only the single target .ll — sufficient
+    for small projects where the target function and its callees are in one
+    translation unit.
+    """
     for linker in ("llvm-link-20", "llvm-link"):
         if shutil.which(linker):
             break
     else:
         return None, "llvm-link not found (install llvm-20)"
+
+    if ir_dir:
+        all_ll = [str(p) for p in sorted(Path(ir_dir).glob("*.ll"))
+                  if p.resolve() != harness_ll.resolve()
+                  and p.resolve() != out.resolve()]
+    else:
+        all_ll = [str(target_ll)]
+
     r = subprocess.run(
-        [linker, str(harness_ll), str(target_ll), "-S", "-o", str(out)],
+        [linker, str(harness_ll)] + all_ll + ["-S", "-o", str(out)],
         capture_output=True, text=True,
     )
     return (out, "") if r.returncode == 0 else (None, r.stderr)
@@ -2008,7 +2024,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         print("\n── IR link ──────────────────────────────────────────")
         promoted_ll = _promote_linkage_in_ir(Path(ll_path), fn_name)
         merged_ll   = output_dir / f"harness_{fn_name}_merged.ll"
-        merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll)
+        merged, link_err = _llvm_link(harness_ll, promoted_ll, merged_ll,
+                                       ir_dir=ir_dir)
         if merged:
             print(f"OK → {merged}")
             print(f"\nTo fuzz:")
