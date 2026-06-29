@@ -1835,7 +1835,16 @@ def main():
         ap.error("--top-k only applies to --ir-dir mode")
 
     header       = Path(args.header).read_text(errors="replace") if args.header else ""
-    include_dirs = [str(Path(args.header).parent)] if args.header else []
+    if args.header:
+        _hdr = Path(args.header).resolve()
+        # Include both the header's parent dir AND its grandparent so that both
+        # `#include "pem.h"` and `#include <openssl/pem.h>` resolve correctly.
+        _dirs = [str(_hdr.parent)]
+        if _hdr.parent.parent != _hdr.parent:
+            _dirs.append(str(_hdr.parent.parent))
+        include_dirs = _dirs
+    else:
+        include_dirs = []
     output_dir   = Path(args.output_dir)
     src_dir      = args.src_dir
 
