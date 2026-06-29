@@ -288,6 +288,42 @@ def fn_in_header(fn_name: str, header_text: str) -> bool:
     return bool(re.search(rf'\b{re.escape(fn_name)}\s*\(', header_text))
 
 
+# Maps DWARF language tags found in LLVM IR debug metadata to C standard strings.
+_DWARF_LANG_MAP = {
+    "DW_LANG_C89":      "C89",
+    "DW_LANG_C":        "C89",
+    "DW_LANG_C99":      "C99",
+    "DW_LANG_C11":      "C11",
+    "DW_LANG_C17":      "C17",
+    "DW_LANG_C23":      "C23",
+    "DW_LANG_C_plus_plus":    "C++",
+    "DW_LANG_C_plus_plus_03": "C++03",
+    "DW_LANG_C_plus_plus_11": "C++11",
+    "DW_LANG_C_plus_plus_14": "C++14",
+    "DW_LANG_C_plus_plus_17": "C++17",
+    "DW_LANG_C_plus_plus_20": "C++20",
+}
+
+
+def _detect_c_standard(ll_path: str) -> str:
+    """Detect the source language/standard from LLVM IR debug metadata.
+
+    Reads !DICompileUnit entries for the 'language:' field. Returns a
+    human-readable standard string (e.g. 'C11', 'C++17') or 'C11' as
+    the default when no debug info is present.
+    """
+    try:
+        text = Path(ll_path).read_text(errors="replace")
+    except OSError:
+        return "C11"
+    # !DICompileUnit(language: DW_LANG_C11, ...)
+    m = re.search(r'!DICompileUnit\([^)]*language:\s*(DW_LANG_\w+)', text)
+    if m:
+        tag = m.group(1)
+        return _DWARF_LANG_MAP.get(tag, tag)
+    return "C11"
+
+
 def _clang_ast_info(header_text: str, fn_name: str,
                     include_dirs: list[str] | None = None,
                     clang_bin: str = "clang-20",
@@ -1136,7 +1172,8 @@ def build_task_block(fn_name: str, summary: dict,
                      target_header: str = "",
                      is_internal: bool = False,
                      is_fd_reader: bool = False,
-                     is_context_reader: bool = False) -> str:
+                     is_context_reader: bool = False,
+                     c_standard: str = "C11") -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
@@ -1145,6 +1182,7 @@ def build_task_block(fn_name: str, summary: dict,
     fallback that catches fgets via source text when the slicer sink list misses it).
     is_context_reader: function reads through an opaque handle/context (BIO*, FILE*,
     EVP_MD_CTX*, etc.) rather than taking a raw fd or buffer argument directly.
+    c_standard: detected from DWARF debug metadata in the IR (e.g. 'C11', 'C++17').
     """
     hint = summary.get("harness_hint", "")
     strcmp_guards = summary.get("strcmp_guards", [])
@@ -1166,7 +1204,16 @@ def build_task_block(fn_name: str, summary: dict,
     modules.append("- Do not write any #include lines — they will be added automatically")
 
     # --- M-01: Base requirements (always present) ---
+    _is_cpp = c_standard.startswith("C++")
+    _lang_rule = (
+        f"- The target is compiled as {c_standard} — output strictly {c_standard}, "
+        f"not {'C' if _is_cpp else 'C++'}. "
+        + ("Do not use C-style casts or extern \"C\" unless the API requires it."
+           if _is_cpp else
+           "Do not use range-based for loops, auto, references, or any other C++ syntax.")
+    )
     modules.append(
+        f"{_lang_rule}\n"
         f"- Use the exact function signature from the IR / API reference above\n"
         f"- Read the target function source carefully — understand what state must be "
         f"initialized before calling it and what the function does with its arguments\n"
@@ -1604,7 +1651,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
         {s.get("fn") for s in caller_summary.get("sinks", [])} & _ifd_sinks
     )
     task_block = build_task_block(caller_fn, merged_summary, target_header=header,
-                                  is_fd_reader=caller_is_fd_reader)
+                                  is_fd_reader=caller_is_fd_reader,
+                                  c_standard=_detect_c_standard(caller_ll))
     # Prepend the interprocedural-specific constraint
     interp_note = (
         f"- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly\n"
@@ -1802,9 +1850,11 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         c_decl = _ir_sig_to_c_decl(ir_sig, fn_name)
         if c_decl:
             internal_fn_decl = c_decl
+    c_std        = _detect_c_standard(ll_path)
     task_block   = build_task_block(fn_name, summary_json, target_header=header,
                                     is_internal=is_internal, is_fd_reader=is_fd_reader,
-                                    is_context_reader=is_context_reader)
+                                    is_context_reader=is_context_reader,
+                                    c_standard=c_std)
 
     # Extract global declarations from the original IR so the pipeline can
     # inject correct extern decls and resets without relying on the model.
