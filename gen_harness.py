@@ -1057,7 +1057,16 @@ def _check_self_harm(harness_ll: Path) -> tuple[str, str | None]:
     if "error" in result:
         return f"Self-harm check skipped: {result['error']}", None
 
-    score      = result.get("score", 0.0)
+    # Suppress double_free/use_after_free before scoring the harness.
+    # The scorer escalates those to 0.92+ because they signal real bugs in
+    # target functions — but in harness code, free() on multiple exit paths
+    # is the correct cleanup pattern, not a defect. The linear IR walker
+    # cannot distinguish mutually exclusive paths, so it always fires on
+    # goto-cleanup harnesses. We score only the structural sink/guard signals.
+    harness_summary = {**result,
+                       "double_free": False, "use_after_free": False}
+    from llvm_ir_context.score_deterministic import philosophy2_score
+    score      = philosophy2_score(harness_summary)
     verdict    = self_harm_verdict(score)
     sink_types = result.get("sink_types") or []
     guard_type = result.get("guard_type", "none")
