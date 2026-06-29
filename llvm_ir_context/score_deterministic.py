@@ -42,11 +42,13 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
@@ -357,6 +359,47 @@ def _print_table(label: str, ranked: list[tuple[str, float]],
 
 
 # ---------------------------------------------------------------------------
+# Per-function worker (runs in a subprocess — no llvmlite objects passed)
+# ---------------------------------------------------------------------------
+
+def _score_one(args):
+    """Score a single function. Designed to run in a worker process.
+
+    Accepts a tuple so it works with ProcessPoolExecutor.map.
+    Returns (fn_name, summary_or_None, score, details_str, file_name).
+    """
+    fn_name, ir_text, file_name = args
+    try:
+        from llvm_ir_context.preprocess_slice_pdg import ir_to_graph_slice_pdg
+        from llvm_ir_context.slice_context import summarize_slice
+
+        g = ir_to_graph_slice_pdg(ir_text, fn_name=fn_name)
+        if g is None or g.get("x") is None:
+            return (fn_name, None, 0.05, f"no slice ({file_name})", file_name)
+
+        summary = summarize_slice(g, fn_name=fn_name)
+        score   = philosophy2_score(summary)
+
+        ns    = summary["n_sinks"]
+        hg    = summary["has_guard"]
+        gt    = summary.get("guard_type", "none")
+        ext   = "ext"     if summary.get("is_external_input")   else ""
+        trunc = "+trunc"  if summary.get("has_trunc")           else ""
+        szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
+        df    = "+df"     if summary.get("double_free")         else ""
+        uaf   = "+uaf"    if summary.get("use_after_free")      else ""
+        cv    = "+caller?" if summary.get("caller_validated")   else ""
+        sinks = ",".join(sorted({s.get("fn", "?") for s in summary["sinks"]}))
+        detail = (
+            f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
+            f"{ext}{trunc}{szext}{df}{uaf}{cv} [{sinks}] ({file_name})"
+        )
+        return (fn_name, summary, score, detail, file_name)
+    except Exception as exc:
+        return (fn_name, None, 0.05, f"error: {exc} ({file_name})", file_name)
+
+
+# ---------------------------------------------------------------------------
 # Core scoring engine (programmatic, no I/O)
 # ---------------------------------------------------------------------------
 
@@ -377,21 +420,7 @@ def score_ir_dir(
       caller_map   — {callee: [caller, ...]} cross-file call graph
       no_slice     — list of fn_names with no extractable slice
     """
-    import llvmlite.binding as _llvm
-
     functions  = _collect_functions(ir_path)
-
-    # Parse all modules once for cross-file caller scanning.
-    all_modules = []
-    seen_ir: set[int] = set()
-    for _, fn_ir, _ in functions:
-        ir_id = id(fn_ir)
-        if ir_id not in seen_ir:
-            seen_ir.add(ir_id)
-            try:
-                all_modules.append(_llvm.parse_assembly(fn_ir))
-            except Exception:
-                pass
 
     rule_scores:  dict[str, float] = {}
     details:      dict[str, str]   = {}
@@ -399,36 +428,30 @@ def score_ir_dir(
     fn_files:     dict[str, Path]  = {}
     no_slice_fns: list[str]        = []
 
-    total = len(functions)
-    for i, (fn_name, fn_ir, fn_file) in enumerate(functions, 1):
-        if i == 1 or i % 50 == 0 or i == total:
-            print(f"\r  Scoring {i}/{total} functions...", end="", flush=True)
-        fn_files[fn_name] = fn_file
-        g = ir_to_graph_slice_pdg(fn_ir, fn_name=fn_name, extra_modules=all_modules)
-        if g is None or g.get("x") is None:
-            rule_scores[fn_name] = 0.05
-            details[fn_name]     = f"no slice ({fn_file.name})"
-            no_slice_fns.append(fn_name)
-        else:
-            summary              = summarize_slice(g, fn_name=fn_name)
-            summaries[fn_name]   = summary
-            rule_scores[fn_name] = philosophy2_score(summary)
-            ns    = summary["n_sinks"]
-            hg    = summary["has_guard"]
-            gt    = summary.get("guard_type", "none")
-            ext   = "ext" if summary.get("is_external_input") else ""
-            trunc = "+trunc" if summary.get("has_trunc") else ""
-            szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
-            df    = "+df"      if summary.get("double_free")    else ""
-            uaf   = "+uaf"     if summary.get("use_after_free") else ""
-            cv    = "+caller?" if summary.get("caller_validated") else ""
-            sinks = ",".join(sorted({s.get("fn","?") for s in summary["sinks"]}))
-            details[fn_name] = (
-                f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
-                f"{ext}{trunc}{szext}{df}{uaf}{cv} [{sinks}] ({fn_file.name})"
-            )
-            if verbose:
-                print(f"  {fn_name}: {summary['natural_language']}")
+    total   = len(functions)
+    workers = max(1, min(os.cpu_count() or 1, total))
+    work    = [(fn_name, fn_ir, fn_file.name) for fn_name, fn_ir, fn_file in functions]
+    fn_file_map = {fn_name: fn_file for fn_name, _, fn_file in functions}
+
+    done = 0
+    print(f"\r  Scoring {done}/{total} functions...", end="", flush=True)
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_score_one, item): item[0] for item in work}
+        for fut in as_completed(futures):
+            fn_name, summary, score, detail, file_name = fut.result()
+            fn_files[fn_name]    = fn_file_map[fn_name]
+            rule_scores[fn_name] = score
+            details[fn_name]     = detail
+            if summary is not None:
+                summaries[fn_name] = summary
+                if verbose:
+                    print(f"\n  {fn_name}: {summary['natural_language']}", flush=True)
+            else:
+                no_slice_fns.append(fn_name)
+            done += 1
+            if done % 50 == 0 or done == total:
+                print(f"\r  Scoring {done}/{total} functions...", end="", flush=True)
 
     print()  # end progress line
     # Build caller_map: callee → [callers] from summaries (for P1.2 reachability).
