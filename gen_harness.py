@@ -88,6 +88,10 @@ offset 4 requires `Size >= 8`, not `Size >= 5`.
 them to their valid range. If the real API enforces a maximum (e.g. nstore <= \
 MAX_STORE), clamp to that maximum in the harness. Unclamped values cause OOB \
 accesses that cannot occur in real usage and mask real bugs.
+- Parameters typed `type **` are output parameters: the function allocates the \
+object and writes the heap pointer into `*param`. Declare them as `type *param = NULL` \
+and pass `&param`. Free `param` after the call — not `&param`, not a static buffer \
+cast to `type **`.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
