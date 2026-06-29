@@ -204,16 +204,18 @@ def extract_fn_source(src_text: str, fn_name: str) -> str:
 def find_source_for_ll(ll_path: str, src_dir: str) -> str:
     """Guess the C source file path from the .ll filename and src_dir.
 
-    Heuristic: src_handler.ll → handler.c, src_util.ll → util.c, etc.
-    Strips a leading 'src_' prefix and replaces the extension.
-    Also tries the stem directly (handler.ll → handler.c).
+    IR stems encode the source path with underscores replacing separators,
+    e.g. crypto_pem_pem_lib.ll → crypto/pem/pem_lib.c. We try progressively
+    shorter suffix sequences so that pem_lib.c is found before pem_pem_lib.c.
     """
-    stem = Path(ll_path).stem          # e.g. "src_handler"
-    candidates = [
-        stem,                           # src_handler
-        re.sub(r'^src_', '', stem),    # handler
-        re.sub(r'^[^_]+_', '', stem),  # handler (strip any prefix)
-    ]
+    stem = Path(ll_path).stem          # e.g. "crypto_pem_pem_lib"
+    parts = stem.split("_")
+    # Build candidates by progressively taking fewer leading parts as prefix:
+    # full stem, then drop one leading part each time.
+    # e.g. ["crypto_pem_pem_lib", "pem_pem_lib", "pem_lib", "lib"]
+    candidates = []
+    for start in range(len(parts)):
+        candidates.append("_".join(parts[start:]))
     src_dir_path = Path(src_dir)
     search_dirs = [
         src_dir_path,
@@ -1061,7 +1063,10 @@ def build_task_block(fn_name: str, summary: dict,
     )
 
     # --- M-05: Double-free / UAF — stateful precondition ---
-    if summary.get("double_free") or summary.get("use_after_free"):
+    # Suppressed for context-readers: the vulnerability is reached by feeding
+    # data through the handle (BIO_write, fmemopen), not by a two-phase call
+    # sequence. M-11 owns the input-routing instruction in that case.
+    if not is_context_reader and (summary.get("double_free") or summary.get("use_after_free")):
         bug = "double-free" if summary.get("double_free") else "use-after-free"
         df_callees = _df_callees or _uaf_callees  # already sorted above
         callee_list = ", ".join(f"`{c}`" for c in df_callees) if df_callees else ""
