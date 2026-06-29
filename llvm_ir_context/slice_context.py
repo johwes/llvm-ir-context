@@ -775,8 +775,7 @@ def _demo_cli():
         summary = summarize_slice(g, fn_name=fn_name)
 
         if args.json:
-            print(_json.dumps({k: v for k, v in summary.items()
-                                if k != "sinks"}, indent=2))
+            print(_json.dumps(summary, indent=2))
         else:
             print(format_for_llm(summary))
             print(f"Natural language:\n  {summary['natural_language']}\n")
