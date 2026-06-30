@@ -59,6 +59,16 @@ across `ssl/` and `crypto/`.
 4. **Out-of-scope CVEs**: 4 of 6 answer-key bugs are null deref, type confusion,
    or pointer deref without a call-based sink — correctly outside the tool's stated
    scope. The scoring model is working as designed.
+6. **Path traversal sink false positives at API boundaries:** Library functions
+   whose documented purpose is to accept a caller-supplied path (e.g. `BIO_new_file`,
+   `openssl_fopen`) score 100% on path traversal because `function_argument → fopen,
+   no guard` is structurally identical to a genuine traversal bug. The distinction
+   requires knowing whether the caller receives that filename from attacker-controlled
+   input — which requires whole-program IR (P2.3). Per-TU analysis cannot
+   differentiate "API boundary that accepts a path by design" from "path traversal
+   vulnerability." These should be filtered or down-ranked when the function name
+   matches a well-known file-opening API wrapper pattern.
+
 5. **Format gate + byte-level fuzzing ceiling (CVE-2022-4450):** The pipeline
    correctly ranked `PEM_read_bio_ex` #2 and generated a harness that gets past
    the PEM header and base64 gate (cov: 272 → 434 with M-13 envelope approach).
