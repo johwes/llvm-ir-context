@@ -91,7 +91,8 @@ accesses that cannot occur in real usage and mask real bugs.
 - Parameters typed `type **` are output parameters: the function allocates the \
 object and writes the heap pointer into `*param`. Declare them as `type *param = NULL` \
 and pass `&param`. Free `param` after the call — not `&param`, not a static buffer \
-cast to `type **`.
+cast to `type **`. Every `type **` output must be freed in the cleanup path — \
+unfeed output pointers hide ASAN leak reports and mask real bugs.
 - Output C code only — no explanation, no markdown prose outside the code block.\
 """
 
@@ -974,17 +975,19 @@ def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: 
         import os as _os
         hdr_abs = _os.path.abspath(header_path)
         rel_include = None
+        # Try explicit include dirs first
         for inc_dir in (include_dirs or []):
             inc_abs = _os.path.abspath(inc_dir)
             try:
                 rel = _os.path.relpath(hdr_abs, inc_abs)
-                # Accept only paths that don't escape the include root
                 if not rel.startswith(".."):
                     rel_include = rel
                     break
             except ValueError:
-                pass  # Windows cross-drive — skip
-        lines.append(f'#include "{rel_include or _os.path.basename(header_path)}"')
+                pass
+        if rel_include is None:
+            rel_include = _os.path.basename(hdr_abs)
+        lines.append(f'#include "{rel_include}"')
     if internal_fn_decl:
         lines.append(internal_fn_decl)
     return "\n".join(lines)
