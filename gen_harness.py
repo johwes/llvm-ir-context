@@ -1565,14 +1565,23 @@ def build_task_block(fn_name: str, summary: dict,
         _fmt_fns      = [g["fn"] for g in _format_gates[:4]]
         _fmt_label    = "/".join(_fmt_families[:2])
         _fn_list      = ", ".join(f"`{f}`" for f in _fmt_fns)
+        _encoding_note = ""
+        if "base64" in _fmt_families:
+            _encoding_note = (
+                f" The payload region must contain valid base64 characters — "
+                f"if you embed fuzz bytes there, base64-encode them first before writing "
+                f"into the envelope; raw arbitrary bytes in the payload will be rejected "
+                f"by the base64 decoder."
+            )
         modules.append(
             f"- The static analyzer detected format-parsing call(s) on the data path: "
             f"{_fn_list}. The input must conform to {_fmt_label} format — random bytes "
             f"will be rejected before reaching the dangerous sink. "
-            f"Two options: (a) construct a valid {_fmt_label} object in the harness and "
-            f"embed fuzz bytes in mutable fields (e.g. content after a valid header), or "
-            f"(b) use `LLVMFuzzerMutate` / provide a seed corpus entry containing a "
-            f"valid {_fmt_label} stream so the fuzzer can mutate within the format. "
+            f"Construct a valid {_fmt_label} envelope: hardcode the required "
+            f"header/prefix bytes, embed fuzz bytes in the payload region, write the "
+            f"complete structured buffer as input.{_encoding_note} "
+            f"Alternatively, provide a seed corpus entry containing a valid {_fmt_label} "
+            f"stream and let the fuzzer mutate within the format. "
             f"Do NOT pass raw `Data` as the entire input — the format parser will reject it."
         )
 
