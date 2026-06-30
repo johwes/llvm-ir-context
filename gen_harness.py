@@ -1451,19 +1451,40 @@ def build_task_block(fn_name: str, summary: dict,
     # etc.) rather than taking a raw fd or buffer argument. The model must create the
     # handle and write fuzz data into it before calling the target.
     if is_context_reader:
-        modules.append(
-            f"- `{fn_name}` reads its input through an opaque context or handle object "
-            f"(e.g. BIO*, FILE*, or similar), not a raw buffer or file descriptor argument. "
-            f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`. "
-            f"For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
-            f"before passing the BIO to `{fn_name}`. "
-            f"`BIO_write` accepts raw bytes — pass `Data` directly, no null-termination "
-            f"or intermediate copy needed. "
-            f"For a FILE*: use `fmemopen(Data, Size, \"r\")`. "
-            f"Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
-            f"check the function signature and API reference to identify which parameter "
-            f"is the handle and which are output/flag parameters."
-        )
+        _fmt_gates = summary.get("format_gates", [])
+        if _fmt_gates:
+            # M-11 + M-13 combined: handle is required, but raw Data must not be
+            # written directly — the format gate means the handle must contain a
+            # valid structured stream, not raw fuzz bytes.
+            _fmt_families = list(dict.fromkeys(g["format"] for g in _fmt_gates))
+            _fmt_label    = "/".join(_fmt_families[:2])
+            modules.append(
+                f"- `{fn_name}` reads its input through an opaque handle (BIO*, FILE*, "
+                f"or similar) AND that handle must contain a valid {_fmt_label} stream — "
+                f"writing raw `Data` bytes into the handle will be rejected by the format "
+                f"parser before reaching any interesting code. "
+                f"You MUST construct a valid {_fmt_label} envelope: hardcode the required "
+                f"header/prefix bytes (e.g. for PEM: `-----BEGIN <type>-----\\n` + base64 "
+                f"content + `-----END <type>-----\\n`), embed fuzz bytes in the payload "
+                f"region after the header, write the complete structured buffer into the "
+                f"BIO with `BIO_write`, then call `{fn_name}`. "
+                f"Do NOT call `BIO_write(bio, Data, Size)` with raw fuzz bytes as the "
+                f"entire input — the format gate will reject it immediately."
+            )
+        else:
+            modules.append(
+                f"- `{fn_name}` reads its input through an opaque context or handle object "
+                f"(e.g. BIO*, FILE*, or similar), not a raw buffer or file descriptor argument. "
+                f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`. "
+                f"For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
+                f"before passing the BIO to `{fn_name}`. "
+                f"`BIO_write` accepts raw bytes — pass `Data` directly, no null-termination "
+                f"or intermediate copy needed. "
+                f"For a FILE*: use `fmemopen(Data, Size, \"r\")`. "
+                f"Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
+                f"check the function signature and API reference to identify which parameter "
+                f"is the handle and which are output/flag parameters."
+            )
 
     # --- M-10: Global init state warning for internal-linkage functions ---
     # Fires when the target is define internal: main() is suppressed in the
