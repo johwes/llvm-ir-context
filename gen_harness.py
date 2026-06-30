@@ -1783,6 +1783,7 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
         {s.get("fn") for s in caller_summary.get("sinks", [])} & _ifd_sinks
     )
     is_fd_reader = caller_is_fd_reader
+    _global_decls = []  # interprocedural path doesn't extract globals
     task_block = build_task_block(caller_fn, merged_summary, target_header=header,
                                   is_fd_reader=caller_is_fd_reader,
                                   c_standard=_detect_c_standard(caller_ll))
