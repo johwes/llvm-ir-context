@@ -1507,6 +1507,30 @@ def build_task_block(fn_name: str, summary: dict,
             "Never derive a buffer length, capacity field, or size argument from `Data`."
         )
 
+    # --- M-12: Dominator gate — format envelope wrapper ---
+    # Fires when the backward CFG walk from the sink found icmp/switch instructions
+    # with literal integer operands. These are gates the fuzzer must satisfy to
+    # reach the sink. Instructs the LLM to hardcode the required values and wrap
+    # fuzz bytes inside a valid envelope so mutations can explore past the gate.
+    _dom_gates = summary.get("dom_gates", [])
+    if _dom_gates:
+        # Summarise the constraints compactly — at most 6 to avoid prompt bloat
+        _gate_lines = []
+        for g in _dom_gates[:6]:
+            _gate_lines.append(
+                f"  {g['kind']} {g['pred']} {g['hex']} (decimal {g['value']})"
+            )
+        _gate_summary = "\n".join(_gate_lines)
+        modules.append(
+            f"- The static analyzer found integer gate(s) on the path to the dangerous sink. "
+            f"Random bytes will almost never satisfy these checks, so the fuzzer will stall "
+            f"before reaching the interesting code:\n{_gate_summary}\n"
+            f"  Construct input by wrapping fuzz bytes inside a valid envelope: hardcode the "
+            f"required prefix/magic/header bytes at the start of the buffer, then append or "
+            f"embed `Data` in the payload region that the function reads after the gate. "
+            f"Do NOT pass raw `Data` directly as the entire input — the gate will reject it."
+        )
+
     # --- M-07: Return 0 (always last) ---
     modules.append("- Return 0")
 

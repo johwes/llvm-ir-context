@@ -893,6 +893,14 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
     strcmp_guards = _detect_strcmp_guards(target_fn, str_globals)
     g["strcmp_guards"] = strcmp_guards
 
+    # Dominator gate extraction (P-08a): walk CFG predecessors from sink-containing
+    # blocks to function entry, collect icmp/switch against literal integer constants.
+    # These are the format gates the fuzzer must satisfy to reach the dangerous sink.
+    sink_fn_names_for_gates = g.get("sink_fn_names", {})
+    dom_gates = _extract_dom_gates(target_fn, block_preds, ptr_to_id,
+                                   sink_fn_names_for_gates)
+    g["dom_gates"] = dom_gates
+
     # Count function arguments so the split-input hint can reference them by name.
     g["arg_count"] = sum(1 for _ in target_fn.arguments)
 
@@ -916,6 +924,121 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
         g["caller_names"]     = []
 
     return g
+
+
+# ---------------------------------------------------------------------------
+# Dominator gate extractor — P-08a
+# ---------------------------------------------------------------------------
+
+_ICMP_LIT_RE = re.compile(
+    r'\bicmp\s+\w+\s+\S+\s*,\s*(-?\d+|0[xX][0-9a-fA-F]+)\b'
+)
+_SWITCH_LIT_RE = re.compile(r'\bi(\d+)\s+(-?\d+|0[xX][0-9a-fA-F]+)\s*,')
+
+
+def _extract_dom_gates(target_fn, block_preds: dict, ptr_to_id: dict,
+                       sink_fn_names: dict) -> list[dict]:
+    """Walk CFG predecessors from sink-containing blocks to entry.
+
+    Collects icmp/switch instructions with a literal integer operand that
+    dominate the path to the sink — these are the gates the fuzzer must
+    satisfy to reach the dangerous sink.
+
+    Returns a list of dicts:
+      {"kind": "icmp"|"switch", "pred": str, "value": int, "hex": str,
+       "ir_snippet": str}
+
+    Scope: only literal (compile-time constant) operands. Struct-field loads
+    and pointer comparisons are excluded — they are not extractable constraints.
+    """
+    # Map block ptr_id → list of instructions in that block
+    block_instrs: dict[int, list] = {}
+    for block in target_fn.blocks:
+        bpid = _ptr_id(block)
+        block_instrs[bpid] = list(block.instructions)
+
+    # Find which blocks contain a dangerous sink call
+    sink_call_ptrs: set[int] = set()
+    for block in target_fn.blocks:
+        bpid = _ptr_id(block)
+        for instr in block_instrs[bpid]:
+            if instr.opcode != "call":
+                continue
+            for op in instr.operands:
+                if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR):
+                    name = _normalize_sink_name(op.name.lstrip("@"))
+                    if name in sink_fn_names.values() or _is_dangerous(name):
+                        sink_call_ptrs.add(bpid)
+                        break
+
+    if not sink_call_ptrs:
+        return []
+
+    # BFS upward through block_preds from sink blocks
+    visited_blocks: set[int] = set(sink_call_ptrs)
+    frontier = list(sink_call_ptrs)
+    while frontier:
+        nxt = []
+        for bpid in frontier:
+            for pred_bpid in block_preds.get(bpid, []):
+                if pred_bpid not in visited_blocks:
+                    visited_blocks.add(pred_bpid)
+                    nxt.append(pred_bpid)
+        frontier = nxt
+
+    # Collect icmp/switch with literal operands from all visited blocks
+    gates: list[dict] = []
+    seen_values: set[int] = set()
+
+    for bpid in visited_blocks:
+        for instr in block_instrs.get(bpid, []):
+            ir_text = str(instr).strip()
+
+            if instr.opcode == "icmp":
+                ops = list(instr.operands)
+                # icmp: operands are [lhs, rhs] — look for a constant int rhs
+                const_val = None
+                pred_str  = ""
+                m_pred = _ICMP_PRED_RE.search(ir_text)
+                if m_pred:
+                    pred_str = m_pred.group(1)
+                for op in ops:
+                    if op.value_kind == VK_CONSTANT_INT:
+                        m = re.search(r'i\d+\s+(-?\d+|0[xX][0-9a-fA-F]+)', str(op))
+                        if m:
+                            raw = m.group(1)
+                            try:
+                                const_val = int(raw, 0)
+                            except ValueError:
+                                pass
+                if const_val is not None and const_val not in seen_values:
+                    seen_values.add(const_val)
+                    gates.append({
+                        "kind":       "icmp",
+                        "pred":       pred_str,
+                        "value":      const_val,
+                        "hex":        hex(const_val & 0xFFFFFFFFFFFFFFFF),
+                        "ir_snippet": ir_text[:120],
+                    })
+
+            elif instr.opcode == "switch":
+                # switch i<N> %val, label %default [ i<N> <val>, label %bb ... ]
+                for m in _SWITCH_LIT_RE.finditer(ir_text):
+                    try:
+                        const_val = int(m.group(2), 0)
+                    except ValueError:
+                        continue
+                    if const_val not in seen_values:
+                        seen_values.add(const_val)
+                        gates.append({
+                            "kind":       "switch",
+                            "pred":       "eq",
+                            "value":      const_val,
+                            "hex":        hex(const_val & 0xFFFFFFFFFFFFFFFF),
+                            "ir_snippet": ir_text[:120],
+                        })
+
+    return gates
 
 
 # ---------------------------------------------------------------------------
