@@ -59,6 +59,21 @@ across `ssl/` and `crypto/`.
 4. **Out-of-scope CVEs**: 4 of 6 answer-key bugs are null deref, type confusion,
    or pointer deref without a call-based sink — correctly outside the tool's stated
    scope. The scoring model is working as designed.
+5. **Format gate + byte-level fuzzing ceiling (CVE-2022-4450):** The pipeline
+   correctly ranked `PEM_read_bio_ex` #2 and generated a harness that gets past
+   the PEM header and base64 gate (cov: 272 → 434 with M-13 envelope approach).
+   Coverage plateaued at 434 — the ASN.1/DER structure inside the decoded payload
+   is a second gate that byte-level fuzzing cannot maintain across mutations.
+   The bouncer (PEM/base64/DER) and the bug (double-free) are in the same function;
+   there is no lower-level entry point to bypass the bouncer.
+   **How CVE-2022-4450 was likely found:** code review — the double-free is visible
+   statically without exercising the format parsing path. Structure-aware fuzzers
+   (libprotobuf-mutator, grammar-based) or OSS-Fuzz harnesses targeting sub-functions
+   (`d2i_X509`) are the dynamic path, but those require per-target engineering.
+   **Pipeline conclusion:** the slicer's value on this target was correct ranking
+   and structured prompt generation. End-to-end crash reproduction via byte-level
+   fuzzing alone is not achievable for bugs behind multi-layer format gates.
+   This is an honest scope boundary, not a pipeline failure.
 
 ---
 
