@@ -1534,6 +1534,28 @@ def build_task_block(fn_name: str, summary: dict,
             f"Do NOT pass raw `Data` directly as the entire input — the gate will reject it."
         )
 
+    # --- M-13: Format gate — structured-input target (P2.2) ---
+    # Fires when the slicer found a known format-parsing function in the call
+    # graph (BIO_gets, EVP_DecodeBlock, d2i_X509, etc.). This means the function
+    # requires structured input — random bytes will be rejected at the parser
+    # boundary before any dangerous sink is reachable.
+    _format_gates = summary.get("format_gates", [])
+    if _format_gates:
+        _fmt_families = list(dict.fromkeys(g["format"] for g in _format_gates))
+        _fmt_fns      = [g["fn"] for g in _format_gates[:4]]
+        _fmt_label    = "/".join(_fmt_families[:2])
+        _fn_list      = ", ".join(f"`{f}`" for f in _fmt_fns)
+        modules.append(
+            f"- The static analyzer detected format-parsing call(s) on the data path: "
+            f"{_fn_list}. The input must conform to {_fmt_label} format — random bytes "
+            f"will be rejected before reaching the dangerous sink. "
+            f"Two options: (a) construct a valid {_fmt_label} object in the harness and "
+            f"embed fuzz bytes in mutable fields (e.g. content after a valid header), or "
+            f"(b) use `LLVMFuzzerMutate` / provide a seed corpus entry containing a "
+            f"valid {_fmt_label} stream so the fuzzer can mutate within the format. "
+            f"Do NOT pass raw `Data` as the entire input — the format parser will reject it."
+        )
+
     # --- M-07: Return 0 (always last) ---
     modules.append("- Return 0")
 

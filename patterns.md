@@ -377,6 +377,57 @@ functions should be mandatory for this pattern.
 
 ---
 
+## P-09 · Format gate (structured-input target)
+
+**What it is:** A function whose data path passes through a known format-parsing
+call before any dangerous sink is reachable. Random bytes fail at the format
+boundary immediately. Coverage stays flat regardless of run count.
+
+**Concrete example (OpenSSL `PEM_read_bio_ex`):**
+- Calls `BIO_gets` to scan for `-----BEGIN` delimiter
+- Calls `EVP_DecodeUpdate` for base64 decode
+- Any input that doesn't start with a valid PEM header is rejected in ~10 instructions
+- Coverage plateaued at 272 edges with a valid seed corpus and PEM dictionary
+
+**IR shape (detection signals):**
+- Call to a function in `FORMAT_PARSERS` (preprocess_slice_pdg.py) appears in
+  the function body — `BIO_gets`, `EVP_DecodeBlock`, `d2i_X509`, etc.
+- Name-matched against a static list of known format parsers, grouped by family
+  (PEM, base64, ASN.1/DER, zlib, JSON, XML, TLS, HTTP)
+
+**Hint (M-13, must emit):**
+```
+The static analyzer detected format-parsing call(s) on the data path:
+`BIO_gets`, `EVP_DecodeUpdate`. The input must conform to PEM/base64 format
+— random bytes will be rejected before reaching the dangerous sink.
+Two options: (a) construct a valid PEM/base64 object in the harness and embed
+fuzz bytes in mutable fields, or (b) use LLVMFuzzerMutate / provide a seed
+corpus entry containing a valid PEM/base64 stream.
+Do NOT pass raw Data as the entire input.
+```
+
+**Correct harness:**
+- Either wraps fuzz bytes in a valid format envelope (hardcoded header + fuzz payload)
+- Or provides a seed corpus entry so libFuzzer mutates within the format
+- Does NOT pass raw `Data` directly as the entire input
+
+**Distinction from M-12 (dom gates):**
+- M-12 fires on `icmp`/`switch` against small integer constants (magic bytes,
+  enum values) — detectable from IR structure alone
+- M-13 fires on calls to named format functions — name-list based, catches
+  multi-hop string/delimiter format gates that have no single icmp
+
+**Known limitation (P2.2 scope):**
+- Detection is name-list based — only catches parsers in `FORMAT_PARSERS`
+- Does not trace *through* the parser to find the actual format constraint
+- Does not detect custom/project-specific format parsers
+- Full structural detection (without a name list) requires whole-program IR
+
+**Status:** Implemented. `FORMAT_PARSERS` dict in `preprocess_slice_pdg.py`,
+`format_gates` field in slice summary, M-13 module in `gen_harness.py`.
+
+---
+
 ## Evaluation rubric
 
 Given a generated harness, mark it:

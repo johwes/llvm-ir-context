@@ -332,36 +332,7 @@ IR-link path in `generate_one`, M-10 module in `build_task_block`)
 
 ### 2. Format-gate detection — structured-input targets
 
-**Observed (OpenSSL `PEM_read_bio_ex`):** Harness is correct and compiles cleanly.
-Coverage plateaus at 272 edges despite a valid PEM seed corpus and PEM dictionary.
-Root cause: the function applies a **format filter** before any vuln-relevant sink —
-random-byte mutations cannot stay in valid base64 across the PEM header boundary, so
-libFuzzer is trapped in the outer header-scanning layer and never reaches the DER/ASN.1
-parser inside.
-
-**What the pipeline currently sees:** The slicer traces `Data` → BIO → target call
-correctly. It does not detect that the path to interesting sinks passes through a
-format-parsing pre-condition (base64 decode, `-----BEGIN` scan) that random bytes
-will almost never satisfy.
-
-**Detection signal:** When the backward slice from interesting sinks passes through:
-- Base64 decode functions (`EVP_DecodeBlock`, `BIO_f_base64`)
-- Delimiter scanning (`BIO_gets`, `strncmp` against `"-----"`)
-- Known format parsers (`PEM_get_type`, `d2i_*`)
-
-...inject a note in the prompt that the function requires **structured input** and
-suggest either (a) seeding with valid objects or (b) targeting a lower-level function
-(e.g. `d2i_X509` for raw DER) that takes raw bytes directly.
-
-**Related:** P1.5 (P-08a magic-byte gate) covers the simpler case of a `icmp` against
-a small constant near entry. This item is the harder generalization: multi-hop format
-validation across an opaque BIO/decode boundary.
-
-**Effort:** Medium — requires a known-format-parser list in the slicer and a new
-prompt module that fires when the call graph between entry and sink contains one.
-
-**Files:** `llvm_ir_context/slice_context.py` (format gate detection),
-`gen_harness.py` (new prompt module)
+*Implemented. See Completed table.*
 
 ---
 
@@ -489,3 +460,4 @@ needs a single-file entry path. Analysis logic is unchanged.
 | M-02/M-05 conflict fix: suppress M-02 when M-05 has specific callees; verb rule added | `gen_harness.py` |
 | **P1.7** tree-sitter-c source extraction: replaced regex+brace-counting `extract_fn_source` with AST-based implementation; call sites and comments are structurally excluded; macro-generated functions (no `function_definition` node) return `""` cleanly; regex fallback retained for environments without the package; `tree-sitter>=0.25` + `tree-sitter-c>=0.23` added to `pyproject.toml` | `gen_harness.py`, `pyproject.toml` |
 | Bug fix: `ir-context --json` excluded `sinks` from serialized summary, causing `get_context_json()` to always return empty sinks list — `_has_read_sink` was always False, `is_context_reader` was always False, M-11 never fired for any context-handle function (BIO*, FILE*, EVP_MD_CTX*) on any codebase | `llvm_ir_context/slice_context.py` |
+| **P2.2** Format gate detection: `FORMAT_PARSERS` dict (PEM, base64, ASN.1/DER, zlib, JSON, XML, TLS, HTTP families); `_extract_format_gates()` scans call graph; `format_gates` field in slice summary; M-13 prompt module instructs envelope-construction or seed corpus | `preprocess_slice_pdg.py`, `slice_context.py`, `gen_harness.py`, `patterns.md` |

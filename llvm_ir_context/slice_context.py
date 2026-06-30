@@ -183,6 +183,7 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     caller_names:     list  = g.get("caller_names", [])
     strcmp_guards:    list  = g.get("strcmp_guards", [])
     dom_gates:        list  = g.get("dom_gates", [])
+    format_gates:     list  = g.get("format_gates", [])
     global_vars_read: list  = g.get("global_vars_read", [])
     arg_count:        int   = g.get("arg_count", 0)
     sink_mask = g.get("sink_mask", None)
@@ -598,6 +599,7 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         "caller_names":       caller_names,
         "strcmp_guards":      strcmp_guards,
         "dom_gates":          dom_gates,
+        "format_gates":       format_gates,
         "arg_count":          arg_count,
         "global_vars_read":   global_vars_read,
         "natural_language":   natural_language,
@@ -714,6 +716,11 @@ def format_for_llm(summary: dict, score: float | None = None,
             else:
                 _parts.append("; ".join(f'{g["fn"]}("{g["literal"]}")' for g in gs))
         lines.append("Strcmp gate     : " + "; ".join(_parts))
+    format_gates = summary.get("format_gates", [])
+    if format_gates:
+        _fmts = list(dict.fromkeys(g["format"] for g in format_gates))
+        _fns  = ", ".join(g["fn"] for g in format_gates[:3])
+        lines.append(f"Format gate     : {'/'.join(_fmts)}  via {_fns}")
     lines.append("Harness target  : " + summary["harness_hint"])
     lines.append(f"Slice           : {summary['slice_size']} nodes, "
                  f"{summary['n_sinks']} sink(s)")

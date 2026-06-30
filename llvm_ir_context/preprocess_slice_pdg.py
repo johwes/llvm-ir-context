@@ -193,6 +193,49 @@ INPUT_SOURCES = frozenset({
     "gets",
 })
 
+# Format-parsing functions: calling any of these on the data path means the
+# input must conform to a structured format before the dangerous sink is reachable.
+# Grouped by format family so the prompt module can name the format specifically.
+FORMAT_PARSERS: dict[str, str] = {
+    # PEM / base64
+    "PEM_read_bio":         "PEM",
+    "PEM_read_bio_ex":      "PEM",
+    "PEM_read":             "PEM",
+    "PEM_get_type":         "PEM",
+    "EVP_DecodeBlock":      "base64",
+    "EVP_DecodeUpdate":     "base64",
+    "EVP_DecodeFinal":      "base64",
+    "BIO_f_base64":         "base64",
+    # ASN.1 / DER
+    "d2i_X509":             "ASN.1/DER",
+    "d2i_PKCS7":            "ASN.1/DER",
+    "d2i_RSAPrivateKey":    "ASN.1/DER",
+    "d2i_PrivateKey":       "ASN.1/DER",
+    "d2i_PublicKey":        "ASN.1/DER",
+    "ASN1_get_object":      "ASN.1/DER",
+    "ASN1_item_d2i":        "ASN.1/DER",
+    # BIO delimiter scanning (PEM header / line-based format gates)
+    "BIO_gets":             "line-delimited",
+    # Archive / compression
+    "inflate":              "zlib",
+    "inflateInit":          "zlib",
+    "inflateInit2":         "zlib",
+    "deflate":              "zlib",
+    "BZ2_bzDecompress":     "bzip2",
+    "LZ4_decompress_safe":  "lz4",
+    # JSON / XML / structured text
+    "json_tokener_parse":   "JSON",
+    "xmlParseDoc":          "XML",
+    "xmlReadMemory":        "XML",
+    "cJSON_Parse":          "JSON",
+    # TLS / protocol record layers
+    "ssl3_get_record":      "TLS",
+    "tls1_process_heartbeat": "TLS",
+    # HTTP
+    "http_parser_execute":  "HTTP",
+    "llhttp_execute":       "HTTP",
+}
+
 _SINK_SUFFIXES = tuple(DANGEROUS_SINKS)
 
 _STRCMP_FNS = frozenset({
@@ -901,6 +944,10 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
                                    sink_fn_names_for_gates)
     g["dom_gates"] = dom_gates
 
+    # Format gate detection (P2.2): detect known format-parsing calls in the
+    # function body — signals that input must conform to a structured format.
+    g["format_gates"] = _extract_format_gates(target_fn, mock_names)
+
     # Count function arguments so the split-input hint can reference them by name.
     g["arg_count"] = sum(1 for _ in target_fn.arguments)
 
@@ -1055,6 +1102,42 @@ def _extract_dom_gates(target_fn, block_preds: dict, ptr_to_id: dict,
                             "hex":        hex(const_val & 0xFFFFFFFFFFFFFFFF),
                             "ir_snippet": ir_text[:120],
                         })
+
+    return gates
+
+
+# ---------------------------------------------------------------------------
+# Format gate extractor — P2.2
+# ---------------------------------------------------------------------------
+
+def _extract_format_gates(target_fn, mock_names: dict) -> list[dict]:
+    """Detect format-parsing calls anywhere in the function body.
+
+    Scans all call instructions in target_fn. When a callee matches
+    FORMAT_PARSERS, records the format family. The presence of a format
+    parser indicates that the input must conform to a structured format
+    before any dangerous sink is reachable — random bytes will be rejected
+    at the parser boundary.
+
+    Returns list of dicts:
+      {"fn": str, "format": str}  — callee name and format family label
+    """
+    seen_formats: set[str] = set()
+    gates: list[dict] = []
+
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode != "call":
+                continue
+            for op in instr.operands:
+                if op.value_kind not in (VK_FUNCTION, VK_GLOBAL_VAR):
+                    continue
+                callee = op.name.lstrip("@")
+                fmt = FORMAT_PARSERS.get(callee)
+                if fmt and fmt not in seen_formats:
+                    seen_formats.add(fmt)
+                    gates.append({"fn": callee, "format": fmt})
+                break  # callee found, move to next instruction
 
     return gates
 
