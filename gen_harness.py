@@ -1240,7 +1240,8 @@ def build_task_block(fn_name: str, summary: dict,
                      is_context_reader: bool = False,
                      is_registration_caller: bool = False,
                      vuln_fn: str = "",
-                     c_standard: str = "C11") -> str:
+                     c_standard: str = "C11",
+                     generate_instructions: bool = False) -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
     Modules are selected by structural signals in the summary dict.
@@ -1250,6 +1251,9 @@ def build_task_block(fn_name: str, summary: dict,
     is_context_reader: function reads through an opaque handle/context (BIO*, FILE*,
     EVP_MD_CTX*, etc.) rather than taking a raw fd or buffer argument directly.
     c_standard: detected from DWARF debug metadata in the IR (e.g. 'C11', 'C++17').
+    generate_instructions: when True, emit layer-2 'how to call' modules (M-02 input
+    routing, M-09 socketpair, M-11 context handle, M-13 format gate). When False
+    (default), only emit structural facts and let the model derive the call setup.
     """
     hint = summary.get("harness_hint", "")
     strcmp_guards = summary.get("strcmp_guards", [])
@@ -1315,31 +1319,32 @@ def build_task_block(fn_name: str, summary: dict,
             f"any of the detected literals — do NOT derive the verb from `Size` or any "
             f"value that is constant across the call sequence"
         )
-    elif is_fd_reader:
-        pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
-    elif is_context_reader:
-        pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
-    elif is_registration_caller:
-        # Caller is a format/handler registration function.
-        # It takes a context handle and registers callbacks — it does not accept Data/Size directly.
-        # The model must consult the API reference and source to find the correct pipeline.
-        _target = vuln_fn or fn_name
-        modules.append(
-            f"- `{fn_name}` accepts only a context handle — it registers `{_target}` as a "
-            f"callback and does not accept `Data`/`Size` directly. "
-            f"Consult the API reference and source to find the correct pipeline: "
-            f"(1) allocate a fresh context, "
-            f"(2) call `{fn_name}` to register the handler, "
-            f"(3) open fuzz input from memory using the library's open-from-memory API, "
-            f"(4) drive the dispatch loop until it returns non-OK — this internally "
-            f"dispatches to `{_target}`, "
-            f"(5) free/close the context on every exit path."
-        )
-    else:
-        modules.append(
-            f"- Pass `Data` and `Size` into `{fn_name}` — "
-            f"do not add artificial caps on Size"
-        )
+    elif generate_instructions:
+        if is_fd_reader:
+            pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
+        elif is_context_reader:
+            pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
+        elif is_registration_caller:
+            # Caller is a format/handler registration function.
+            # It takes a context handle and registers callbacks — it does not accept Data/Size directly.
+            # The model must consult the API reference and source to find the correct pipeline.
+            _target = vuln_fn or fn_name
+            modules.append(
+                f"- `{fn_name}` accepts only a context handle — it registers `{_target}` as a "
+                f"callback and does not accept `Data`/`Size` directly. "
+                f"Consult the API reference and source to find the correct pipeline: "
+                f"(1) allocate a fresh context, "
+                f"(2) call `{fn_name}` to register the handler, "
+                f"(3) open fuzz input from memory using the library's open-from-memory API, "
+                f"(4) drive the dispatch loop until it returns non-OK — this internally "
+                f"dispatches to `{_target}`, "
+                f"(5) free/close the context on every exit path."
+            )
+        else:
+            modules.append(
+                f"- Pass `Data` and `Size` into `{fn_name}` — "
+                f"do not add artificial caps on Size"
+            )
 
     # --- M-03: String null-termination (always) ---
     modules.append(
@@ -1438,7 +1443,7 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-09: fd-reader — pipe fuzz input via socketpair ---
     # Fires when the target reads data through a file descriptor (fgets/recv/read)
     # rather than accepting a buffer argument directly.
-    if is_fd_reader:
+    if generate_instructions and is_fd_reader:
         modules.append(
             f"- This function reads data through a file descriptor, not from a buffer "
             f"argument. The fuzzer cannot feed `Data` into it directly.\n"
@@ -1468,7 +1473,7 @@ def build_task_block(fn_name: str, summary: dict,
     # Fires when the function reads through an opaque handle (BIO*, FILE*, EVP_MD_CTX*,
     # etc.) rather than taking a raw fd or buffer argument. The model must create the
     # handle and write fuzz data into it before calling the target.
-    if is_context_reader:
+    if generate_instructions and is_context_reader:
         _fmt_gates = summary.get("format_gates", [])
         if _fmt_gates:
             # M-11 + M-13 combined: handle is required, but raw Data must not be
@@ -1578,7 +1583,7 @@ def build_task_block(fn_name: str, summary: dict,
     # requires structured input — random bytes will be rejected at the parser
     # boundary before any dangerous sink is reachable.
     _format_gates = summary.get("format_gates", [])
-    if _format_gates:
+    if generate_instructions and _format_gates:
         _fmt_families = list(dict.fromkeys(g["format"] for g in _format_gates))
         _fmt_fns      = [g["fn"] for g in _format_gates[:4]]
         _fmt_label    = "/".join(_fmt_families[:2])
@@ -1757,7 +1762,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                output_dir: Path, src_dir: str,
                                save_prompt: bool = False,
                                header_path: str = "",
-                               libs: list[str] | None = None) -> bool:
+                               libs: list[str] | None = None,
+                               generate_instructions: bool = False) -> bool:
     """Build a two-section prompt: vulnerable callee context + caller entry point.
 
     The model sees where the bug is (vuln_fn) and where the harness must
@@ -1819,7 +1825,8 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
                                   is_fd_reader=caller_is_fd_reader,
                                   is_registration_caller=_reg_caller,
                                   vuln_fn=vuln_fn,
-                                  c_standard=_detect_c_standard(caller_ll))
+                                  c_standard=_detect_c_standard(caller_ll),
+                                  generate_instructions=generate_instructions)
     # Prepend the interprocedural-specific constraint
     interp_note = (
         f"- The harness entry point is `{caller_fn}` — do NOT call `{vuln_fn}` directly\n"
@@ -1932,7 +1939,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                  src_dir: str = "", ir_dir: str = "",
                  save_prompt: bool = False,
                  header_path: str = "",
-                 libs: list[str] | None = None) -> bool:
+                 libs: list[str] | None = None,
+                 generate_instructions: bool = False) -> bool:
     """Generate, compile, and validate one harness. Returns True on success."""
 
     print(f"\n{'='*60}")
@@ -1960,6 +1968,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 save_prompt=save_prompt,
                 header_path=header_path,
                 libs=libs,
+                generate_instructions=generate_instructions,
             )
 
     # If function has internal linkage and no public caller was found, fall
@@ -2024,7 +2033,8 @@ def generate_one(ll_path: str, fn_name: str, header: str,
     task_block   = build_task_block(fn_name, summary_json, target_header=header,
                                     is_internal=is_internal, is_fd_reader=is_fd_reader,
                                     is_context_reader=is_context_reader,
-                                    c_standard=c_std)
+                                    c_standard=c_std,
+                                    generate_instructions=generate_instructions)
 
     # Extract global declarations from the original IR so the pipeline can
     # inject correct extern decls and resets without relying on the model.
@@ -2281,6 +2291,11 @@ def main():
     ap.add_argument("--save-prompt",  action="store_true",
                     help="Write harness_<fn>_prompt.md alongside each harness showing "
                          "the full message sequence sent to the model (system + user turns)")
+    ap.add_argument("--generate-instructions", action="store_true",
+                    help="Emit layer-2 'how to call' prompt modules (socketpair setup, "
+                         "context handle population, format gate envelope, registration "
+                         "caller pipeline). By default these are omitted and the model "
+                         "derives the call setup from source and API reference.")
     ap.add_argument("--lib",          metavar="PATH", action="append", default=[],
                     help="Library or object to link into the fuzzer binary "
                          "(repeatable). Accepts .a/.so paths or -lname flags. "
@@ -2313,13 +2328,16 @@ def main():
 
     header_path  = args.header or ""
 
+    gen_instructions = args.generate_instructions
+
     if args.ll:
         generate_one(args.ll, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir,
                      ir_dir=str(Path(args.ll).parent),
                      save_prompt=args.save_prompt,
                      header_path=header_path,
-                     libs=libs)
+                     libs=libs,
+                     generate_instructions=gen_instructions)
         return
 
     # ir-dir mode
@@ -2330,7 +2348,8 @@ def main():
             ap.error(f"--function {args.function!r} not found in any .ll file under {args.ir_dir}")
         generate_one(ll_path, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir, ir_dir=args.ir_dir, save_prompt=args.save_prompt,
-                     header_path=header_path, libs=libs)
+                     header_path=header_path, libs=libs,
+                     generate_instructions=gen_instructions)
         return
 
     print(f"── ranking functions in {args.ir_dir} ──────────────")
@@ -2349,7 +2368,8 @@ def main():
                           src_dir=src_dir, ir_dir=args.ir_dir,
                           header_path=header_path,
                           save_prompt=args.save_prompt,
-                          libs=libs)
+                          libs=libs,
+                          generate_instructions=gen_instructions)
         (results["ok"] if ok else results["fail"]).append(fn_name)
 
     # Summary when running multiple
