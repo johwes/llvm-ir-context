@@ -1133,6 +1133,22 @@ def _compile_fuzzer(merged_ll: Path, out_bin: Path) -> "tuple[Path | None, str]"
     return (out_bin, "") if r.returncode == 0 else (None, r.stderr)
 
 
+def _compile_fuzzer_with_lib(merged_ll: Path, out_bin: Path,
+                              libs: list[str],
+                              extra_libs: list[str]) -> "tuple[Path | None, str]":
+    """Compile merged IR + target .a into a fuzzer binary.
+
+    Uses --allow-multiple-definition so the IR version of promoted symbols
+    wins over the .a copy, while native/assembly symbols from the .a fill
+    in what the IR cannot provide.
+    """
+    cmd = ["clang-20", "-fsanitize=fuzzer,address", "-g",
+           str(merged_ll)] + libs + extra_libs + [
+           "-Wl,--allow-multiple-definition", "-o", str(out_bin)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return (out_bin, "") if r.returncode == 0 else (None, r.stderr)
+
+
 def self_harm_verdict(score: float) -> str:
     if score >= SELF_HARM_WARN:
         return f"WARNING ({score:.0%}) — likely real bug in harness; review before fuzzing"
@@ -2232,12 +2248,21 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             print(f"IR link OK → {merged}")
             fuzzer_bin = output_dir / f"fuzzer_{fn_name}"
             fuzzer, compile_err = _compile_fuzzer(merged, fuzzer_bin)
+            if not fuzzer and libs:
+                # IR-only compile failed — retry with target .a +
+                # --allow-multiple-definition so promoted IR symbols win.
+                undef = [l for l in compile_err.splitlines()
+                         if "undefined reference" in l]
+                extra_libs = _infer_extra_libs(undef)
+                print(f"IR-only compile failed; retrying with target lib...")
+                fuzzer, compile_err = _compile_fuzzer_with_lib(
+                    merged, fuzzer_bin, libs, extra_libs)
             if fuzzer:
                 print(f"Compiled  → {fuzzer}")
                 print(f"\nTo fuzz:")
                 print(f"  {fuzzer}")
             else:
-                # Assembly or external symbols not in IR — library link required.
+                # Still failed — instruct user to build lib with sanitizers.
                 undef = [l for l in compile_err.splitlines()
                          if "undefined reference" in l]
                 print(f"Compile failed (IR-only binary not self-contained).")
