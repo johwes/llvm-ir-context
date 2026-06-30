@@ -127,45 +127,72 @@ def get_context_json(ll_path: str, fn_name: str) -> dict:
 
 
 def resolve_public_caller(ll_path: str, fn_name: str,
-                          header_text: str, ir_dir: str) -> "tuple[str, str] | None":
-    """Find the best public caller of fn_name.
+                          header_text: str, ir_dir: str,
+                          max_hops: int = 3) -> "tuple[str, str] | None":
+    """Find the best public caller of fn_name via BFS up the call graph.
 
-    Uses caller_names from the slice JSON. Searches all .ll files in ir_dir
-    for a caller with external linkage (not `define internal`).
-    Prefers callers declared in the header; falls back to any externally-linked
-    caller (e.g. main()) when no header-declared caller exists.
+    Searches up to max_hops levels up from fn_name, looking for a caller
+    with external linkage declared in the header. BFS ensures the shortest
+    path to a public entry point is found first.
+
     Returns (caller_ll_path, caller_fn_name) or None.
     """
-    summary = get_context_json(ll_path, fn_name)
-    caller_names = summary.get("caller_names", [])
-    if not caller_names:
-        return None
-
     search_dir = Path(ir_dir) if ir_dir else Path(ll_path).parent
-    header_matches: list[tuple[str, str]] = []
-    any_matches: list[tuple[str, str]] = []
-    for ll in search_dir.glob("*.ll"):
+
+    # Pre-index: function name -> (ll_path, is_internal, text) for all .ll files
+    fn_index: dict[str, list[tuple[str, bool]]] = {}
+    ll_texts: dict[str, str] = {}
+    for ll in sorted(search_dir.glob("*.ll")):
         try:
             text = ll.read_text(errors="replace")
         except OSError:
             continue
-        for caller in caller_names:
-            if caller == "main":
-                continue  # calling main() from a harness re-enters the server loop
-            m = re.search(
-                r"^(define\b[^@]*)@" + re.escape(caller) + r"\s*\(",
-                text, re.MULTILINE,
-            )
-            if not m:
-                continue
-            if "internal" in m.group(1):
-                continue
-            entry = (str(ll), caller)
-            if header_text and fn_in_header(caller, header_text):
-                header_matches.append(entry)
-            else:
-                any_matches.append(entry)
-    return (header_matches or any_matches or [None])[0]
+        ll_texts[str(ll)] = text
+        for m in re.finditer(r"^(define\b[^@]*)@(\w+)\s*\(", text, re.MULTILINE):
+            is_internal = "internal" in m.group(1)
+            fn_index.setdefault(m.group(2), []).append((str(ll), is_internal))
+
+    # BFS: start from fn_name, walk up via caller_names
+    visited: set[str] = {fn_name}
+    frontier: list[tuple[str, str]] = [(ll_path, fn_name)]  # (ll_path, fn_name)
+
+    for _hop in range(max_hops):
+        if not frontier:
+            break
+        next_frontier: list[tuple[str, str]] = []
+        header_matches: list[tuple[str, str]] = []
+        any_matches: list[tuple[str, str]] = []
+
+        for cur_ll, cur_fn in frontier:
+            summary = get_context_json(cur_ll, cur_fn)
+            caller_names = summary.get("caller_names", [])
+            for caller in caller_names:
+                if caller == "main" or caller in visited:
+                    continue
+                visited.add(caller)
+                if caller not in fn_index:
+                    continue
+                for caller_ll, is_internal in fn_index[caller]:
+                    if is_internal:
+                        # Internal caller — add to next frontier to keep searching up
+                        next_frontier.append((caller_ll, caller))
+                        continue
+                    # External caller — candidate
+                    entry = (caller_ll, caller)
+                    if header_text and fn_in_header(caller, header_text):
+                        header_matches.append(entry)
+                    else:
+                        any_matches.append(entry)
+
+        if header_matches or any_matches:
+            result = (header_matches or any_matches)[0]
+            hops = _hop + 1
+            if hops > 1:
+                print(f"  P-05: found public caller `{result[1]}` at {hops} hops")
+            return result
+        frontier = next_frontier
+
+    return None
 
 try:
     from tree_sitter import Language, Parser as _TSParser
@@ -2342,16 +2369,32 @@ def generate_one(ll_path: str, fn_name: str, header: str,
 # ---------------------------------------------------------------------------
 
 def _find_ll_for_function(ir_dir: str, fn_name: str) -> str | None:
-    """Return the .ll file path that defines fn_name, or None."""
+    """Return the .ll file path that defines fn_name, or None.
+
+    When multiple .ll files define the same function name, prints a warning
+    listing all matches so the user can pin the correct one with --ll.
+    """
     import glob as _glob
     pattern = re.compile(rf"^define\b.*@{re.escape(fn_name)}\s*\(", re.MULTILINE)
+    matches = []
     for ll_path in sorted(_glob.glob(str(Path(ir_dir) / "*.ll"))):
         try:
             if pattern.search(Path(ll_path).read_text(errors="replace")):
-                return ll_path
+                matches.append(ll_path)
         except OSError:
             pass
-    return None
+    if not matches:
+        return None
+    if len(matches) > 1:
+        names = "\n  ".join(Path(p).name for p in matches)
+        print(
+            f"WARNING: '{fn_name}' is defined in {len(matches)} translation units:\n"
+            f"  {names}\n"
+            f"Picked {Path(matches[0]).name} (alphabetically first). "
+            f"Use --ll to pin a specific file:\n"
+            f"  --ll {matches[0]}"
+        )
+    return matches[0]
 
 
 def _enrich_with_callee_flags(summary: dict, fn_name: str,
@@ -2402,9 +2445,14 @@ def _enrich_with_callee_flags(summary: dict, fn_name: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--ll",          metavar="FILE")
-    src.add_argument("--ir-dir",      metavar="DIR")
+    ap.add_argument("--ll",          metavar="FILE",
+                    help="Translation unit .ll file containing the target function. "
+                         "Can be combined with --ir-dir to pin the TU while using "
+                         "the full IR directory for P-05 caller search.")
+    ap.add_argument("--ir-dir",      metavar="DIR",
+                    help="Directory of .ll files. Used for ranking (without --ll/--function), "
+                         "for locating the TU when --function is given without --ll, and "
+                         "for P-05 transitive caller search.")
     ap.add_argument("--function",     metavar="FN",
                     help="Target function. Required with --ll. "
                          "With --ir-dir: skip ranking, generate exactly this function.")
@@ -2434,9 +2482,11 @@ def main():
                          "Example: --lib /path/to/libssl.a --lib /path/to/libcrypto.a")
     args = ap.parse_args()
 
+    if not args.ll and not args.ir_dir:
+        ap.error("one of --ll or --ir-dir is required")
     if args.ll and not args.function:
         ap.error("--function is required with --ll")
-    if args.ll and args.top_k != 1:
+    if args.ll and not args.ir_dir and args.top_k != 1:
         ap.error("--top-k only applies to --ir-dir mode")
 
     header       = Path(args.header).read_text(errors="replace") if args.header else ""
@@ -2463,9 +2513,12 @@ def main():
     gen_instructions = args.generate_instructions
 
     if args.ll:
+        # --ir-dir can be combined with --ll to use the full directory for P-05
+        # caller search while pinning the specific TU containing the target function.
+        effective_ir_dir = args.ir_dir or str(Path(args.ll).parent)
         generate_one(args.ll, args.function, header, include_dirs, output_dir,
                      src_dir=src_dir,
-                     ir_dir=str(Path(args.ll).parent),
+                     ir_dir=effective_ir_dir,
                      save_prompt=args.save_prompt,
                      header_path=header_path,
                      libs=libs,
