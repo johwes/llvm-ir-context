@@ -73,6 +73,14 @@ buffer", do not add any size cap or MAX_SIZE guard.
 point is to reach the dangerous sizes the slicer identified.
 - Use the exact function signature from the IR or API reference. Do not invent \
 parameters.
+- LLVM IR uses `ptr` as a generic opaque pointer type. When an IR signature shows \
+`ptr` as a parameter type, translate it to the appropriate C pointer type from \
+context (e.g. `struct archive_read *`, `void *`). Never write `ptr` literally in \
+C code — it is not a valid C type.
+- Never call `sizeof` on an opaque struct (one declared as `struct foo;` with no \
+body in scope). Allocate opaque objects only via the library's own constructor \
+functions (e.g. `archive_entry_new()`, not `calloc(1, sizeof(struct archive_entry))`). \
+If no constructor is available, pass NULL or omit the argument.
 - Never redefine structs, typedefs, or enums that appear in the API reference — \
 redefining types that don't match the compiled target causes silent layout mismatches \
 and missed bugs.
