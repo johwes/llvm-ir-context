@@ -160,39 +160,7 @@ plus test cases.
 
 ### 11. Sparse guard ratio score boost
 
-**Observation (libarchive LHA run):** `archive_read_format_lha_read_header` ranked 33rd
-despite having 195 sinks — the highest sink count of any function in the 90–93% score
-band by a factor of 4×. It was identified for fuzzing not by ranking but by a human
-noticing the anomalous sink count in the details column. The root cause was an
-unchecked `compsize` field flowing to a 4GB allocation — confirmed OOM crash at 91M
-executions.
-
-The slicer already computed and flagged the signal: `5.1 sinks/guard (sparse)`. But
-this ratio does not feed back into the score. A function with sparse guard coverage
-is structurally different from one with dense coverage — sparse means the guards that
-exist protect only a fraction of the dangerous paths, leaving many unguarded routes
-to the sink.
-
-**Fix:** Add a sparse guard ratio multiplier to the score:
-
-| sinks/guard ratio | multiplier |
-|---|---|
-| > 5.0 | ×1.15 |
-| > 10.0 | ×1.25 |
-| guard = NO (any sinks) | unchanged (already penalised) |
-
-Applied after the base score, before propagation. Would have pushed
-`archive_read_format_lha_read_header` from rank 33 into approximately the top 15 on
-libarchive — making it visible without any manual selection.
-
-**Codebase-agnostic:** The ratio is derived purely from IR structure (icmp count /
-sink count). No target-specific tuning.
-
-**Effort:** Small — one multiplier in `score_deterministic.py`, one field already
-present in the slice summary.
-
-**Files:** `llvm_ir_context/score_deterministic.py` (score formula),
-`llvm_ir_context/preprocess_slice_pdg.py` (sinks/guard ratio already computed)
+*Implemented. See Completed table.*
 
 ---
 
@@ -570,3 +538,4 @@ No slicer changes needed; all required signals are already emitted.
 | gen_harness UX #1: warn when `--function` matches multiple TUs (ambiguous name) — lists all matches and names the one picked, prompts user to use `--ll` to pin | `gen_harness.py` |
 | gen_harness UX #2: allow `--ll` and `--ir-dir` together — `--ll` pins the TU, `--ir-dir` provides the full directory for P-05 caller search; previously mutually exclusive | `gen_harness.py` |
 | gen_harness UX #3: BFS transitive P-05 caller search (up to 3 hops) — previously only searched one level up, missing public entry points 2+ hops away (e.g. `read_header` → `archive_read_format_rar_read_header` → `archive_read_support_format_rar`) | `gen_harness.py` |
+| **P1.11** Sparse guard ratio score boost: ×1.15 when sinks/guard > 5, ×1.25 when > 10; only fires when guards exist and call sinks are present — pushes high-sink sparse-guard functions from mid-band into top ranks without target-specific tuning | `score_deterministic.py` |

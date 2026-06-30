@@ -255,7 +255,19 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     if has_free_sink and not has_buffer_write:
         mult *= 1.05   # free() call without a raw copy — UAF/double-free risk signal
 
-    # caller_validated is surfaced as +caller? in the details column for human review.
+    # Sparse guard ratio multiplier (P1.11): when guards exist but cover only a
+    # small fraction of sinks, many dangerous paths are unprotected. The slicer
+    # already computes this ratio; feed it back into the score.
+    # Only fires when there ARE guards (no_guard functions already score high);
+    # only fires when there are call sinks (GEP-only sparsity is a different signal).
+    if has_guard and has_call_sink and n_sinks > 0:
+        gc = summary.get("guard_count", 1) or 1
+        ratio = n_sinks / gc
+        if ratio > 10.0:
+            mult *= 1.25
+        elif ratio > 5.0:
+            mult *= 1.15
+
     # caller_validated is surfaced as +caller? in the details column for human review.
     # We do NOT apply an automatic score reduction: "caller has icmp" is too broad a
     # signal — routing guards, null pointer checks, and loop bounds all satisfy it
