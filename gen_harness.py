@@ -1463,13 +1463,12 @@ def build_task_block(fn_name: str, summary: dict,
                 f"or similar) AND that handle must contain a valid {_fmt_label} stream — "
                 f"writing raw `Data` bytes into the handle will be rejected by the format "
                 f"parser before reaching any interesting code. "
-                f"You MUST construct a valid {_fmt_label} envelope: hardcode the required "
-                f"header/prefix bytes (e.g. for PEM: `-----BEGIN <type>-----\\n` + base64 "
-                f"content + `-----END <type>-----\\n`), embed fuzz bytes in the payload "
-                f"region after the header, write the complete structured buffer into the "
-                f"BIO with `BIO_write`, then call `{fn_name}`. "
-                f"Do NOT call `BIO_write(bio, Data, Size)` with raw fuzz bytes as the "
-                f"entire input — the format gate will reject it immediately."
+                f"You MUST construct a valid {_fmt_label} envelope: consult the API "
+                f"reference to determine the required header/prefix bytes for this format, "
+                f"hardcode them, embed fuzz bytes in the payload region after the header, "
+                f"write the complete structured buffer into the handle, then call `{fn_name}`. "
+                f"Do NOT write raw `Data` bytes directly into the handle as the entire "
+                f"input — the format gate will reject it immediately."
             )
         else:
             modules.append(
