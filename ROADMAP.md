@@ -181,9 +181,15 @@ a valid zlib stream, the fuzzer can't reach any decompression logic.
 first call without refilling, so even with valid input no deep state was reached.
 
 **Fix path:**
-- P-08a: detect `icmp` against small integer constant within 1–2 hops of input
-  buffer offset 0/1 near function entry → emit hint "provide seed corpus with a
-  valid `<format>` stream; fuzzer cannot reach sink without it"
+- P-08a: dominator tree walk from sink basic block to function entry; collect all
+  `icmp`/`switch` instructions on the dominator path whose operands are integer
+  literals or enum constants. Emit prompt hint with the extracted constraint values
+  (e.g. "to reach this sink, input offset 0–3 must equal `0x789c` (zlib magic)").
+  This is strictly more powerful than the original "near function entry" heuristic —
+  it catches guards anywhere in the function and extracts the actual required values
+  rather than just flagging that a gate exists. Scope: extractable constraints only
+  (literal `icmp` operands); struct-field state guards and multi-hop format parsers
+  are out of scope (see P2.2).
 - P-08b: detect return-value-as-loop-condition shape (function returns status int,
   caller loops while status == CONTINUE) → emit hint "call in a loop; refill
   output buffer each iteration"
