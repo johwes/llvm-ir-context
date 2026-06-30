@@ -1238,6 +1238,8 @@ def build_task_block(fn_name: str, summary: dict,
                      is_internal: bool = False,
                      is_fd_reader: bool = False,
                      is_context_reader: bool = False,
+                     is_registration_caller: bool = False,
+                     vuln_fn: str = "",
                      c_standard: str = "C11") -> str:
     """Compose the Task requirements block from slicer-detected patterns.
 
@@ -1317,6 +1319,23 @@ def build_task_block(fn_name: str, summary: dict,
         pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
     elif is_context_reader:
         pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
+    elif is_registration_caller:
+        # Caller is a format/handler registration function (e.g. archive_read_support_format_lha).
+        # It takes a context handle and registers callbacks — it does not accept Data/Size directly.
+        # Feed fuzz input through the library's standard open-memory + read-header pipeline.
+        _target = vuln_fn or fn_name
+        modules.append(
+            f"- `{fn_name}` is a registration function — it registers `{_target}` as a "
+            f"callback and does not accept `Data`/`Size` directly. "
+            f"To reach `{_target}`, use the library's standard pipeline:\n"
+            f"  1. Create a fresh reader/context with the appropriate `*_new()` call.\n"
+            f"  2. Call `{fn_name}` on the context to register the format handler.\n"
+            f"  3. Open fuzz input via `archive_read_open_memory(ctx, Data, Size)` (or the "
+            f"equivalent open-from-memory API for this library).\n"
+            f"  4. Drive the dispatch loop with `archive_read_next_header()` (or equivalent) "
+            f"until it returns non-OK — this internally dispatches to `{_target}`.\n"
+            f"  5. Free/close the context on every exit path."
+        )
     else:
         modules.append(
             f"- Pass `Data` and `Size` into `{fn_name}` — "
@@ -1784,8 +1803,19 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
     )
     is_fd_reader = caller_is_fd_reader
     _global_decls = []  # interprocedural path doesn't extract globals
+
+    # Detect registration-style callers: single pointer arg, no i8*/i32 size param.
+    # These functions register callbacks but don't accept Data/Size directly.
+    # Pattern: define ... @fn(ptr %0) with no i8* or i32/i64 buffer param.
+    _reg_caller = bool(
+        caller_sig
+        and re.search(r'@' + re.escape(caller_fn) + r'\s*\(\s*ptr\s+\w+\s*\)', caller_sig)
+    )
+
     task_block = build_task_block(caller_fn, merged_summary, target_header=header,
                                   is_fd_reader=caller_is_fd_reader,
+                                  is_registration_caller=_reg_caller,
+                                  vuln_fn=vuln_fn,
                                   c_standard=_detect_c_standard(caller_ll))
     # Prepend the interprocedural-specific constraint
     interp_note = (
