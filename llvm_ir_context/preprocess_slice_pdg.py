@@ -464,12 +464,15 @@ def _is_dangerous(name: str) -> bool:
     norm = _normalize_sink_name(name)
     if norm != name and norm in DANGEROUS_SINKS:
         return True
-    # Only apply suffix matching to compiler-generated names (start with _ or __).
-    # This prevents BIO_gets, BIO_read, BIO_free etc. matching gets/read/free.
-    if name.startswith("_"):
-        for s in _SINK_SUFFIXES:
-            if name.endswith(s) or name.endswith("_" + s):
-                return True
+    # gets is inherently unsafe regardless of wrapping — never match via suffix.
+    # All other sinks (read, free, malloc, memcpy etc.) are legitimate I/O or
+    # memory signals even when appearing as a suffix (BIO_read, CRYPTO_free).
+    _NO_SUFFIX_MATCH = frozenset({"gets"})
+    for s in _SINK_SUFFIXES:
+        if s in _NO_SUFFIX_MATCH:
+            continue
+        if name.endswith(s) or name.endswith("_" + s):
+            return True
     # LLVM memory intrinsics: e.g. llvm.memcpy.p0i8.p0i8.i64 / llvm.memcpy.p0.p0.i64
     for s in ("memcpy", "memmove", "memset", "bcopy"):
         if name.startswith(f"llvm.{s}."):
@@ -485,10 +488,12 @@ def _canonical_name(name: str) -> str:
     for s in ("memcpy", "memmove", "memset", "bcopy"):
         if name.startswith(f"llvm.{s}."):
             return s
-    if name.startswith("_"):
-        for s in _SINK_SUFFIXES:
-            if name.endswith(s) or name.endswith("_" + s):
-                return s
+    _NO_SUFFIX_MATCH = frozenset({"gets"})
+    for s in _SINK_SUFFIXES:
+        if s in _NO_SUFFIX_MATCH:
+            continue
+        if name.endswith(s) or name.endswith("_" + s):
+            return s
     return name
 
 
