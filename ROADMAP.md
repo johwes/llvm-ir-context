@@ -365,6 +365,50 @@ prompt module that fires when the call graph between entry and sink contains one
 
 ---
 
+### 3. Whole-program IR input (LTO bitcode)
+
+**External review:** A glibc maintainer and CNA flagged that per-TU IR analysis
+will accumulate false positives at scale because LTO can substantially transform
+IR across the final link boundary — the IR we analyze may not be what the CPU
+executes. Covscan-style tools mirror the full build and analyze the post-link IR
+to avoid this. They also raised that OSS-Fuzz-Gen uses the project build system
+directly, which gives higher-quality call graph resolution.
+
+**Honest scope assessment:** This tool is a *signal generator for LLM harness
+generation*, not a SAST tool. A SAST tool needs near-zero false positives because
+a human triages every finding. We need directionally useful signal — the LLM is
+the final reasoning layer and can discard implausible findings from context. A 30%
+false positive rate is acceptable if it eliminates 70% of the LLM's blind spots.
+The codebase-agnostic design constraint means we deliberately do not require
+build-system integration; our value is that any `.ll` file works without per-target
+engineering.
+
+That said, the LTO transformation gap is real. It is most acute when:
+- A function that looks dangerous in per-TU IR is actually inlined into a call
+  site that guards it — we see the function as unguarded; it isn't at link time.
+- Multiply-defined symbols (already hit in OpenSSL with `--only-needed`) mean
+  the IR we analyze may be a different instantiation than what the linker chose.
+
+**Fix:** Accept a pre-linked whole-program `.bc` file as an alternative to a
+directory of per-TU `.ll` files. The caller builds with `clang -flto -fuse-ld=lld`
+and passes the resulting `.bc` directly. We already use `llvm-link`; the only new
+piece is a `--whole-program-ir` input path that feeds the same analysis pipeline
+with a single already-merged module. This collapses the callee resolution problem
+and eliminates the LTO transformation gap without requiring build-system knowledge.
+
+Building with `-flto` is a one-flag change to a `CFLAGS` environment variable for
+autoconf/cmake projects; it is not "integrating with the build system" in the
+covscan sense.
+
+**Effort:** Medium — `score_deterministic.py` walks a directory of `.ll` files;
+needs a single-file entry path. Analysis logic is unchanged.
+
+**Files:** `llvm_ir_context/score_deterministic.py` (single-module entry path),
+`llvm_ir_context/__main__.py` (`--whole-program-ir` flag), `gen_harness.py`
+(pass single `.bc` to `llvm-link` rather than a directory)
+
+---
+
 ### 1. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
 - Lever 1: Juliet pretraining (§27) — cleaner training signal
 - Lever 2: guard direction + taint source as node features
