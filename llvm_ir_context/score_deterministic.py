@@ -92,6 +92,27 @@ _ALLOC_ONLY_SINKS = frozenset({
     "malloc", "calloc", "realloc", "xmalloc", "xrealloc",
 })
 
+# Command injection sinks: user-controlled string reaches shell/exec.
+# Scored like unguarded call sinks — no buffer-write multiplier since there
+# is no size argument, but the vulnerability class is high severity.
+_COMMAND_INJECTION_SINKS = frozenset({
+    "system", "popen",
+    "execv", "execvp", "execve", "execle", "execl", "execlp",
+    "posix_spawn",
+})
+
+# Path traversal sinks: user-controlled string reaches filesystem call.
+_PATH_TRAVERSAL_SINKS = frozenset({
+    "open", "openat", "creat",
+    "fopen", "fopen64", "freopen",
+    "unlink", "unlinkat", "remove",
+    "rename", "renameat",
+    "rmdir", "mkdir", "mkdirat",
+    "chmod", "chown", "lchown",
+    "symlink", "symlinkat", "link", "linkat",
+    "stat", "lstat", "access", "faccessat",
+})
+
 
 def philosophy2_score(summary: dict) -> float:  # noqa: C901
     """Pure structural Philosophy 2 score from a slice_context summary.
@@ -199,9 +220,11 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
     # Identify call sink types for multiplier logic
     call_sink_fns = {s.get("fn") for s in sinks
                      if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS}
-    has_buffer_write  = bool(call_sink_fns & _BUFFER_WRITE_SINKS)
-    all_format_sinks  = bool(call_sink_fns) and call_sink_fns <= _FORMAT_ONLY_SINKS
-    all_alloc_sinks   = bool(call_sink_fns) and call_sink_fns <= _ALLOC_ONLY_SINKS
+    has_buffer_write      = bool(call_sink_fns & _BUFFER_WRITE_SINKS)
+    has_cmd_injection     = bool(call_sink_fns & _COMMAND_INJECTION_SINKS)
+    has_path_traversal    = bool(call_sink_fns & _PATH_TRAVERSAL_SINKS)
+    all_format_sinks      = bool(call_sink_fns) and call_sink_fns <= _FORMAT_ONLY_SINKS
+    all_alloc_sinks       = bool(call_sink_fns) and call_sink_fns <= _ALLOC_ONLY_SINKS
 
     has_free_sink = any(s.get("fn") == "free" for s in sinks
                         if s.get("fn") not in _GEP_SINKS and s.get("fn") not in _DIV_SINKS)
@@ -218,6 +241,10 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         # risk level. Stacking ×1.50 pushes well-known patterns (guarded memcpy, null-only
         # inflateGetDictionary) to 1.00 and destroys differentiation at the top.
         mult *= 1.50   # raw copy with no built-in size limit — categorically most dangerous
+    elif has_cmd_injection and not trunc_drove_base:
+        mult *= 1.30   # shell/exec with user-controlled arg — high severity
+    elif has_path_traversal and not trunc_drove_base:
+        mult *= 1.20   # filesystem call with user-controlled path
     elif all_format_sinks and has_guard:
         mult *= 0.70   # snprintf/printf with guard — size param is the guard
     elif all_alloc_sinks:

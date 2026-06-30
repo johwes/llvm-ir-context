@@ -182,6 +182,19 @@ DANGEROUS_SINKS = frozenset({
     # common vulnerability pattern (scar_atoi in scarnet, CWE-190/191).
     "atoi", "atol", "atoll", "atof",
     "strtol", "strtoul", "strtoll", "strtoull", "strtod",
+    # Command injection — user-controlled string reaches a shell or exec call.
+    "system", "popen",
+    "execv", "execvp", "execve", "execle", "execl", "execlp",
+    "posix_spawn",
+    # Path traversal — user-controlled string reaches a filesystem call.
+    "open", "openat", "creat",
+    "fopen", "fopen64", "freopen",
+    "unlink", "unlinkat", "remove",
+    "rename", "renameat",
+    "rmdir", "mkdir", "mkdirat",
+    "chmod", "chown", "lchown",
+    "symlink", "symlinkat", "link", "linkat",
+    "stat", "lstat", "access", "faccessat",
 })
 
 # Functions whose return value is user-controlled / network-facing input.

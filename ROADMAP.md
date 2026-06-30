@@ -108,6 +108,10 @@ graph is already built; this is a filter on top of the existing output.
 
 ### 3. Sink list expansion — command injection and path traversal
 
+*Implemented. See Completed table.*
+
+<!--
+
 **Problem:** The current sink set covers memory-safety hazards almost
 exclusively (memcpy/strcpy/malloc family). Two whole CVE categories with the
 same backward-slice detection shape are missing:
@@ -140,6 +144,7 @@ plus test cases.
 
 **Files:** `llvm_ir_context/score_deterministic.py` (sink registry),
 `llvm_ir_context/slice_context.py` (hints), `patterns.md`
+-->
 
 ---
 
@@ -475,4 +480,5 @@ needs a single-file entry path. Analysis logic is unchanged.
 | M-02/M-05 conflict fix: suppress M-02 when M-05 has specific callees; verb rule added | `gen_harness.py` |
 | **P1.7** tree-sitter-c source extraction: replaced regex+brace-counting `extract_fn_source` with AST-based implementation; call sites and comments are structurally excluded; macro-generated functions (no `function_definition` node) return `""` cleanly; regex fallback retained for environments without the package; `tree-sitter>=0.25` + `tree-sitter-c>=0.23` added to `pyproject.toml` | `gen_harness.py`, `pyproject.toml` |
 | Bug fix: `ir-context --json` excluded `sinks` from serialized summary, causing `get_context_json()` to always return empty sinks list — `_has_read_sink` was always False, `is_context_reader` was always False, M-11 never fired for any context-handle function (BIO*, FILE*, EVP_MD_CTX*) on any codebase | `llvm_ir_context/slice_context.py` |
+| **P1.3** Sink expansion: command injection (`system`, `popen`, `execv*`, `posix_spawn` — ×1.30 multiplier) and path traversal (`open`, `fopen`, `unlink`, `rename`, `stat`, `access`, `chmod`, `symlink` + 20 more — ×1.20 multiplier); full `_SINK_INFO` entries with harness hints for all new sinks | `preprocess_slice_pdg.py`, `score_deterministic.py`, `slice_context.py` |
 | **P2.2** Format gate detection: `FORMAT_PARSERS` dict (PEM, base64, ASN.1/DER, zlib, JSON, XML, TLS, HTTP families); `_extract_format_gates()` scans call graph; `format_gates` field in slice summary; M-13 prompt module instructs envelope-construction or seed corpus | `preprocess_slice_pdg.py`, `slice_context.py`, `gen_harness.py`, `patterns.md` |
