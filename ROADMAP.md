@@ -410,6 +410,42 @@ needs a single-file entry path. Analysis logic is unchanged.
 
 ---
 
+### 4. Adaptive fuzzing loop
+
+**Observation (libarchive LHA run):** Coverage gains required three manual interventions —
+seed corpus creation, `-max_len` increase, and dict injection with strcmp-gate tokens
+extracted from the slicer output. Each intervention was driven by a recognisable stall
+pattern (coverage delta < N over M seconds) and a corresponding lever the slicer already
+had the data to suggest.
+
+**Design:** A lightweight `fuzz_loop.py` wrapper that:
+1. Launches the fuzzer as a subprocess and tails its output.
+2. Detects stalls (coverage delta < threshold over a configurable window).
+3. Applies a fixed ladder of levers derived from the slicer summary already available at
+   harness-generation time:
+   - **Strcmp gates** → generate a libFuzzer `-dict` file from the gate constants
+     (`memcmp` / `strcmp` operands emitted by `slice_context.py`).
+   - **Max-len** → double `-max_len` (starting from 4096, up to a configurable ceiling).
+   - **Corpus seeds** → emit minimal valid seeds whose magic bytes satisfy any format-gate
+     constraints (slicer already extracts these for M-13).
+   - **Time budget** → extend `-max_total_time` up to a configured ceiling.
+4. Restarts the fuzzer with the new lever active and the accumulated corpus preserved.
+
+**LLM lever (optional):** The slicer summary (sink types, gate constants, guard density)
+can be fed to the model to suggest lever ordering and seed shape — the model already
+reasons about this when generating the harness prompt. Defer until the rule-based ladder
+is validated; the ladder covers ≥80% of the value.
+
+**Integration point:** `gen_harness.py` already writes the slicer summary alongside the
+harness. `fuzz_loop.py` reads it, no pipeline change required.
+
+**Effort:** Medium — subprocess management, output parsing, lever state machine.
+No slicer changes needed; all required signals are already emitted.
+
+**File:** new `fuzz_loop.py`; reads slicer summary JSON from `--output-dir`.
+
+---
+
 ### 1. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
 - Lever 1: Juliet pretraining (§27) — cleaner training signal
 - Lever 2: guard direction + taint source as node features
