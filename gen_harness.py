@@ -73,10 +73,6 @@ buffer", do not add any size cap or MAX_SIZE guard.
 point is to reach the dangerous sizes the slicer identified.
 - Use the exact function signature from the IR or API reference. Do not invent \
 parameters.
-- LLVM IR uses `ptr` as a generic opaque pointer type. When an IR signature shows \
-`ptr` as a parameter type, translate it to the appropriate C pointer type from \
-context (e.g. `struct archive_read *`, `void *`). Never write `ptr` literally in \
-C code — it is not a valid C type.
 - Never call `sizeof` on an opaque struct (one declared as `struct foo;` with no \
 body in scope). Allocate opaque objects only via the library's own constructor \
 functions (e.g. `archive_entry_new()`, not `calloc(1, sizeof(struct archive_entry))`). \
@@ -910,6 +906,8 @@ _IR_TYPE_TO_C = {
     "i8*": "char *", "i8**": "char **",
     "float": "float", "double": "double",
     "void": "void",
+    # LLVM 15+ opaque pointer type — no type info at IR level, use void *
+    "ptr": "void *",
 }
 
 def _ir_sig_to_c_decl(ir_sig: str, fn_name: str) -> str:
