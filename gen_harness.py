@@ -2220,11 +2220,12 @@ def main():
     header       = Path(args.header).read_text(errors="replace") if args.header else ""
     if args.header:
         _hdr = Path(args.header).resolve()
-        # Include both the header's parent dir AND its grandparent so that both
-        # `#include "pem.h"` and `#include <openssl/pem.h>` resolve correctly.
-        _dirs = [str(_hdr.parent)]
+        # Grandparent first so relpath gives "openssl/pem.h" not "pem.h".
+        # Parent included as fallback for flat layouts (header in include root).
+        _dirs = []
         if _hdr.parent.parent != _hdr.parent:
             _dirs.append(str(_hdr.parent.parent))
+        _dirs.append(str(_hdr.parent))
         include_dirs = _dirs
     else:
         include_dirs = []
