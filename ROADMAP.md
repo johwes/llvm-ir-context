@@ -452,6 +452,58 @@ No slicer changes needed; all required signals are already emitted.
 
 ---
 
+### 5. Targeted PoC generation (slicer-driven, no fuzzer)
+
+**Observation (libarchive RAR run):** The slicer's trunc warning already identified
+the vulnerable field class and the trigger values (`0xFFFFFFFF`, `0x80000000`,
+`0x100000000`). The fuzzer took 91M executions to find the LHA analogue; a
+correctly-crafted 57-byte input would have found it in milliseconds. The gap is
+knowing *which bytes in the input map to that field* — the IR trace knows this but
+the pipeline doesn't yet use it.
+
+**Design:** After scoring and slicing, generate targeted PoC inputs directly from
+slicer signals — no fuzzer required for the first pass:
+
+- **Trunc warning** → enumerate the truncation sites; for each, emit one input with
+  that field set to `0xFFFFFFFF`, one at `0x80000000`, one at `0x100000000`. Requires
+  knowing the byte offset and endianness of the field in the input stream — derivable
+  from the IR load instruction that feeds the narrowing cast.
+- **Format/strcmp gate** → prepend the required magic bytes / satisfy the literal
+  comparisons extracted by the slicer before setting the target field.
+- **Double-free / UAF** → emit a two-input sequence: first input allocates the
+  resource, second triggers the free path — same structure as M-05 but as a
+  concrete byte sequence rather than a harness template.
+
+**Agent loop this enables:**
+```
+score → ir-context → generate targeted PoCs → replay → crash? → done
+                              ↓ no crash in <N inputs
+                     run fuzzer bounded (e.g. 30 min)
+                              ↓ plateau / no crash
+                     conclude "not reachable from this entry point"
+                     flag for human if sinks/guard is extreme
+```
+
+**The hard part:** Mapping IR load instructions back to input byte offsets requires
+either (a) format schema knowledge (external, per-target), or (b) dynamic taint
+tracing on a valid input to discover which bytes flow into which loads. Option (b)
+is codebase-agnostic but requires instrumented execution, not just static IR.
+Option (a) can be LLM-assisted: given the source file and the IR load site, the
+model can often identify the struct field and its wire offset.
+
+**Prerequisite:** P2.4 (adaptive fuzzing loop) — the bounded fuzzer fallback is the
+same infrastructure.
+
+**Effort:** High. Static field-offset recovery is tractable for simple formats;
+the general case requires dynamic taint. Likely a multi-month research item.
+
+**Why it matters:** Converts the pipeline from "find candidates for a human to fuzz"
+to "find candidates and prove exploitability automatically." Closes the loop that
+LHA demonstrated: scorer found it, slicer named it, fuzzer confirmed it in 30 min.
+The targeted PoC step cuts that 30 min to seconds for the trunc/OOM bug class.
+
+---
+
 ### 1. GNN training levers (in `johwes/llvm-ir-vuln-gnn`)
 - Lever 1: Juliet pretraining (§27) — cleaner training signal
 - Lever 2: guard direction + taint source as node features
