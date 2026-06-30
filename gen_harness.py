@@ -1993,12 +1993,42 @@ the public API function that calls `{vuln_fn}`.
         messages.append({"role": "assistant", "content": _assistant_content(reply)})
         messages.append({"role": "user", "content": bs_msg})
 
-    inc     = "".join(f" -I {d}" for d in include_dirs)
-    lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
-    print(f"\nTo fuzz:")
-    print(f"  clang-20 -fsanitize=fuzzer,address -g{inc} {out_c}{lib_str} "
-          f"-o fuzzer_{vuln_fn}_via_{caller_fn}")
-    print(f"  ./fuzzer_{vuln_fn}_via_{caller_fn}")
+    inc_str = "".join(f" -I {d}" for d in include_dirs)
+    fuzzer_bin = output_dir / f"fuzzer_{vuln_fn}_via_{caller_fn}"
+    if libs:
+        print("\n── compile (harness + instrumented lib) ────────────")
+        cmd = (["clang-20", "-fsanitize=fuzzer,address", "-g"]
+               + [f"-I{d}" for d in include_dirs]
+               + [str(out_c)] + libs)
+        r = subprocess.run(cmd + ["-o", str(fuzzer_bin)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"Compiled  → {fuzzer_bin}")
+            print(f"\nTo fuzz:\n  {fuzzer_bin}")
+        else:
+            undef = [l for l in r.stderr.splitlines() if "undefined reference" in l]
+            extra_libs = _infer_extra_libs(undef)
+            if extra_libs:
+                r2 = subprocess.run(cmd + extra_libs + ["-o", str(fuzzer_bin)],
+                                    capture_output=True, text=True)
+                if r2.returncode == 0:
+                    print(f"Compiled  → {fuzzer_bin}")
+                    print(f"\nTo fuzz:\n  {fuzzer_bin}")
+                    return True
+            lib_str = " " + " ".join(libs)
+            extra_str = (" " + " ".join(extra_libs)) if extra_libs else ""
+            print(f"Compile failed:\n{r.stderr.strip()[:400]}")
+            print(
+                f"\nManual compile:\n"
+                f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}{extra_str}"
+                f" -o fuzzer_{vuln_fn}_via_{caller_fn}"
+            )
+    else:
+        lib_str = " <target_lib>"
+        print(f"\nTo fuzz:")
+        print(f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}"
+              f" -o fuzzer_{vuln_fn}_via_{caller_fn}")
+        print(f"  ./fuzzer_{vuln_fn}_via_{caller_fn}")
     return True
 
 
@@ -2234,11 +2264,43 @@ def generate_one(ll_path: str, fn_name: str, header: str,
             messages.append({"role": "assistant", "content": _assistant_content(reply)})
             messages.append({"role": "user", "content": bs_msg})
 
-    # Merge harness IR with target IR via llvm-link and attempt a full compile.
-    # If the target uses native/assembly code (OpenSSL AES-NI, SHA, etc.) the
-    # compile will fail with undefined references — in that case, instruct the
-    # user to build the target as a sanitized library and link against it.
-    if harness_ll and ll_path:
+    # Compile the fuzzer binary.
+    # When an instrumented library is provided, compile the harness C file
+    # directly against it — no IR merging needed and no symbol mixing.
+    # Only use the IR merge path when no library is available (closed-source /
+    # can't-rebuild scenario), where lifting to IR is the only option.
+    fuzzer_bin = output_dir / f"fuzzer_{fn_name}"
+    inc_str = "".join(f" -I {d}" for d in include_dirs)
+    if harness_ll and libs:
+        print("\n── compile (harness + instrumented lib) ────────────")
+        cmd = (["clang-20", "-fsanitize=fuzzer,address", "-g"]
+               + [f"-I{d}" for d in include_dirs]
+               + [str(out_c)] + libs)
+        r = subprocess.run(cmd + ["-o", str(fuzzer_bin)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"Compiled  → {fuzzer_bin}")
+            print(f"\nTo fuzz:\n  {fuzzer_bin}")
+        else:
+            undef = [l for l in r.stderr.splitlines() if "undefined reference" in l]
+            extra_libs = _infer_extra_libs(undef)
+            if extra_libs:
+                r2 = subprocess.run(cmd + extra_libs + ["-o", str(fuzzer_bin)],
+                                    capture_output=True, text=True)
+                if r2.returncode == 0:
+                    print(f"Compiled  → {fuzzer_bin}")
+                    print(f"\nTo fuzz:\n  {fuzzer_bin}")
+                    return True
+            lib_str = " " + " ".join(libs)
+            extra_str = (" " + " ".join(extra_libs)) if extra_libs else ""
+            print(f"Compile failed:\n{r.stderr.strip()[:400]}")
+            print(
+                f"\nManual compile:\n"
+                f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}{extra_str}"
+                f" -o fuzzer_{fn_name}"
+            )
+    elif harness_ll and ll_path:
+        # No library — use IR merge path (closed-source / can't-rebuild scenario).
         print("\n── IR link ──────────────────────────────────────────")
         promoted_ll = _promote_linkage_in_ir(Path(ll_path), fn_name)
         merged_ll   = output_dir / f"harness_{fn_name}_merged.ll"
@@ -2246,48 +2308,30 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                                        ir_dir=ir_dir)
         if merged:
             print(f"IR link OK → {merged}")
-            fuzzer_bin = output_dir / f"fuzzer_{fn_name}"
             fuzzer, compile_err = _compile_fuzzer(merged, fuzzer_bin)
-            if not fuzzer and libs:
-                # IR-only compile failed — retry with target .a +
-                # --allow-multiple-definition so promoted IR symbols win.
-                undef = [l for l in compile_err.splitlines()
-                         if "undefined reference" in l]
-                extra_libs = _infer_extra_libs(undef)
-                print(f"IR-only compile failed; retrying with target lib...")
-                fuzzer, compile_err = _compile_fuzzer_with_lib(
-                    merged, fuzzer_bin, libs, extra_libs)
             if fuzzer:
                 print(f"Compiled  → {fuzzer}")
-                print(f"\nTo fuzz:")
-                print(f"  {fuzzer}")
+                print(f"\nTo fuzz:\n  {fuzzer}")
             else:
-                # Still failed — instruct user to build lib with sanitizers.
                 undef = [l for l in compile_err.splitlines()
                          if "undefined reference" in l]
                 print(f"Compile failed (IR-only binary not self-contained).")
                 if undef:
                     print(f"  Missing symbols: {undef[0].strip()}" +
                           (f" ... (+{len(undef)-1} more)" if len(undef) > 1 else ""))
-                inc_str = "".join(f" -I {d}" for d in include_dirs)
-                lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
-                extra   = " ".join(_infer_extra_libs(undef))
-                extra_str = (" " + extra) if extra else ""
                 print(
                     "\nThe target contains symbols not representable in LLVM IR\n"
                     "(e.g. hand-written assembly, compiler builtins, or external\n"
                     "libraries). Build the target library with sanitizers and link\n"
                     "the harness against it:\n"
-                    f"\n  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}{extra_str}"
+                    f"\n  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c} <target_lib>"
                     f" -o fuzzer_{fn_name}\n"
                     f"  ./fuzzer_{fn_name}"
                 )
         else:
             print(f"IR link failed — {link_err.strip()[:200]}")
-            inc_str = "".join(f" -I {d}" for d in include_dirs)
-            lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
             print(f"\nCompile the harness against your target library:\n"
-                  f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}"
+                  f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c} <target_lib>"
                   f" -o fuzzer_{fn_name}\n"
                   f"  ./fuzzer_{fn_name}")
     return True
