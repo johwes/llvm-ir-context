@@ -158,6 +158,44 @@ plus test cases.
 
 ---
 
+### 11. Sparse guard ratio score boost
+
+**Observation (libarchive LHA run):** `archive_read_format_lha_read_header` ranked 33rd
+despite having 195 sinks — the highest sink count of any function in the 90–93% score
+band by a factor of 4×. It was identified for fuzzing not by ranking but by a human
+noticing the anomalous sink count in the details column. The root cause was an
+unchecked `compsize` field flowing to a 4GB allocation — confirmed OOM crash at 91M
+executions.
+
+The slicer already computed and flagged the signal: `5.1 sinks/guard (sparse)`. But
+this ratio does not feed back into the score. A function with sparse guard coverage
+is structurally different from one with dense coverage — sparse means the guards that
+exist protect only a fraction of the dangerous paths, leaving many unguarded routes
+to the sink.
+
+**Fix:** Add a sparse guard ratio multiplier to the score:
+
+| sinks/guard ratio | multiplier |
+|---|---|
+| > 5.0 | ×1.15 |
+| > 10.0 | ×1.25 |
+| guard = NO (any sinks) | unchanged (already penalised) |
+
+Applied after the base score, before propagation. Would have pushed
+`archive_read_format_lha_read_header` from rank 33 into approximately the top 15 on
+libarchive — making it visible without any manual selection.
+
+**Codebase-agnostic:** The ratio is derived purely from IR structure (icmp count /
+sink count). No target-specific tuning.
+
+**Effort:** Small — one multiplier in `score_deterministic.py`, one field already
+present in the slice summary.
+
+**Files:** `llvm_ir_context/score_deterministic.py` (score formula),
+`llvm_ir_context/preprocess_slice_pdg.py` (sinks/guard ratio already computed)
+
+---
+
 ### 4. Interprocedural guard attribution
 
 **Problem:** Internal helper functions that have their guards in the caller
