@@ -2219,7 +2219,10 @@ def main():
 
     header       = Path(args.header).read_text(errors="replace") if args.header else ""
     if args.header:
-        _hdr = Path(args.header).resolve()
+        # Use absolute() not resolve() — resolve() follows symlinks and produces
+        # a different path than abspath() used in _build_include_preamble, which
+        # causes relpath() to return ".." prefixes and fall back to bare basename.
+        _hdr = Path(args.header).absolute()
         # Grandparent first so relpath gives "openssl/pem.h" not "pem.h".
         # Parent included as fallback for flat layouts (header in include root).
         _dirs = []
