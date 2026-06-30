@@ -935,7 +935,9 @@ def _ir_sig_to_c_decl(ir_sig: str, fn_name: str) -> str:
         param_parts.append(c_type)
 
     params_c = ", ".join(param_parts) if param_parts else "void"
-    return f"static {ret_c} {fn_name}({params_c});"
+    # Use extern, not static: the function is defined in the target library,
+    # not in this TU. static would make the linker expect a local definition.
+    return f"extern {ret_c} {fn_name}({params_c});"
 
 
 def _build_include_preamble(summary: dict, header_path: str = "", is_fd_reader: bool = False, internal_fn_decl: str = "",
@@ -1087,6 +1089,33 @@ def _llvm_link(harness_ll: Path, target_ll: Path, out: Path,
         capture_output=True, text=True,
     )
     return (out, "") if r.returncode == 0 else (None, r.stderr)
+
+
+_TRANSITIVE_DEP_SYMBOLS: list[tuple[str, str]] = [
+    # (symbol substring, -l flag)
+    ("crc32",       "-lz"),
+    ("deflate",     "-lz"),
+    ("inflate",     "-lz"),
+    ("BZ2_",        "-lbz2"),
+    ("lzma_",       "-llzma"),
+    ("ZSTD_",       "-lzstd"),
+    ("crypto",      "-lcrypto"),
+    ("ssl",         "-lssl"),
+    ("pcre",        "-lpcre2-8"),
+]
+
+
+def _infer_extra_libs(undef_lines: list[str]) -> list[str]:
+    """Infer common transitive -l flags from undefined reference lines."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for sym, flag in _TRANSITIVE_DEP_SYMBOLS:
+        if flag in seen:
+            continue
+        if any(sym in line for line in undef_lines):
+            seen.add(flag)
+            result.append(flag)
+    return result
 
 
 def _compile_fuzzer(merged_ll: Path, out_bin: Path) -> "tuple[Path | None, str]":
@@ -2215,20 +2244,26 @@ def generate_one(ll_path: str, fn_name: str, header: str,
                 if undef:
                     print(f"  Missing symbols: {undef[0].strip()}" +
                           (f" ... (+{len(undef)-1} more)" if len(undef) > 1 else ""))
+                inc_str = "".join(f" -I {d}" for d in include_dirs)
+                lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
+                extra   = " ".join(_infer_extra_libs(undef))
+                extra_str = (" " + extra) if extra else ""
                 print(
                     "\nThe target contains symbols not representable in LLVM IR\n"
                     "(e.g. hand-written assembly, compiler builtins, or external\n"
                     "libraries). Build the target library with sanitizers and link\n"
                     "the harness against it:\n"
-                    f"\n  clang-20 -fsanitize=fuzzer,address -g {out_c} \\\n"
-                    f"    -L<lib_dir> -l<target_lib> -o fuzzer_{fn_name}\n"
+                    f"\n  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}{extra_str}"
+                    f" -o fuzzer_{fn_name}\n"
                     f"  ./fuzzer_{fn_name}"
                 )
         else:
             print(f"IR link failed — {link_err.strip()[:200]}")
+            inc_str = "".join(f" -I {d}" for d in include_dirs)
+            lib_str = (" " + " ".join(libs)) if libs else " <target_lib>"
             print(f"\nCompile the harness against your target library:\n"
-                  f"  clang-20 -fsanitize=fuzzer,address -g {out_c} \\\n"
-                  f"    -L<lib_dir> -l<target_lib> -o fuzzer_{fn_name}\n"
+                  f"  clang-20 -fsanitize=fuzzer,address -g{inc_str} {out_c}{lib_str}"
+                  f" -o fuzzer_{fn_name}\n"
                   f"  ./fuzzer_{fn_name}")
     return True
 
