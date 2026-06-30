@@ -1319,32 +1319,20 @@ def build_task_block(fn_name: str, summary: dict,
             f"any of the detected literals — do NOT derive the verb from `Size` or any "
             f"value that is constant across the call sequence"
         )
-    elif generate_instructions:
-        if is_fd_reader:
-            pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
-        elif is_context_reader:
-            pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
-        elif is_registration_caller:
-            # Caller is a format/handler registration function.
-            # It takes a context handle and registers callbacks — it does not accept Data/Size directly.
-            # The model must consult the API reference and source to find the correct pipeline.
-            _target = vuln_fn or fn_name
-            modules.append(
-                f"- `{fn_name}` accepts only a context handle — it registers `{_target}` as a "
-                f"callback and does not accept `Data`/`Size` directly. "
-                f"Consult the API reference and source to find the correct pipeline: "
-                f"(1) allocate a fresh context, "
-                f"(2) call `{fn_name}` to register the handler, "
-                f"(3) open fuzz input from memory using the library's open-from-memory API, "
-                f"(4) drive the dispatch loop until it returns non-OK — this internally "
-                f"dispatches to `{_target}`, "
-                f"(5) free/close the context on every exit path."
-            )
-        else:
-            modules.append(
-                f"- Pass `Data` and `Size` into `{fn_name}` — "
-                f"do not add artificial caps on Size"
-            )
+    elif is_fd_reader:
+        pass  # M-09 provides the socketpair pattern — suppress contradictory "Pass Data" bullet
+    elif is_context_reader:
+        pass  # M-11 provides the handle-population pattern — suppress contradictory "Pass Data" bullet
+    elif is_registration_caller:
+        # Registration functions take only a context handle and register callbacks.
+        # Do not emit "Pass Data and Size" — instead let the model read the source
+        # and API reference to derive the correct dispatch pipeline.
+        pass
+    else:
+        modules.append(
+            f"- Pass `Data` and `Size` into `{fn_name}` — "
+            f"do not add artificial caps on Size"
+        )
 
     # --- M-03: String null-termination (always) ---
     modules.append(
@@ -1443,7 +1431,7 @@ def build_task_block(fn_name: str, summary: dict,
     # --- M-09: fd-reader — pipe fuzz input via socketpair ---
     # Fires when the target reads data through a file descriptor (fgets/recv/read)
     # rather than accepting a buffer argument directly.
-    if generate_instructions and is_fd_reader:
+    if is_fd_reader:
         modules.append(
             f"- This function reads data through a file descriptor, not from a buffer "
             f"argument. The fuzzer cannot feed `Data` into it directly.\n"
@@ -1473,7 +1461,7 @@ def build_task_block(fn_name: str, summary: dict,
     # Fires when the function reads through an opaque handle (BIO*, FILE*, EVP_MD_CTX*,
     # etc.) rather than taking a raw fd or buffer argument. The model must create the
     # handle and write fuzz data into it before calling the target.
-    if generate_instructions and is_context_reader:
+    if is_context_reader:
         _fmt_gates = summary.get("format_gates", [])
         if _fmt_gates:
             # M-11 + M-13 combined: handle is required, but raw Data must not be
@@ -1494,16 +1482,23 @@ def build_task_block(fn_name: str, summary: dict,
                 f"input — the format gate will reject it immediately."
             )
         else:
-            modules.append(
-                f"- `{fn_name}` reads its input through an opaque context or handle object "
-                f"(e.g. BIO*, FILE*, or similar), not a raw buffer or file descriptor argument. "
-                f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`. "
-                f"For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
+            _handle_detail = (
+                f" Consult the API reference and source to find the appropriate "
+                f"open-from-memory or memory-backed handle constructor, write `Data` "
+                f"into it, then pass the handle to `{fn_name}`."
+                if not generate_instructions else
+                f" For a BIO*: call `BIO_new(BIO_s_mem())` then `BIO_write(bio, Data, Size)` "
                 f"before passing the BIO to `{fn_name}`. "
                 f"`BIO_write` accepts raw bytes — pass `Data` directly, no null-termination "
                 f"or intermediate copy needed. "
-                f"For a FILE*: use `fmemopen(Data, Size, \"r\")`. "
-                f"Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
+                f"For a FILE*: use `fmemopen(Data, Size, \"r\")`."
+            )
+            modules.append(
+                f"- `{fn_name}` reads its input through an opaque context or handle object "
+                f"(e.g. BIO*, FILE*, or similar), not a raw buffer or file descriptor argument. "
+                f"You MUST populate that handle with fuzz data BEFORE calling `{fn_name}`."
+                + _handle_detail +
+                f" Do NOT pass `Data` or `Size` directly as arguments to `{fn_name}` — "
                 f"check the function signature and API reference to identify which parameter "
                 f"is the handle and which are output/flag parameters."
             )
@@ -1583,7 +1578,7 @@ def build_task_block(fn_name: str, summary: dict,
     # requires structured input — random bytes will be rejected at the parser
     # boundary before any dangerous sink is reachable.
     _format_gates = summary.get("format_gates", [])
-    if generate_instructions and _format_gates:
+    if _format_gates:
         _fmt_families = list(dict.fromkeys(g["format"] for g in _format_gates))
         _fmt_fns      = [g["fn"] for g in _format_gates[:4]]
         _fmt_label    = "/".join(_fmt_families[:2])
