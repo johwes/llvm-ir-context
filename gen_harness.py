@@ -1805,10 +1805,14 @@ def _generate_interprocedural(vuln_ll: str, vuln_fn: str,
 
     # Detect registration-style callers: single pointer arg, no i8*/i32 size param.
     # These functions register callbacks but don't accept Data/Size directly.
-    # Pattern: define ... @fn(ptr %0) with no i8* or i32/i64 buffer param.
+    # Pattern: define ... @fn(ptr [modifiers] %N) — exactly one ptr param, nothing else.
+    # IR modifiers between type and name: noundef, nonnull, align N, etc. (all \w or digits).
     _reg_caller = bool(
         caller_sig
-        and re.search(r'@' + re.escape(caller_fn) + r'\s*\(\s*ptr\s+\w+\s*\)', caller_sig)
+        and re.search(
+            r'@' + re.escape(caller_fn) + r'\s*\(\s*ptr(?:\s+\w+)*\s+%\w+\s*\)',
+            caller_sig
+        )
     )
 
     task_block = build_task_block(caller_fn, merged_summary, target_header=header,
