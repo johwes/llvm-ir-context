@@ -997,8 +997,12 @@ def _extract_dom_gates(target_fn, block_preds: dict, ptr_to_id: dict,
             if instr.opcode == "icmp":
                 ops = list(instr.operands)
                 # icmp: operands are [lhs, rhs] — look for a constant int rhs
-                const_val = None
-                pred_str  = ""
+                # Skip if the non-constant operand is a call return value:
+                # those are error-check patterns (e.g. "if (EVP_Decode... < 0)")
+                # not format gates on input data.
+                const_val    = None
+                non_const_op = None
+                pred_str     = ""
                 m_pred = _ICMP_PRED_RE.search(ir_text)
                 if m_pred:
                     pred_str = m_pred.group(1)
@@ -1011,6 +1015,20 @@ def _extract_dom_gates(target_fn, block_preds: dict, ptr_to_id: dict,
                                 const_val = int(raw, 0)
                             except ValueError:
                                 pass
+                    elif op.value_kind == VK_INSTRUCTION:
+                        non_const_op = op
+                # Reject: non-const side is a call result (error check, not input gate)
+                if non_const_op is not None and non_const_op.value_kind == VK_INSTRUCTION:
+                    try:
+                        non_const_instr = next(
+                            i for block in target_fn.blocks
+                            for i in block.instructions
+                            if _ptr_id(i) == _ptr_id(non_const_op)
+                        )
+                        if non_const_instr.opcode == "call":
+                            continue
+                    except StopIteration:
+                        pass
                 if const_val is not None and const_val not in seen_values:
                     seen_values.add(const_val)
                     gates.append({
