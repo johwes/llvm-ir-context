@@ -870,6 +870,13 @@ def _assistant_content(reply: str) -> str:
     return extract_c(reply)
 
 
+def _save_raw_reply(output_dir: Path, fn_name: str, attempt: int, reply: str) -> None:
+    """Save the raw model reply when no code block is found, for debugging."""
+    out = output_dir / f"harness_{fn_name}_reply_attempt_{attempt}.txt"
+    out.write_text(reply, errors="replace")
+    print(f"  raw reply saved: {out}")
+
+
 def extract_c(text: str) -> str:
     # Strip deepseek-r1 chain-of-thought reasoning blocks before searching for code.
     # The model wraps internal reasoning in <think>...</think>; if that leaks into
@@ -1863,6 +1870,21 @@ the public API function that calls `{vuln_fn}`.
         reply = ask_qwen(messages)
         preamble = _build_include_preamble(merged_summary, header_path=header_path, include_dirs=include_dirs)
         code  = _apply_preamble(extract_c(reply), preamble)
+        if "/* ERROR: model reply contained no code block" in code:
+            _save_raw_reply(output_dir, vuln_fn, attempt, reply)
+            print("NO CODE BLOCK — model reply had no fenced code; retrying")
+            if attempt == MAX_RETRIES:
+                print(f"VALIDATION: FAIL — {vuln_fn} via {caller_fn} skipped after {MAX_RETRIES} empty replies")
+                return False
+            messages.append({"role": "assistant", "content": reply[:500]})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your reply contained no C code block. "
+                    "Output ONLY a fenced C code block (```c ... ```) with the complete harness."
+                ),
+            })
+            continue
         if is_fd_reader:
             code = _inject_sigpipe_ignore(code)
         if _global_decls:
@@ -2076,6 +2098,7 @@ def generate_one(ll_path: str, fn_name: str, header: str,
         extracted = extract_c(reply)
         # Sentinel stub means model returned no fenced code block — retry directly.
         if "/* ERROR: model reply contained no code block" in extracted:
+            _save_raw_reply(output_dir, fn_name, attempt, reply)
             print("NO CODE BLOCK — model reply had no fenced code; retrying")
             if attempt == MAX_RETRIES:
                 print(f"VALIDATION: FAIL — {fn_name} skipped after {MAX_RETRIES} empty replies")
