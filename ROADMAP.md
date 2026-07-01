@@ -149,38 +149,7 @@ plus test cases.
 
 ### 4. Interprocedural guard attribution
 
-**Problem:** Internal helper functions that have their guards in the caller
-consistently rank high (e.g. `lm_init` in zlib — no `icmp` in its body, but
-`deflateInit2_` validates `windowBits` before calling it). The current
-`caller_validated` flag is too coarse: it checks whether *any* caller of this
-function contains *any* `icmp`, not whether the `icmp` in the caller guards
-*the specific argument slot* that feeds the sink.
-
-The completed interprocedural score propagation (P1.3) addresses the
-complementary case (caller is clean, callee is dangerous). This item addresses
-the inverse: function looks dangerous, caller actually guards it.
-
-**Fix:** Argument-slot-level guard attribution rather than score propagation.
-When the slicer sees a function where:
-- All input channels are `external_call_return` (no direct `function_argument`), and
-- `caller_validated` is true
-
-...traverse one hop into callers and check whether the specific argument slot
-feeding the sink has an `icmp` guard in the caller's slice. If yes, apply a
-score reduction (suggested 0.70×) and annotate with `[+caller_guarded:argN]`.
-If the guard protects a different argument slot, do not reduce.
-
-This is more precise than the current heuristic and directly addresses the
-dominant false-positive pattern expected on mature codebases.
-
-**Depends on:** P1.0 (benchmark will confirm whether this is the dominant
-false-positive category before investing 2–3 weeks here)
-
-**Effort:** High — requires tracking which argument slot a caller's `icmp`
-feeds, which is a meaningful extension to the cross-file caller scan.
-
-**Files:** `llvm_ir_context/score_deterministic.py` (caller scan),
-`llvm_ir_context/preprocess_slice_pdg.py` (argument slot tracking)
+*Implemented. See Completed table.*
 
 ---
 
@@ -577,3 +546,4 @@ The targeted PoC step cuts that 30 min to seconds for the trunc/OOM bug class.
 | **P1.1** Wrapper/alias deduplication: BFS from each impl upward through caller_map; pure-delegation callers (no own sinks) and subset-sink callers both marked; chained wrappers (PEM_read → PEM_read_bio → PEM_read_bio_ex) handled; grouped beneath impl in table with └─ | `score_deterministic.py` |
 | Sink suffix false-positive fixes: disabled suffix match for strcat/strcpy/sprintf/printf/link/symlink families — archive_strcat, archive_entry_set_nlink etc. no longer flagged as dangerous sinks; exact-name matches unaffected | `preprocess_slice_pdg.py` |
 | **P1.12** Write-path / read-path disambiguation: fd-source backward check in `_read_fd_from_arg` — when `read`/`recv`/`pread` fd argument traces to a struct load or global (not a function argument), `is_external_input` is suppressed; drops zisofs_rewind_boot_file (reads from internal temp fd) without any libarchive-specific tuning | `preprocess_slice_pdg.py` |
+| **P1.4** Interprocedural arg-slot-level caller guard attribution: `_check_caller_guards` extended to build per-caller SSA tracing infrastructure (`arg_ptr_ids`, `alloca_to_arg`, `instr_by_pid`) and trace each argument passed to the target back to the caller's own arguments; `caller_guarded_args: list[int]` stored through graph→summary pipeline; 0.70× score multiplier fires when any guarded slot matches and the callee receives `function_argument` input; annotation `+caller_guarded:argN` in rank table and "Caller guard: arg-slot" in context output | `preprocess_slice_pdg.py`, `score_deterministic.py`, `slice_context.py` |
