@@ -606,18 +606,6 @@ def score_ir_dir(
             rule_scores[fn_name] = 0.05
             details[fn_name]    += "  [gep-only suppressed]"
 
-    # Write-path discount (P1.12): functions in archive_write_* TUs read from
-    # internal temp fds, not attacker-controlled input. Discount external_input
-    # signal by applying ×0.60 when the TU filename indicates a write path.
-    _WRITE_TU = re.compile(r'archive_write_|_write_set_format_|_write_add_filter_')
-    for fn_name, summary in summaries.items():
-        if not summary.get("is_external_input"):
-            continue
-        fn_file = fn_file_map.get(fn_name)
-        if fn_file and _WRITE_TU.search(fn_file.name):
-            rule_scores[fn_name] = round(rule_scores[fn_name] * 0.60, 4)
-            details[fn_name] += "  [write-path discount]"
-
     ranked = sorted(rule_scores.items(),
                     key=lambda x: (x[1], summaries.get(x[0], {}).get("n_sinks", 0)),
                     reverse=True)

@@ -274,6 +274,36 @@ def _extract_str_globals(ir_text: str) -> dict[str, str]:
     return result
 
 
+def _read_fd_from_arg(target_fn, fd_sources: frozenset) -> bool:
+    """Return True if any call to an fd-based input source (read/recv/pread)
+    in target_fn passes a function argument as its first (fd) operand.
+
+    If all such calls use fds loaded from struct members or globals, returns
+    False — the reads are from internal fds, not attacker-controlled input.
+    """
+    arg_ids = {_ptr_id(a) for a in target_fn.arguments}
+    for block in target_fn.blocks:
+        for instr in block.instructions:
+            if instr.opcode != "call":
+                continue
+            ops = list(instr.operands)
+            callee_name = ""
+            for op in ops:
+                if op.value_kind == VK_FUNCTION:
+                    callee_name = _normalize_sink_name(op.name.lstrip("@"))
+                    break
+            if callee_name not in fd_sources:
+                continue
+            # First non-callee operand is the fd argument
+            for op in ops:
+                if op.value_kind == VK_FUNCTION:
+                    continue
+                if _ptr_id(op) in arg_ids:
+                    return True  # fd comes from a function argument
+                break  # only check the first (fd) argument
+    return False
+
+
 def _detect_strcmp_guards(target_fn, str_globals: dict[str, str]) -> list[dict]:
     """Scan target_fn body for strcmp/strncmp/memcmp calls against a string literal.
 
@@ -962,6 +992,27 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
              "sink_fn_names": {}, "source_fn_names": {}, "div_sink_names": {},
              "global_vars_read": [],
              "_sliced": False, "_n_sinks": 0}
+
+    # fd-source check: read/recv/pread are in INPUT_SOURCES, but if the fd
+    # argument is loaded from a struct member or global (not a function argument),
+    # the data is internal — not attacker-controlled.
+    # Regex: call ... @read(ptr/i32 %reg, ...) where %reg is NOT %0/%1/... arg.
+    # We detect this by checking if any argument name in the function matches the
+    # fd operand of each INPUT_SOURCES call. If no call uses a function-argument
+    # fd, clear is_external_input.
+    _FD_SOURCES = frozenset({"read", "recv", "recvfrom", "pread"})
+    if g.get("source_fn_names"):
+        # Names of functions in the slice that are fd-based (not stream-based)
+        fd_based_sources = {
+            _canonical_name(nm) for nm in g["source_fn_names"].values()
+            if _canonical_name(nm) in _FD_SOURCES
+        }
+        if fd_based_sources and not _read_fd_from_arg(target_fn, fd_based_sources):
+            # All fd-based reads use internal fds — suppress external_input
+            g["source_fn_names"] = {
+                nid: nm for nid, nm in g["source_fn_names"].items()
+                if _canonical_name(nm) not in _FD_SOURCES
+            }
 
     # strcmp-against-literal gates: detect hardcoded credential checks that block
     # fuzzer coverage.  Scan the full IR text for @.str globals first.
