@@ -141,6 +141,40 @@ plus test cases.
 
 ---
 
+### 12. Write-path / read-path disambiguation
+
+**Observation (libarchive ISO9660 run):** `zisofs_rewind_boot_file` ranked 3rd with
+`external_input=YES via read` and a trunc warning. Source inspection showed it is a
+write-path function — it reads from `iso9660->temp_fd`, a temp file the library
+itself wrote during archive creation, not attacker-controlled input. The scorer
+cannot distinguish `read(temp_fd, ...)` from `read(network_socket, ...)`.
+
+Similarly, `archive_write_*` functions operating on user-supplied filesystem data
+are not parser targets — the attack model (malformed archive → crash) does not apply
+to the write path.
+
+**Fix:** Two complementary signals:
+
+1. **TU name heuristic** — if the `.ll` filename contains `_write_` or starts with
+   `archive_write_`, discount `external_input` and apply a score multiplier of
+   ×0.60. Cheap, zero IR analysis required, catches the dominant pattern.
+
+2. **fd-source tracking** — when the `read` call's fd argument originates from an
+   internal temp file (opened by the same TU via `mkstemp`/`open` with `O_CREAT`),
+   do not classify it as external input. Requires one backward slice from the fd
+   argument to its definition — tractable within a single TU.
+
+**Codebase-agnostic:** Both signals are structural (naming convention + IR shape),
+not target-specific.
+
+**Effort:** Small for heuristic #1 (one line in `score_deterministic.py`);
+medium for #2 (fd-source slice in `preprocess_slice_pdg.py`).
+
+**Files:** `llvm_ir_context/score_deterministic.py` (TU name filter),
+`llvm_ir_context/preprocess_slice_pdg.py` (fd-source tracking)
+
+---
+
 ### 4. Interprocedural guard attribution
 
 **Problem:** Internal helper functions that have their guards in the caller
