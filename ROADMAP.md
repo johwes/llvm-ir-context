@@ -89,30 +89,7 @@ across `ssl/` and `crypto/`.
 
 ### 1. Wrapper/alias deduplication
 
-**Problem:** The benchmark revealed that ranks 7–23 are all thin wrapper functions
-that immediately delegate to a single higher-ranked function (`PEM_read_bio_ex` at
-rank 2). All 16 `PEM_read_*` variants share the same underlying sink and the same
-code path — they add no information to the ranking but consume 17 of the top-23
-slots, burying genuinely distinct findings below them.
-
-This is a systematic pattern in any large C codebase with a public API layer:
-the public API functions are thin wrappers over internal implementation functions.
-The implementation function is the real target; the wrappers are noise.
-
-**Detection:** A function is a wrapper candidate when:
-- It has exactly one non-GEP call sink
-- That call sink is itself a ranked function scoring above some threshold
-- Its own body contributes no additional sinks or guards beyond the call
-
-**Fix:** When a function's only sinks are a single call to a higher-ranked function
-already in the output, suppress it from the ranked table (or annotate it as
-`[wrapper of <fn>]` and group it). The implementation function keeps its rank; the
-wrappers are listed as aliases beneath it rather than as separate entries.
-
-**Effort:** Medium — requires one post-ranking pass over the summaries. The call
-graph is already built; this is a filter on top of the existing output.
-
-**Files:** `llvm_ir_context/score_deterministic.py` (`score_ir_dir`, `_print_table`)
+*Implemented. See Completed table.*
 
 ---
 
@@ -591,3 +568,4 @@ The targeted PoC step cuts that 30 min to seconds for the trunc/OOM bug class.
 | gen_harness UX #2: allow `--ll` and `--ir-dir` together — `--ll` pins the TU, `--ir-dir` provides the full directory for P-05 caller search; previously mutually exclusive | `gen_harness.py` |
 | gen_harness UX #3: BFS transitive P-05 caller search (up to 3 hops) — previously only searched one level up, missing public entry points 2+ hops away (e.g. `read_header` → `archive_read_format_rar_read_header` → `archive_read_support_format_rar`) | `gen_harness.py` |
 | **P1.11** Sparse guard ratio score boost: ×1.15 when sinks/guard > 5, ×1.25 when > 10; only fires when guards exist and call sinks are present — pushes high-sink sparse-guard functions from mid-band into top ranks without target-specific tuning | `score_deterministic.py` |
+| **P1.1** Wrapper/alias deduplication: BFS from each impl upward through caller_map; pure-delegation callers (no own sinks) and subset-sink callers both marked; chained wrappers (PEM_read → PEM_read_bio → PEM_read_bio_ex) handled; grouped beneath impl in table with └─ | `score_deterministic.py` |
