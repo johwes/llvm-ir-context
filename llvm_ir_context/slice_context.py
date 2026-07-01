@@ -248,10 +248,11 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
     double_free:      bool  = g.get("double_free", False)
     use_after_free:   bool  = g.get("use_after_free", False)
     freed_ptrs:       list  = g.get("freed_ptrs", [])
-    caller_validated: bool  = g.get("caller_validated", False)
-    caller_count:     int   = g.get("caller_count", 0)
-    caller_names:     list  = g.get("caller_names", [])
-    strcmp_guards:    list  = g.get("strcmp_guards", [])
+    caller_validated:    bool  = g.get("caller_validated", False)
+    caller_count:        int   = g.get("caller_count", 0)
+    caller_names:        list  = g.get("caller_names", [])
+    caller_guarded_args: list  = g.get("caller_guarded_args", [])
+    strcmp_guards:       list  = g.get("strcmp_guards", [])
     dom_gates:        list  = g.get("dom_gates", [])
     format_gates:     list  = g.get("format_gates", [])
     global_vars_read: list  = g.get("global_vars_read", [])
@@ -664,10 +665,11 @@ def summarize_slice(g: dict, fn_name: str = "unknown") -> dict:
         "double_free":        double_free,
         "use_after_free":     use_after_free,
         "freed_ptrs":         freed_ptrs,
-        "caller_validated":   caller_validated,
-        "caller_count":       caller_count,
-        "caller_names":       caller_names,
-        "strcmp_guards":      strcmp_guards,
+        "caller_validated":    caller_validated,
+        "caller_count":        caller_count,
+        "caller_names":        caller_names,
+        "caller_guarded_args": caller_guarded_args,
+        "strcmp_guards":       strcmp_guards,
         "dom_gates":          dom_gates,
         "format_gates":       format_gates,
         "arg_count":          arg_count,
@@ -765,7 +767,12 @@ def format_for_llm(summary: dict, score: float | None = None,
         ptrs = summary.get("freed_ptrs", [])
         ptr_str = ", ".join(ptrs[:3]) + (" ..." if len(ptrs) > 3 else "")
         lines.append(f"Use-after-free  : YES  freed ptr(s): {ptr_str}")
-    if summary.get("caller_validated"):
+    if summary.get("caller_guarded_args"):
+        callers = summary.get("caller_names", [])
+        caller_str = ", ".join(callers[:3]) + (" ..." if len(callers) > 3 else "")
+        slots = ",".join(f"arg{i}" for i in summary["caller_guarded_args"])
+        lines.append(f"Caller guard    : arg-slot {slots} guarded by icmp in caller(s): {caller_str}")
+    elif summary.get("caller_validated"):
         callers = summary.get("caller_names", [])
         caller_str = ", ".join(callers[:3]) + (" ..." if len(callers) > 3 else "")
         lines.append(f"Caller guard    : icmp found in caller(s): {caller_str}  — may be validated upstream")

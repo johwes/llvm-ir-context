@@ -1046,13 +1046,15 @@ def ir_to_graph_slice_pdg(ir_text, fn_name: str | None = None,
     if target_fn is not None and fn_name is not None:
         all_mods = [mod] + (list(extra_modules) if extra_modules else [])
         caller_info = _check_caller_guards(all_mods, target_fn.name)
-        g["caller_count"]     = caller_info["caller_count"]
-        g["caller_validated"] = caller_info["caller_validated"]
-        g["caller_names"]     = caller_info["caller_names"]
+        g["caller_count"]        = caller_info["caller_count"]
+        g["caller_validated"]    = caller_info["caller_validated"]
+        g["caller_names"]        = caller_info["caller_names"]
+        g["caller_guarded_args"] = caller_info["caller_guarded_args"]
     else:
-        g["caller_count"]     = 0
-        g["caller_validated"] = False
-        g["caller_names"]     = []
+        g["caller_count"]        = 0
+        g["caller_validated"]    = False
+        g["caller_names"]        = []
+        g["caller_guarded_args"] = []
 
     return g
 
@@ -1232,49 +1234,148 @@ def _extract_format_gates(target_fn, mock_names: dict) -> list[dict]:
 
 def _check_caller_guards(modules, fn_name: str) -> dict:
     """
-    Check whether any direct caller of fn_name has an icmp guard — searched
-    across all provided modules (cross-file aware).
+    Check whether any direct caller of fn_name has an icmp guard, and
+    whether that guard is specifically protecting one of the argument slots
+    passed to fn_name (arg-slot-level attribution, P1.4).
 
     modules: single llvmlite module OR list of modules. Passing all loaded
              modules catches callers defined in different compilation units.
 
     Returns dict:
-      caller_count     int  — number of distinct callers found
-      caller_validated bool — at least one caller has an icmp
-      caller_names     list — names of functions that call fn_name
+      caller_count        int       — number of distinct callers found
+      caller_validated    bool      — at least one caller has any icmp
+      caller_names        list[str] — names of functions that call fn_name
+      caller_guarded_args list[int] — arg slot indices that are guarded in
+                                      at least one caller (empty = broad icmp
+                                      only, no slot-specific attribution)
     """
     if not isinstance(modules, (list, tuple)):
         modules = [modules]
 
     callers_with_guard: list[str] = []
     all_callers:        list[str] = []
+    guarded_slots:      set[int]  = set()
 
     for mod in modules:
         for fn in mod.functions:
             if fn.is_declaration or fn.name == fn_name:
                 continue
 
-            fn_calls_target = False
-            caller_has_icmp = False
+            # --- Build caller-local tracing infrastructure -------------------
+            caller_arg_ptr_ids: dict[int, int] = {
+                _ptr_id(a): i for i, a in enumerate(fn.arguments)
+            }
+            caller_alloca_to_arg: dict[int, int] = {}
+            caller_instr_by_pid:  dict[int, object] = {}
 
             for block in fn.blocks:
                 for instr in block.instructions:
-                    if instr.opcode == "call":
-                        for op in instr.operands:
-                            if op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR) and op.name == fn_name:
-                                fn_calls_target = True
-                    elif instr.opcode == "icmp":
-                        caller_has_icmp = True
+                    caller_instr_by_pid[_ptr_id(instr)] = instr
+                    if instr.opcode == "store":
+                        ops = list(instr.operands)
+                        if len(ops) >= 2:
+                            val_op, ptr_op = ops[0], ops[1]
+                            if (ptr_op.value_kind == VK_INSTRUCTION
+                                    and val_op.value_kind == VK_ARGUMENT):
+                                aidx = caller_arg_ptr_ids.get(_ptr_id(val_op))
+                                if aidx is not None:
+                                    caller_alloca_to_arg[_ptr_id(ptr_op)] = aidx
 
-            if fn_calls_target:
-                all_callers.append(fn.name)
-                if caller_has_icmp:
-                    callers_with_guard.append(fn.name)
+            def _trace_caller_arg(op, _depth: int = 0) -> "int | None":
+                if _depth > 4:
+                    return None
+                if op.value_kind == VK_ARGUMENT:
+                    return caller_arg_ptr_ids.get(_ptr_id(op))
+                if op.value_kind == VK_INSTRUCTION:
+                    instr = caller_instr_by_pid.get(_ptr_id(op))
+                    if instr is None:
+                        return None
+                    try:
+                        ops = list(instr.operands)
+                    except Exception:
+                        return None
+                    if instr.opcode == "load" and ops:
+                        result = caller_alloca_to_arg.get(_ptr_id(ops[0]))
+                        if result is not None:
+                            return result
+                        return _trace_caller_arg(ops[0], _depth + 1)
+                    if instr.opcode == "getelementptr" and ops:
+                        return _trace_caller_arg(ops[0], _depth + 1)
+                return None
+
+            # --- Find call sites and icmps in each block ---------------------
+            # Build: block_ptr_id → set of SSA value ptr_ids compared by icmp
+            # in that block. Used to check if a call-site argument is guarded
+            # by a same-block (or earlier) icmp.
+            block_icmp_vals: dict[int, set[int]] = {}
+
+            fn_calls_target = False
+            caller_has_icmp = False
+            call_site_args:  list[list] = []  # per call site: operand list
+
+            for block in fn.blocks:
+                bpid = _ptr_id(block)
+                icmp_vals_here: set[int] = set()
+                block_call_args: list[list] = []
+
+                for instr in block.instructions:
+                    if instr.opcode == "icmp":
+                        caller_has_icmp = True
+                        for op in list(instr.operands):
+                            if op.value_kind not in (VK_CONSTANT_INT,):
+                                icmp_vals_here.add(_ptr_id(op))
+                    elif instr.opcode == "call":
+                        for op in instr.operands:
+                            if (op.value_kind in (VK_FUNCTION, VK_GLOBAL_VAR)
+                                    and op.name == fn_name):
+                                fn_calls_target = True
+                                # Collect the non-callee operands (the args)
+                                call_ops = [
+                                    o for o in instr.operands
+                                    if o.value_kind != VK_FUNCTION
+                                ]
+                                block_call_args.append(call_ops)
+
+                block_icmp_vals[bpid] = icmp_vals_here
+                call_site_args.extend(block_call_args)
+
+            if not fn_calls_target:
+                continue
+
+            all_callers.append(fn.name)
+            if caller_has_icmp:
+                callers_with_guard.append(fn.name)
+
+            # --- Arg-slot attribution: does any icmp compare a value that is
+            # also passed as argument slot N to fn_name? -----------------------
+            # Collect all values compared by icmp anywhere in the caller.
+            all_icmp_vals: set[int] = set()
+            for vals in block_icmp_vals.values():
+                all_icmp_vals.update(vals)
+
+            for call_ops in call_site_args:
+                for slot_idx, op in enumerate(call_ops):
+                    # Direct: the operand ptr_id appears in an icmp comparison
+                    if _ptr_id(op) in all_icmp_vals:
+                        guarded_slots.add(slot_idx)
+                        continue
+                    # Indirect: the operand traces back to a caller arg that
+                    # is compared by an icmp (e.g. if(x > 0) foo(x))
+                    caller_arg_idx = _trace_caller_arg(op)
+                    if caller_arg_idx is not None:
+                        # Check if that caller arg appears in any icmp
+                        arg_pid = next(
+                            (pid for pid, idx in caller_arg_ptr_ids.items()
+                             if idx == caller_arg_idx), None
+                        )
+                        if arg_pid is not None and arg_pid in all_icmp_vals:
+                            guarded_slots.add(slot_idx)
 
     return {
-        "caller_count":     len(all_callers),
-        "caller_validated": bool(callers_with_guard),
-        "caller_names":     all_callers,
+        "caller_count":        len(all_callers),
+        "caller_validated":    bool(callers_with_guard),
+        "caller_names":        all_callers,
+        "caller_guarded_args": sorted(guarded_slots),
     }
 
 

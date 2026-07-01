@@ -268,10 +268,14 @@ def philosophy2_score(summary: dict) -> float:  # noqa: C901
         elif ratio > 5.0:
             mult *= 1.15
 
-    # caller_validated is surfaced as +caller? in the details column for human review.
-    # We do NOT apply an automatic score reduction: "caller has icmp" is too broad a
-    # signal — routing guards, null pointer checks, and loop bounds all satisfy it
-    # independently of whether they protect the data flow into this function's sinks.
+    # P1.4 — arg-slot-level caller guard attribution.
+    # "caller has icmp" is too broad: routing guards, null checks, and loop
+    # bounds all satisfy it without protecting the data flowing into this
+    # function's sinks.  We apply 0.70× only when the icmp in a caller can be
+    # traced to the specific argument slot that feeds the sink in this callee.
+    caller_guarded_args = summary.get("caller_guarded_args", [])
+    if caller_guarded_args and has_arg_input:
+        mult *= 0.70
 
     score = min(base * mult, 1.0)
 
@@ -441,7 +445,13 @@ def _score_one(args):
         szext = "+zext64" if summary.get("has_safe_mul_via_zext") else ""
         df    = "+df"     if summary.get("double_free")         else ""
         uaf   = "+uaf"    if summary.get("use_after_free")      else ""
-        cv    = "+caller?" if summary.get("caller_validated")   else ""
+        cg_args = summary.get("caller_guarded_args", [])
+        if cg_args:
+            cv = f"+caller_guarded:arg{''.join(str(i) for i in cg_args)}"
+        elif summary.get("caller_validated"):
+            cv = "+caller?"
+        else:
+            cv = ""
         sinks = ",".join(sorted({s.get("fn", "?") for s in summary["sinks"]}))
         detail = (
             f"sinks={ns} guard={'yes('+gt+')' if hg else 'NO'} "
