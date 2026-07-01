@@ -668,7 +668,10 @@ def score_ir_dir(
                                 queue.append((c, depth + 1))
                 # Sinks not ⊆ impl's: unrelated function, stop here
                 continue
-            # No own sinks: pass-through adapter — traverse further if within hop limit
+            # No own sinks: pure delegation wrapper — mark it and traverse further.
+            if node not in wrapper_of:
+                wrapper_of[node] = impl_fn
+                details[node] += f"  [wrapper of {impl_fn}]"
             if depth < _MAX_WRAPPER_HOPS:
                 for c in caller_map.get(node, []):
                     if c not in visited:
