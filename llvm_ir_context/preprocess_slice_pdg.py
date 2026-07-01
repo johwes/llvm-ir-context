@@ -465,9 +465,16 @@ def _is_dangerous(name: str) -> bool:
     if norm != name and norm in DANGEROUS_SINKS:
         return True
     # gets is inherently unsafe regardless of wrapping — never match via suffix.
-    # All other sinks (read, free, malloc, memcpy etc.) are legitimate I/O or
-    # memory signals even when appearing as a suffix (BIO_read, CRYPTO_free).
-    _NO_SUFFIX_MATCH = frozenset({"gets"})
+    # str*/sprintf family: safe wrappers (archive_strcat, g_strdup_printf) use
+    # a completely different calling convention — suffix match produces false
+    # positives without catching anything real. Only match exact names.
+    # free/read/malloc/memcpy etc. are different — CRYPTO_free, BIO_read are
+    # genuinely dangerous and suffix match is intentional there.
+    _NO_SUFFIX_MATCH = frozenset({
+        "gets", "strcat", "strncat", "strcpy", "strncpy",
+        "sprintf", "vsprintf", "snprintf", "vsnprintf",
+        "printf", "fprintf",
+    })
     for s in _SINK_SUFFIXES:
         if s in _NO_SUFFIX_MATCH:
             continue
@@ -488,7 +495,10 @@ def _canonical_name(name: str) -> str:
     for s in ("memcpy", "memmove", "memset", "bcopy"):
         if name.startswith(f"llvm.{s}."):
             return s
-    _NO_SUFFIX_MATCH = frozenset({"gets"})
+    _NO_SUFFIX_MATCH = frozenset({
+        "gets", "strcat", "strncat", "strcpy", "strncpy",
+        "sprintf", "vsprintf", "snprintf", "vsnprintf",
+    })
     for s in _SINK_SUFFIXES:
         if s in _NO_SUFFIX_MATCH:
             continue
