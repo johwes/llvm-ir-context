@@ -143,35 +143,7 @@ plus test cases.
 
 ### 12. Write-path / read-path disambiguation
 
-**Observation (libarchive ISO9660 run):** `zisofs_rewind_boot_file` ranked 3rd with
-`external_input=YES via read` and a trunc warning. Source inspection showed it is a
-write-path function — it reads from `iso9660->temp_fd`, a temp file the library
-itself wrote during archive creation, not attacker-controlled input. The scorer
-cannot distinguish `read(temp_fd, ...)` from `read(network_socket, ...)`.
-
-Similarly, `archive_write_*` functions operating on user-supplied filesystem data
-are not parser targets — the attack model (malformed archive → crash) does not apply
-to the write path.
-
-**Fix:** Two complementary signals:
-
-1. **TU name heuristic** — if the `.ll` filename contains `_write_` or starts with
-   `archive_write_`, discount `external_input` and apply a score multiplier of
-   ×0.60. Cheap, zero IR analysis required, catches the dominant pattern.
-
-2. **fd-source tracking** — when the `read` call's fd argument originates from an
-   internal temp file (opened by the same TU via `mkstemp`/`open` with `O_CREAT`),
-   do not classify it as external input. Requires one backward slice from the fd
-   argument to its definition — tractable within a single TU.
-
-**Codebase-agnostic:** Both signals are structural (naming convention + IR shape),
-not target-specific.
-
-**Effort:** Small for heuristic #1 (one line in `score_deterministic.py`);
-medium for #2 (fd-source slice in `preprocess_slice_pdg.py`).
-
-**Files:** `llvm_ir_context/score_deterministic.py` (TU name filter),
-`llvm_ir_context/preprocess_slice_pdg.py` (fd-source tracking)
+*Implemented (heuristic #1). See Completed table.*
 
 ---
 
@@ -603,3 +575,5 @@ The targeted PoC step cuts that 30 min to seconds for the trunc/OOM bug class.
 | gen_harness UX #3: BFS transitive P-05 caller search (up to 3 hops) — previously only searched one level up, missing public entry points 2+ hops away (e.g. `read_header` → `archive_read_format_rar_read_header` → `archive_read_support_format_rar`) | `gen_harness.py` |
 | **P1.11** Sparse guard ratio score boost: ×1.15 when sinks/guard > 5, ×1.25 when > 10; only fires when guards exist and call sinks are present — pushes high-sink sparse-guard functions from mid-band into top ranks without target-specific tuning | `score_deterministic.py` |
 | **P1.1** Wrapper/alias deduplication: BFS from each impl upward through caller_map; pure-delegation callers (no own sinks) and subset-sink callers both marked; chained wrappers (PEM_read → PEM_read_bio → PEM_read_bio_ex) handled; grouped beneath impl in table with └─ | `score_deterministic.py` |
+| Sink suffix false-positive fixes: disabled suffix match for strcat/strcpy/sprintf/printf/link/symlink families — archive_strcat, archive_entry_set_nlink etc. no longer flagged as dangerous sinks; exact-name matches unaffected | `preprocess_slice_pdg.py` |
+| **P1.12** Write-path discount (heuristic #1): ×0.60 multiplier when `is_external_input` and TU filename matches `archive_write_*`/`_write_set_format_*`/`_write_add_filter_*` — drops zisofs_rewind_boot_file from 100% to 60% | `score_deterministic.py` |
