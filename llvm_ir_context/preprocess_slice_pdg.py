@@ -474,6 +474,7 @@ def _is_dangerous(name: str) -> bool:
         "gets", "strcat", "strncat", "strcpy", "strncpy",
         "sprintf", "vsprintf", "snprintf", "vsnprintf",
         "printf", "fprintf",
+        "link", "symlink",
     })
     for s in _SINK_SUFFIXES:
         if s in _NO_SUFFIX_MATCH:
